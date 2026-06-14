@@ -1,9 +1,37 @@
 [package]
-edition = "2024"
-name    = "rustylink-api"
-version = "0.1.0"
+build             = "build.rs"
+edition.workspace = true
+name              = "rustylink-api"
+version.workspace = true
+
+[lib]
+path = "src/lib.rs"
 
 [dependencies]
+aes.workspace               = true
+base64.workspace            = true
+cbc.workspace               = true
+hex.workspace               = true
+hmac.workspace              = true
+progenitor-client.workspace = true
+reqwest.workspace           = true
+serde.workspace             = true
+serde_json.workspace        = true
+sha1.workspace              = true
+sha2.workspace              = true
+snafu.workspace             = true
+time.workspace              = true
+tracing.workspace           = true
+url.workspace               = true
+uuid.workspace              = true
+
+[build-dependencies]
+openapiv3.workspace    = true
+prettyplease.workspace = true
+progenitor.workspace   = true
+serde_json.workspace   = true
+serde_yaml.workspace   = true
+syn.workspace          = true
 
 [lints]
 workspace = true
