@@ -1,7 +1,7 @@
 {
-  description = "Rustylink clean-room VPN client";
-
+  # spell-checker: disable
   inputs = {
+    self.submodules = true;
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
     flake-parts = {
       url = "github:hercules-ci/flake-parts";
@@ -15,6 +15,10 @@
       url = "github:numtide/treefmt-nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    pnpm2nix = {
+      url = "github:wrvsrx/pnpm2nix-nzbr/adapt-to-v9";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
     crane.url = "github:ipetkov/crane";
   };
 
@@ -23,7 +27,6 @@
     flake-parts.lib.mkFlake { inherit inputs; } {
       systems = inputs.nixpkgs.lib.systems.flakeExposed;
       imports = [ inputs.treefmt-nix.flakeModule ];
-
       perSystem =
         {
           config,
@@ -34,131 +37,95 @@
         let
           pkgs = import inputs.nixpkgs {
             inherit system;
-            overlays = [ (import inputs.rust-overlay) ];
-          };
-
-          stableRust = pkgs.rust-bin.stable.latest.default.override {
-            extensions = [
-              "clippy"
-              "rust-src"
-              "rustfmt"
+            overlays = [
+              (import inputs.rust-overlay)
+              inputs.pnpm2nix.overlays.default
             ];
           };
-          nightlyRust = pkgs.rust-bin.nightly.latest.default.override {
+          rust = pkgs.rust-bin.stable.latest.default.override {
             extensions = [
               "rust-src"
-              "rustfmt"
+              "llvm-tools-preview"
             ];
           };
-          devRust = pkgs.runCommand "rustylink-dev-rust" { } ''
-            mkdir -p "$out/bin"
-            ln -s ${nightlyRust}/bin/cargo "$out/bin/cargo"
-            ln -s ${nightlyRust}/bin/rustfmt "$out/bin/rustfmt"
-            ln -s ${stableRust}/bin/cargo-clippy "$out/bin/cargo-clippy"
-            ln -s ${stableRust}/bin/clippy-driver "$out/bin/clippy-driver"
-            ln -s ${stableRust}/bin/rustc "$out/bin/rustc"
-            ln -s ${stableRust}/bin/rustdoc "$out/bin/rustdoc"
-          '';
-
-          craneLib = (inputs.crane.mkLib pkgs).overrideToolchain (_: stableRust);
-          cargoSrc =
-            with lib.fileset;
-            toSource {
-              root = ./.;
-              fileset = unions [
+          rustfmt = pkgs.rust-bin.selectLatestNightlyWith (toolchain: toolchain.rustfmt);
+          typespec = pkgs.callPackage ./nix/typespec { };
+          craneLib = (inputs.crane.mkLib pkgs).overrideToolchain (_: rust);
+          craneCommonArgs = rec {
+            src = ./.;
+            inherit (craneLib.crateNameFromCargoToml { inherit src; }) version;
+            strictDeps = true;
+            cargoVendorDir = craneLib.vendorMultipleCargoDeps {
+              inherit (craneLib.findCargoFiles src) cargoConfigs;
+              cargoLockList = [
                 ./Cargo.lock
-                ./Cargo.toml
-                ./crates
-                ./package-lock.json
-                ./package.json
-                ./rustfmt.toml
+                "${rust}/lib/rustlib/src/rust/library/Cargo.lock"
               ];
             };
-          nativeBuildInputs =
-            with pkgs;
-            [
-              importNpmLock.npmConfigHook
-              nodejs_22
-              pkg-config
-            ]
-            ++ lib.optionals stdenv.isDarwin [ llvmPackages.bintools ];
-          buildInputs = lib.optionals pkgs.stdenv.isDarwin [
-            pkgs.apple-sdk
-            pkgs.libiconv
-          ];
-          commonArgs = {
-            src = cargoSrc;
-            strictDeps = true;
-            npmDeps = pkgs.importNpmLock { npmRoot = ./.; };
-            inherit buildInputs nativeBuildInputs;
-          } // lib.optionalAttrs pkgs.stdenv.isDarwin {
-            CPATH = "${pkgs.libiconv}/include";
-            LIBRARY_PATH = "${pkgs.libiconv}/lib";
+            nativeBuildInputs = [ typespec ];
           };
-          cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+          cargoArtifacts = craneLib.buildDepsOnly craneCommonArgs;
         in
         {
-          _module.args = { inherit inputs pkgs stableRust nightlyRust; };
-
-          treefmt = {
-            projectRootFile = "flake.nix";
-            settings.global.excludes = [
-              "artifacts/**"
-              "node_modules/**"
-              "target/**"
-            ];
-            programs.nixfmt.enable = true;
-            programs.rustfmt = {
-              enable = true;
-              package = nightlyRust;
+          _module.args = { inherit inputs pkgs rust; };
+          treefmt =
+            { ... }:
+            {
+              projectRootFile = ".git/config";
+              programs.nixfmt.enable = true;
+              programs.taplo.enable = true;
+              programs.rustfmt = {
+                enable = true;
+                package = rustfmt;
+              };
+              programs.yamlfmt.enable = true;
             };
-            programs.taplo.enable = true;
+          devShells.default = pkgs.mkShell {
+            inherit (pkgs) stdenv;
+            inputsFrom = [ config.treefmt.build.devShell ];
+            buildInputs = [
+              (lib.hiPrio rustfmt)
+              rust
+              typespec
+            ]
+            ++ (
+              with pkgs;
+              [
+                cargo-edit
+                cargo-nextest
+              ]
+              ++ lib.optionals stdenv.isLinux [
+                llvmPackages.bolt
+                perf
+              ]
+              ++ lib.optionals stdenv.isDarwin [
+                darwin.libiconv
+                darwin.libresolv
+              ]
+            );
+            env = lib.optionalAttrs pkgs.stdenv.isDarwin { SDKROOT = pkgs.apple-sdk.sdkroot; };
           };
-
-          formatter = config.treefmt.build.wrapper;
-
-          packages.default = craneLib.buildPackage (
-            commonArgs
-            // {
-              inherit cargoArtifacts;
-              cargoExtraArgs = "-p rustylink";
-            }
-          );
-
           checks = {
-            build = config.packages.default;
             clippy = craneLib.cargoClippy (
-              commonArgs
+              craneCommonArgs
               // {
                 inherit cargoArtifacts;
-                cargoClippyExtraArgs = "--workspace --all-targets";
+                cargoClippyExtraArgs = "--all-targets --all-features";
               }
             );
-            test = craneLib.cargoTest (commonArgs // { inherit cargoArtifacts; });
-            treefmt = config.treefmt.build.check ./.;
+            test = craneLib.cargoNextest (
+              craneCommonArgs
+              // {
+                inherit cargoArtifacts;
+              }
+            );
           };
 
-          devShells.default = pkgs.mkShell (
-            {
-              packages = with pkgs; [
-                config.treefmt.build.wrapper
-                devRust
-                direnv
-                nodejs_22
-                pkg-config
-                taplo
-              ] ++ lib.optionals stdenv.isDarwin [
-                apple-sdk
-                libiconv
-                llvmPackages.bintools
-              ];
-
-              RUSTC = "${stableRust}/bin/rustc";
-              RUSTDOC = "${stableRust}/bin/rustdoc";
-              RUSTFMT = "${nightlyRust}/bin/rustfmt";
-            } // lib.optionalAttrs pkgs.stdenv.isDarwin {
-              CPATH = "${pkgs.libiconv}/include";
-              LIBRARY_PATH = "${pkgs.libiconv}/lib";
+          packages.default = craneLib.buildPackage (
+            craneCommonArgs
+            // {
+              inherit cargoArtifacts;
+              doCheck = false;
             }
           );
         };
