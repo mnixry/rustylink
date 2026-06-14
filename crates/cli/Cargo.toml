@@ -1,0 +1,24 @@
+[package]
+edition.workspace = true
+name              = "rustylink"
+version.workspace = true
+
+[[bin]]
+name = "rustylink"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace               = true
+rustylink-api                = { path = "../api" }
+rustylink-core               = { path = "../core" }
+rustylink-tunnel             = { path = "../tunnel" }
+serde.workspace              = true
+serde_json.workspace         = true
+snafu.workspace              = true
+tokio.workspace              = true
+tracing.workspace            = true
+tracing-subscriber.workspace = true
+url.workspace                = true
+
+[lints]
+workspace = true
