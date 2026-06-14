@@ -1,0 +1,19 @@
+[package]
+edition.workspace = true
+name              = "rustylink-tunnel"
+version.workspace = true
+
+[dependencies]
+gotatun                 = { git = "https://github.com/mnixry/gotatun" }
+route_manager.workspace = true
+rustylink-api           = { path = "../api" }
+rustylink-core          = { path = "../core" }
+serde.workspace         = true
+serde_json.workspace    = true
+snafu.workspace         = true
+tokio.workspace         = true
+tracing.workspace       = true
+tun-rs.workspace        = true
+
+[lints]
+workspace = true
