@@ -7,43 +7,39 @@ edition = "2024"
 version = "0.1.0"
 
 [workspace.dependencies]
-aes                = "0.8"
-base64             = "0.22"
-bitflags           = "2"
-cbc                = "0.1"
-clap               = { version = "4", features = ["derive", "env"] }
-dirs               = "6"
-etherparse         = "0.19"
-hex                = "0.4"
-hickory-proto      = "0.25"
-hmac               = "0.12"
-ipnetwork          = "0.21"
-openapiv3          = "2"
-prettyplease       = "0.2"
-progenitor         = "0.14"
-progenitor-client  = "0.14"
-prost              = "0.13"
-prost-build        = "0.13"
-protox             = "0.8"
-rand               = "0.9"
-reqwest            = { version = "0.13", features = ["cookies", "json", "rustls"] }
-route_manager      = "0.2"
-serde              = { version = "1", features = ["derive"] }
-serde_json         = "1"
-serde_yaml         = "0.9"
-sha1               = "0.10"
-sha2               = "0.10"
-snafu              = "0.8"
-strum              = { version = "0.27", features = ["derive"] }
-syn                = "2"
-time               = { version = "0.3", features = ["formatting", "macros", "serde"] }
-tokio              = { version = "1", features = ["full"] }
-toml               = "0.8"
-tracing            = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-tun-rs             = { version = "2.8", features = ["async"] }
-url                = { version = "2", features = ["serde"] }
-uuid               = { version = "1", features = ["v4", "serde"] }
+aes                = "0.9.1"
+base64             = "0.22.1"
+bitflags           = "2.13.0"
+cbc                = "0.2.1"
+clap               = { version = "4.6.1", features = ["derive", "env"] }
+dirs               = "6.0.0"
+etherparse         = "0.20.2"
+hex                = "0.4.3"
+hickory-proto      = "0.26.1"
+hmac               = "0.13.0"
+ipnetwork          = "0.21.1"
+openapiv3          = "2.2.0"
+prettyplease       = "0.2.37"
+progenitor         = "0.14.0"
+progenitor-client  = "0.14.0"
+prost              = "0.14.4"
+rand               = "0.10.1"
+reqwest            = { version = "0.13.4", features = ["cookies", "json", "rustls"] }
+route_manager      = { version = "0.2.11", features = ["async"] }
+serde              = { version = "1.0.228", features = ["derive"] }
+serde_json         = "1.0.150"
+serde_yaml         = "0.9.34"
+sha1               = "0.11.0"
+sha2               = "0.11.0"
+snafu              = "0.9.1"
+strum              = { version = "0.28.0", features = ["derive"] }
+syn                = "2.0.117"
+time               = { version = "0.3.49", features = ["formatting", "macros", "serde"] }
+tokio              = { version = "1.52.3", features = ["full"] }
+tracing            = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+url                = { version = "2.5.8", features = ["serde"] }
+uuid               = { version = "1.23.3", features = ["v4", "serde"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
@@ -57,6 +53,8 @@ pedantic = { level = "warn", priority = -1 }
 
 cargo_common_metadata   = "allow"
 multiple_crate_versions = "allow"
+missing_errors_doc      = "allow"
+missing_const_for_fn    = "allow"
 
 [profile.release]
 codegen-units = 1

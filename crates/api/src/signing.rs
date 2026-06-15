@@ -3,9 +3,9 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bitflags::bitflags;
 use cbc::{
     Encryptor,
-    cipher::{BlockEncryptMut, KeyIvInit, block_padding::Pkcs7},
+    cipher::{BlockModeEncrypt, KeyIvInit, block_padding::Pkcs7},
 };
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use prost::Message;
 use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
@@ -232,7 +232,7 @@ impl PasswordCipher {
         buf.resize(plain_len + AES_CBC_BLOCK_SIZE, 0);
         let ciphertext = Encryptor::<Aes256>::new_from_slices(key, &iv)
             .map_err(|_| PasswordCipherError::InvalidKeyLength { length: key.len() })?
-            .encrypt_padded_mut::<Pkcs7>(&mut buf, plain_len)
+            .encrypt_padded::<Pkcs7>(&mut buf, plain_len)
             .map_err(|_| PasswordCipherError::Padding)?;
         Ok(hex::encode(ciphertext))
     }

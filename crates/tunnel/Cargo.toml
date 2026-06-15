@@ -4,26 +4,25 @@ name              = "rustylink-tunnel"
 version.workspace = true
 
 [dependencies]
-base64.workspace = true
-etherparse.workspace = true
-gotatun = { git = "https://github.com/mnixry/gotatun", features = [
-  "device",
-  "tun",
-] }
-hex.workspace = true
+rustylink-api.path = "../api"
+
+base64.workspace        = true
+etherparse.workspace    = true
+hex.workspace           = true
 hickory-proto.workspace = true
-ipnetwork.workspace = true
-rand.workspace = true
+ipnetwork.workspace     = true
+rand.workspace          = true
 route_manager.workspace = true
-rustylink-api = { path = "../api" }
-rustylink-core = { path = "../core" }
-serde.workspace = true
-serde_json.workspace = true
-snafu.workspace = true
-strum.workspace = true
-tokio.workspace = true
-tracing.workspace = true
-tun-rs.workspace = true
+serde.workspace         = true
+serde_json.workspace    = true
+snafu.workspace         = true
+strum.workspace         = true
+tokio.workspace         = true
+tracing.workspace       = true
+
+[dependencies.gotatun]
+features = ["device", "tun"]
+git      = "https://github.com/mnixry/gotatun"
 
 [lints]
 workspace = true

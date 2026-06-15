@@ -6,8 +6,26 @@ use strum::{Display, EnumIter, EnumString};
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
 pub enum Error {
-    #[snafu(display("route manager failed: {message}"))]
-    RouteManager { message: String },
+    #[snafu(display("route manager setup failed"))]
+    RouteManager { source: std::io::Error },
+
+    #[snafu(display("invalid route CIDR `{cidr}`"))]
+    InvalidRoute {
+        cidr: String,
+        source: ipnetwork::IpNetworkError,
+    },
+
+    #[snafu(display("failed to add route `{route}`"))]
+    AddRoute {
+        route: String,
+        source: std::io::Error,
+    },
+
+    #[snafu(display("failed to delete route `{route}`"))]
+    DeleteRoute {
+        route: String,
+        source: std::io::Error,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -38,6 +56,12 @@ pub enum RouteMode {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RoutePlan {
     pub rules: Vec<RouteRule>,
+}
+
+#[derive(Debug)]
+pub struct AppliedRoutes {
+    interface_name: String,
+    routes: Vec<route_manager::Route>,
 }
 
 impl RoutePlan {
@@ -71,10 +95,47 @@ impl RoutePlan {
         Self { rules }
     }
 
-    pub fn apply(&self) -> Result<()> {
+    pub async fn apply(&self, interface_name: &str) -> Result<AppliedRoutes> {
+        let routes = self.system_routes(interface_name)?;
+        let mut manager = route_manager::AsyncRouteManager::new().context(RouteManagerSnafu)?;
+        for route in &routes {
+            tracing::debug!(%interface_name, %route, "adding VPN route");
+            manager.add(route).await.context(AddRouteSnafu {
+                route: route.to_string(),
+            })?;
+        }
         tracing::info!(
-            routes = self.rules.len(),
-            "route plan ready for route_manager"
+            %interface_name,
+            routes = routes.len(),
+            "applied VPN routes"
+        );
+        Ok(AppliedRoutes {
+            interface_name: interface_name.to_string(),
+            routes,
+        })
+    }
+
+    fn system_routes(&self, interface_name: &str) -> Result<Vec<route_manager::Route>> {
+        self.rules
+            .iter()
+            .map(|rule| system_route(rule, interface_name))
+            .collect()
+    }
+}
+
+impl AppliedRoutes {
+    pub async fn remove(self) -> Result<()> {
+        let mut manager = route_manager::AsyncRouteManager::new().context(RouteManagerSnafu)?;
+        for route in self.routes.iter().rev() {
+            tracing::debug!(interface_name = %self.interface_name, %route, "deleting VPN route");
+            manager.delete(route).await.context(DeleteRouteSnafu {
+                route: route.to_string(),
+            })?;
+        }
+        tracing::info!(
+            interface_name = %self.interface_name,
+            routes = self.routes.len(),
+            "deleted VPN routes"
         );
         Ok(())
     }
@@ -100,9 +161,22 @@ fn normalize_cidr(value: &str, family: AddressFamily) -> String {
     }
 }
 
+fn system_route(rule: &RouteRule, interface_name: &str) -> Result<route_manager::Route> {
+    let network = rule
+        .cidr
+        .parse::<ipnetwork::IpNetwork>()
+        .context(InvalidRouteSnafu {
+            cidr: rule.cidr.clone(),
+        })?;
+    Ok(route_manager::Route::new(network.ip(), network.prefix())
+        .with_if_name(interface_name.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{AddressFamily, normalize_cidr};
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use super::{AddressFamily, RouteMode, RouteRule, normalize_cidr, system_route};
 
     #[test]
     fn normalizes_host_routes() {
@@ -116,5 +190,21 @@ mod tests {
             normalize_cidr("10.0.0.0/8", AddressFamily::V4),
             "10.0.0.0/8"
         );
+    }
+
+    #[test]
+    fn converts_plan_rule_to_system_route() {
+        let route = system_route(
+            &RouteRule {
+                cidr: "10.0.0.0/8".to_string(),
+                family: AddressFamily::V4,
+                mode: RouteMode::Split,
+            },
+            "utun7",
+        )
+        .expect("route");
+        assert_eq!(route.destination(), IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)));
+        assert_eq!(route.prefix(), 8);
+        assert_eq!(route.if_name().map(String::as_str), Some("utun7"));
     }
 }

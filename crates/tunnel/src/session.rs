@@ -15,7 +15,10 @@ use snafu::prelude::*;
 use strum::{Display, EnumIter, FromRepr};
 use tokio::net::lookup_host;
 
-use crate::{DnsHijackPlan, DnsHijackTun, DnsProxyRuntime, FeilianTcpTransportFactory, RoutePlan};
+use crate::{
+    DnsHijackPlan, DnsHijackTun, DnsProxyRuntime, FeilianTcpTransportFactory, RoutePlan,
+    route::AppliedRoutes,
+};
 
 const ANDROID_LOCAL_PORT_START: u16 = 12912;
 const WIREGUARD_KEEPALIVE_SECS: u16 = 25;
@@ -110,6 +113,7 @@ pub struct TunnelSession {
     pub status: TunnelStatus,
     device: Option<TunnelDevice>,
     dns_proxy: Option<DnsProxyRuntime>,
+    routes: Option<AppliedRoutes>,
 }
 
 enum TunnelDevice {
@@ -196,10 +200,24 @@ impl TunnelSession {
             status: TunnelStatus::Created,
             device: None,
             dns_proxy: None,
+            routes: None,
         }
     }
 
     pub async fn start(&mut self) -> Result<()> {
+        if let Err(error) = self.start_inner().await {
+            if let Err(cleanup_error) = self.stop().await {
+                tracing::warn!(
+                    %cleanup_error,
+                    "failed to clean up partially started tunnel session"
+                );
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    async fn start_inner(&mut self) -> Result<()> {
         tracing::info!(
             interface = %self.config.interface_name,
             mtu = self.config.mtu,
@@ -238,12 +256,29 @@ impl TunnelSession {
             peer = peer.with_preshared_key(decode_key("server_preshared_key", preshared_key)?);
         }
 
-        self.config.route_plan.apply().context(RouteSnafu)?;
+        let tun = TunDevice::from_name(&self.config.interface_name).context(TunDeviceSnafu)?;
+        let actual_interface_name = tun.name().context(TunDeviceSnafu)?;
+        if actual_interface_name != self.config.interface_name {
+            tracing::info!(
+                requested_interface = %self.config.interface_name,
+                actual_interface = %actual_interface_name,
+                "TUN device assigned OS interface name"
+            );
+            self.config
+                .interface_name
+                .clone_from(&actual_interface_name);
+        }
+        let routes = self
+            .config
+            .route_plan
+            .apply(&actual_interface_name)
+            .await
+            .context(RouteSnafu)?;
+        self.routes = Some(routes);
         self.status = TunnelStatus::RoutesApplied;
         self.dns_proxy = DnsProxyRuntime::start(&self.config.dns_plan)
             .await
             .context(DnsSnafu)?;
-        let tun = TunDevice::from_name(&self.config.interface_name).context(TunDeviceSnafu)?;
         let tun = DnsHijackTun::new(tun, &self.config.dns_plan);
         let device = match transport {
             TunnelTransport::Udp => {
@@ -284,6 +319,9 @@ impl TunnelSession {
         }
         if let Some(dns_proxy) = self.dns_proxy.take() {
             dns_proxy.stop();
+        }
+        if let Some(routes) = self.routes.take() {
+            routes.remove().await.context(RouteSnafu)?;
         }
         self.status = TunnelStatus::Stopped;
         Ok(())

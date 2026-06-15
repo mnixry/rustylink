@@ -205,9 +205,9 @@ impl ApiClient {
             .encrypt_aes_cbc(&password)
             .context(EncryptPasswordSnafu)?;
         let body = PasswordLoginRequest {
-            login_scene,
-            account_type,
             account,
+            account_type,
+            login_scene,
             password,
         };
         let response = self
@@ -226,10 +226,10 @@ impl ApiClient {
         &self, login_scene: String, account_type: String, login_type: String, account: String,
     ) -> Result<SendLoginCodeResponse> {
         let body = SendCodeRequest {
-            login_scene,
-            account_type,
-            login_type,
             account,
+            account_type,
+            login_scene,
+            login_type,
         };
         let response = self
             .generated
@@ -248,11 +248,11 @@ impl ApiClient {
         code: String,
     ) -> Result<VerifyLoginCodeResponse> {
         let body = VerifyCodeRequest {
-            login_scene,
-            account_type,
-            login_type,
             account,
+            account_type,
             code,
+            login_scene,
+            login_type,
         };
         let response = self
             .generated
@@ -278,10 +278,10 @@ impl ApiClient {
             })
             .transpose()?;
         let body = VerifyMfaRequest {
-            login_scene,
-            mfa_type,
             account,
             code,
+            login_scene,
+            mfa_type,
             password,
         };
         let response = self

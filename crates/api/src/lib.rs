@@ -1,5 +1,3 @@
-#![allow(clippy::missing_errors_doc, clippy::missing_const_for_fn)]
-
 pub mod client;
 pub mod error;
 pub mod identity;

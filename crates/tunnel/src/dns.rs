@@ -514,7 +514,7 @@ fn normalize_dns_payload(payload: &[u8]) -> io::Result<Vec<u8>> {
 
 fn first_query_domain(message: &DnsMessage) -> Option<String> {
     message
-        .queries()
+        .queries
         .first()
         .map(|query| normalize_domain(&query.name().to_ascii()))
 }
@@ -646,7 +646,7 @@ fn to_io_error(error: impl std::fmt::Display) -> io::Error {
 #[cfg(test)]
 mod tests {
     use hickory_proto::{
-        op::{Message as DnsMessage, Query},
+        op::{Message as DnsMessage, MessageType, OpCode, Query},
         rr::{Name, RecordType},
     };
 
@@ -672,7 +672,7 @@ mod tests {
 
     #[test]
     fn parses_dns_question_domain() {
-        let mut message = DnsMessage::new();
+        let mut message = DnsMessage::new(1, MessageType::Query, OpCode::Query);
         message.add_query(Query::query(
             Name::from_ascii("example.com.").unwrap(),
             RecordType::A,

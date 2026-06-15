@@ -1,5 +1,3 @@
-#![allow(clippy::missing_errors_doc)]
-
 pub mod dns;
 pub mod error;
 pub mod reconnect;
