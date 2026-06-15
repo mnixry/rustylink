@@ -6,7 +6,10 @@ use snafu::prelude::*;
 #[snafu(visibility(pub(crate)), context(suffix(false)))]
 pub enum Error {
     #[snafu(display("API operation failed"))]
-    Api { source: rustylink_api::Error },
+    Api {
+        #[snafu(source(from(rustylink_api::Error, Box::new)))]
+        source: Box<rustylink_api::Error>,
+    },
 
     #[snafu(display("failed to read state file {}", path.display()))]
     ReadState {

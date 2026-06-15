@@ -1,0 +1,11 @@
+openapi: 3.0.3
+info:
+  title: Rustylink static-evidence API
+  version: 0.1.0
+servers:
+  - url: "{baseUrl}"
+    variables:
+      baseUrl:
+        default: "https://example.invalid"
+paths: {}
+components: {}

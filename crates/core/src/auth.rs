@@ -1,5 +1,8 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use rustylink_api::{ActivateInfo, BaseResponse, LoginResult};
+use rustylink_api::{
+    ActivateInfo, ActivateResponse, LoginByPasswordResponse, OauthCallbackResponse,
+    SendLoginCodeResponse, VerifyLoginCodeResponse, VerifyMfaResponse,
+};
 use sha2::{Digest as _, Sha256};
 use snafu::prelude::*;
 use uuid::Uuid;
@@ -9,7 +12,7 @@ use crate::{AppContext, error, error::Result, state::OAuthState};
 pub async fn activate(
     ctx: &mut AppContext, code: Option<String>, base_url: Option<String>,
     backup_url: Option<String>,
-) -> Result<Option<BaseResponse<ActivateInfo>>> {
+) -> Result<Option<ActivateResponse>> {
     if let Some(value) = base_url {
         ctx.state.tenant.base_url = Some(value);
     }
@@ -38,7 +41,7 @@ pub async fn activate(
 pub async fn login_password(
     ctx: &mut AppContext, login_scene: String, account_type: String, account: String,
     password: String,
-) -> Result<BaseResponse<LoginResult>> {
+) -> Result<LoginByPasswordResponse> {
     let client = ctx.api_client()?;
     let response = client
         .login_password(login_scene, account_type, account, password)
@@ -52,7 +55,7 @@ pub async fn login_password(
 pub async fn send_code(
     ctx: &mut AppContext, login_scene: String, account_type: String, login_type: String,
     account: String,
-) -> Result<BaseResponse<String>> {
+) -> Result<SendLoginCodeResponse> {
     let client = ctx.api_client()?;
     let response = client
         .send_login_code(login_scene, account_type, login_type, account)
@@ -66,7 +69,7 @@ pub async fn send_code(
 pub async fn verify_code(
     ctx: &mut AppContext, login_scene: String, account_type: String, login_type: String,
     account: String, code: String,
-) -> Result<BaseResponse<LoginResult>> {
+) -> Result<VerifyLoginCodeResponse> {
     let client = ctx.api_client()?;
     let response = client
         .verify_login_code(login_scene, account_type, login_type, account, code)
@@ -80,7 +83,7 @@ pub async fn verify_code(
 pub async fn verify_mfa(
     ctx: &mut AppContext, login_scene: String, mfa_type: String, account: String,
     code: Option<String>, password: Option<String>,
-) -> Result<BaseResponse<LoginResult>> {
+) -> Result<VerifyMfaResponse> {
     let client = ctx.api_client()?;
     let response = client
         .verify_mfa(login_scene, mfa_type, account, code, password)
@@ -115,7 +118,7 @@ pub fn start_oauth(
 
 pub async fn oauth_callback(
     ctx: &mut AppContext, alias_key: Option<String>, code: String, state: Option<String>,
-) -> Result<BaseResponse<LoginResult>> {
+) -> Result<OauthCallbackResponse> {
     let alias_key = alias_key
         .or_else(|| ctx.state.oauth.alias_key.clone())
         .context(error::MissingOAuthVerifier)?;
@@ -149,8 +152,8 @@ fn merge_activation(ctx: &mut AppContext, data: &ActivateInfo) {
     if let Some(enable) = data.activate_enable_backup_domain {
         ctx.state.tenant.use_backup = enable;
     }
-    if let Some(name) = data.raw.get("tenant_name").and_then(|value| value.as_str()) {
-        ctx.state.tenant.name = Some(name.to_string());
+    if let Some(name) = &data.tenant_name {
+        ctx.state.tenant.name = Some(name.clone());
     }
 }
 

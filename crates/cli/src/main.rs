@@ -12,7 +12,10 @@ use tracing_subscriber::{EnvFilter, fmt};
 #[snafu(module, context(suffix(false)))]
 enum CliError {
     #[snafu(display("core operation failed"))]
-    Core { source: rustylink_core::Error },
+    Core {
+        #[snafu(source(from(rustylink_core::Error, Box::new)))]
+        source: Box<rustylink_core::Error>,
+    },
 
     #[snafu(display("tunnel operation failed"))]
     Tunnel { source: rustylink_tunnel::Error },

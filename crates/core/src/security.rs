@@ -1,11 +1,13 @@
-use rustylink_api::{BaseResponse, JsonObject, SecurityReportItem, SecurityReportRequest};
+use rustylink_api::{
+    JsonObject, ReportSecurityResponse, SecurityReportItem, SecurityReportRequest,
+};
 use snafu::prelude::*;
 
 use crate::{AppContext, error, error::Result};
 
 pub async fn report_security(
     ctx: &mut AppContext, report: &SecurityReportRequest,
-) -> Result<BaseResponse<String>> {
+) -> Result<ReportSecurityResponse> {
     let client = ctx.api_client()?;
     let response = client.report_security(report).await.context(error::Api)?;
     ctx.sync_from_client(&client);

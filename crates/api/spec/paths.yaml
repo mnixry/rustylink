@@ -1,0 +1,212 @@
+/activation/match:
+  post:
+    operationId: activate
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ActivateRequest"
+    responses:
+      "200":
+        description: The request has succeeded.
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ActivateResponse"
+
+/api/login/v2/password:
+  post:
+    operationId: loginByPassword
+    parameters: &device_query
+      - $ref: "#/components/parameters/Os"
+      - $ref: "#/components/parameters/OsVersion"
+      - $ref: "#/components/parameters/AppVersion"
+      - $ref: "#/components/parameters/Brand"
+      - $ref: "#/components/parameters/Model"
+      - $ref: "#/components/parameters/Did"
+      - $ref: "#/components/parameters/BuildNumber"
+      - $ref: "#/components/parameters/OsVersionPatch"
+      - $ref: "#/components/parameters/Timestamp"
+      - $ref: "#/components/parameters/ClientSource"
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/PasswordLoginRequest"
+    responses:
+      "200":
+        description: The request has succeeded.
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginByPasswordResponse"
+
+/api/login/v2/code/send:
+  post:
+    operationId: sendLoginCode
+    parameters: *device_query
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/SendCodeRequest"
+    responses:
+      "200":
+        description: The request has succeeded.
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SendLoginCodeResponse"
+
+/api/login/v2/code/verify:
+  post:
+    operationId: verifyLoginCode
+    parameters: *device_query
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/VerifyCodeRequest"
+    responses:
+      "200":
+        description: The request has succeeded.
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VerifyLoginCodeResponse"
+
+/api/login/v2/mfa/verify:
+  post:
+    operationId: verifyMfa
+    parameters: *device_query
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/VerifyMfaRequest"
+    responses:
+      "200":
+        description: The request has succeeded.
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VerifyMfaResponse"
+
+/api/login/v2/oauth/callback:
+  post:
+    operationId: oauthCallback
+    parameters: *device_query
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/OAuthCallbackRequest"
+    responses:
+      "200":
+        description: The request has succeeded.
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OauthCallbackResponse"
+
+/api/login/setting:
+  get:
+    operationId: getLoginSetting
+    parameters: *device_query
+    responses:
+      "200":
+        description: The request has succeeded.
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GetLoginSettingResponse"
+
+/api/user/info:
+  get:
+    operationId: getUserInfo
+    parameters: *device_query
+    responses:
+      "200":
+        description: The request has succeeded.
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GetUserInfoResponse"
+
+/api/tenant/config:
+  get:
+    operationId: getTenantConfig
+    parameters: *device_query
+    responses:
+      "200":
+        description: The request has succeeded.
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GetTenantConfigResponse"
+
+/api/vpn/setting:
+  get:
+    operationId: getVpnSetting
+    parameters: *device_query
+    responses:
+      "200":
+        description: The request has succeeded.
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GetVpnSettingResponse"
+
+/api/vpn/locations:
+  get:
+    operationId: getVpnLocations
+    parameters: *device_query
+    responses:
+      "200":
+        description: The request has succeeded.
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GetVpnLocationsResponse"
+
+/vpn/conn:
+  post:
+    operationId: vpnConn
+    parameters: *device_query
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/VpnConnRequest"
+    responses:
+      "200":
+        description: The request has succeeded.
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VpnConnEnvelope"
+
+/api/security/report:
+  post:
+    operationId: reportSecurity
+    parameters: *device_query
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/SecurityReportRequest"
+    responses:
+      "200":
+        description: The request has succeeded.
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReportSecurityResponse"

@@ -1,0 +1,397 @@
+parameters:
+  Os:
+    name: os
+    in: query
+    schema: { type: string }
+  OsVersion:
+    name: os_version
+    in: query
+    schema: { type: string }
+  AppVersion:
+    name: app_version
+    in: query
+    schema: { type: string }
+  Brand:
+    name: brand
+    in: query
+    schema: { type: string }
+  Model:
+    name: model
+    in: query
+    schema: { type: string }
+  Did:
+    name: did
+    in: query
+    schema: { type: string }
+  BuildNumber:
+    name: build_number
+    in: query
+    schema: { type: string }
+  OsVersionPatch:
+    name: os_version_patch
+    in: query
+    schema: { type: string }
+  Timestamp:
+    name: timestamp
+    in: query
+    schema: { type: string }
+  ClientSource:
+    name: client_source
+    in: query
+    schema: { type: string }
+
+schemas:
+  JsonObject: &json_object
+    type: object
+    additionalProperties: true
+
+  ActivateRequest:
+    type: object
+    required: [code]
+    properties:
+      code: { type: string }
+
+  ActivateInfo:
+    type: object
+    properties:
+      activate_host: { type: string }
+      activate_backup_domain: { type: string }
+      activate_enable_backup_domain: { type: boolean }
+      tenant_name: { type: string }
+      raw: *json_object
+
+  PasswordLoginRequest:
+    type: object
+    required: [login_scene, account_type, account, password]
+    properties:
+      login_scene: { type: string }
+      account_type: { type: string }
+      account: { type: string }
+      password: { type: string }
+
+  SendCodeRequest:
+    type: object
+    required: [login_scene, account_type, login_type, account]
+    properties:
+      login_scene: { type: string }
+      account_type: { type: string }
+      login_type: { type: string }
+      account: { type: string }
+
+  VerifyCodeRequest:
+    type: object
+    required: [login_scene, account_type, login_type, account, code]
+    properties:
+      login_scene: { type: string }
+      account_type: { type: string }
+      login_type: { type: string }
+      account: { type: string }
+      code: { type: string }
+
+  VerifyMfaRequest:
+    type: object
+    required: [login_scene, mfa_type, account]
+    properties:
+      login_scene: { type: string }
+      mfa_type: { type: string }
+      account: { type: string }
+      code: { type: string }
+      password: { type: string }
+
+  OAuthCallbackRequest:
+    type: object
+    required: [alias_key, code, state, code_verifier]
+    properties:
+      alias_key: { type: string }
+      code: { type: string }
+      state: { type: string }
+      code_verifier: { type: string }
+
+  LoginResult:
+    type: object
+    properties:
+      token: { type: string }
+      uid: { type: string }
+      need_mfa: { type: boolean }
+      mfa_token: { type: string }
+      raw: *json_object
+
+  LoginSetting:
+    type: object
+    properties:
+      v1Login: { type: boolean }
+      raw: *json_object
+
+  TenantConfig:
+    type: object
+    properties:
+      signingConfig:
+        $ref: "#/components/schemas/SigningConfig"
+      raw: *json_object
+
+  SigningConfig:
+    type: object
+    properties:
+      enable: { type: boolean }
+      algorithms:
+        type: array
+        items: { type: string }
+      rules:
+        type: array
+        items:
+          $ref: "#/components/schemas/SigningRule"
+
+  SigningRule:
+    type: object
+    properties:
+      urls:
+        type: array
+        items: { type: string }
+      enableSigning: { type: boolean }
+      signingInputParams:
+        type: integer
+        format: int32
+      maxTimeDesync:
+        type: integer
+        format: int32
+
+  UserInfo:
+    type: object
+    properties:
+      uid: { type: string }
+      name: { type: string }
+      email: { type: string }
+      mobile: { type: string }
+      raw: *json_object
+
+  VpnSetting:
+    type: object
+    properties:
+      enable: { type: boolean }
+      mode: { type: string }
+      export_id:
+        type: integer
+        format: int32
+      raw: *json_object
+
+  VpnLocation:
+    type: object
+    properties:
+      id:
+        type: integer
+        format: int32
+      name: { type: string }
+      is_auto: { type: boolean }
+      dots:
+        type: array
+        items:
+          $ref: "#/components/schemas/VpnDot"
+      raw: *json_object
+
+  VpnDot:
+    type: object
+    properties:
+      id:
+        type: integer
+        format: int32
+      apiIp: { type: string }
+      apiPort:
+        type: integer
+        format: int32
+      vpnIp: { type: string }
+      vpnPort:
+        type: integer
+        format: int32
+      protocolMode:
+        type: integer
+        format: int32
+      timeout:
+        type: integer
+        format: int32
+      raw: *json_object
+
+  VpnConnRequest:
+    type: object
+    required: [public_key, export_id]
+    properties:
+      mode: { type: string }
+      public_key: { type: string }
+      otp: { type: string }
+      export_id:
+        type: integer
+        format: int32
+      sign_token: { type: string }
+      not_auto: { type: boolean }
+
+  VpnConnResponse:
+    type: object
+    required: [ip, public_key, setting]
+    properties:
+      ip: { type: string }
+      ipv6: { type: string }
+      ip_mask:
+        type: integer
+        format: int32
+      public_key: { type: string }
+      preshared_key: { type: string }
+      sign_token: { type: string }
+      protocol_version: { type: string }
+      setting:
+        $ref: "#/components/schemas/VpnConnSetting"
+      raw: *json_object
+
+  VpnConnSetting:
+    type: object
+    required: [vpn_mtu]
+    properties:
+      vpn_mtu:
+        type: integer
+        format: int32
+      vpn_dns: { type: string }
+      vpn_dns_backup: { type: string }
+      vpn_dns_domain_split:
+        type: array
+        items: { type: string }
+      vpn_route_full:
+        type: array
+        items: { type: string }
+      vpn_route_split:
+        type: array
+        items: { type: string }
+      v6_route_full:
+        type: array
+        items: { type: string }
+      v6_route_split:
+        type: array
+        items: { type: string }
+      vpn_dynamic_domain_route_split: { type: string }
+      v6_vpn_dynamic_domain_route_split: { type: string }
+      vpn_wildcard_dynamic_domain_route_split: { type: string }
+      suffix_wildcard_dynamic_domain_route_split: { type: string }
+      dynamic_domain: { type: string }
+      central_dns: { type: string }
+      ip_nats: { type: string }
+
+  SecurityReportItem:
+    type: object
+    required: [name, level, passed]
+    properties:
+      name: { type: string }
+      level:
+        type: integer
+        format: int32
+      passed: { type: boolean }
+      message: { type: string }
+
+  SecurityReportRequest:
+    type: object
+    required: [status, items]
+    properties:
+      status: { type: string }
+      items:
+        type: array
+        items:
+          $ref: "#/components/schemas/SecurityReportItem"
+      raw: *json_object
+
+  ActivateResponse:
+    allOf:
+      - $ref: "#/components/schemas/ResponseBase"
+      - type: object
+        properties:
+          data:
+            $ref: "#/components/schemas/ActivateInfo"
+  LoginByPasswordResponse:
+    allOf:
+      - $ref: "#/components/schemas/ResponseBase"
+      - type: object
+        properties:
+          data:
+            $ref: "#/components/schemas/LoginResult"
+  SendLoginCodeResponse:
+    allOf:
+      - $ref: "#/components/schemas/ResponseBase"
+      - type: object
+        properties:
+          data: { type: string }
+  VerifyLoginCodeResponse:
+    allOf:
+      - $ref: "#/components/schemas/ResponseBase"
+      - type: object
+        properties:
+          data:
+            $ref: "#/components/schemas/LoginResult"
+  VerifyMfaResponse:
+    allOf:
+      - $ref: "#/components/schemas/ResponseBase"
+      - type: object
+        properties:
+          data:
+            $ref: "#/components/schemas/LoginResult"
+  OauthCallbackResponse:
+    allOf:
+      - $ref: "#/components/schemas/ResponseBase"
+      - type: object
+        properties:
+          data:
+            $ref: "#/components/schemas/LoginResult"
+  GetLoginSettingResponse:
+    allOf:
+      - $ref: "#/components/schemas/ResponseBase"
+      - type: object
+        properties:
+          data:
+            $ref: "#/components/schemas/LoginSetting"
+  GetUserInfoResponse:
+    allOf:
+      - $ref: "#/components/schemas/ResponseBase"
+      - type: object
+        properties:
+          data:
+            $ref: "#/components/schemas/UserInfo"
+  GetTenantConfigResponse:
+    allOf:
+      - $ref: "#/components/schemas/ResponseBase"
+      - type: object
+        properties:
+          data:
+            $ref: "#/components/schemas/TenantConfig"
+  GetVpnSettingResponse:
+    allOf:
+      - $ref: "#/components/schemas/ResponseBase"
+      - type: object
+        properties:
+          data:
+            $ref: "#/components/schemas/VpnSetting"
+  GetVpnLocationsResponse:
+    allOf:
+      - $ref: "#/components/schemas/ResponseBase"
+      - type: object
+        properties:
+          data:
+            type: array
+            items:
+              $ref: "#/components/schemas/VpnLocation"
+  VpnConnEnvelope:
+    allOf:
+      - $ref: "#/components/schemas/ResponseBase"
+      - type: object
+        properties:
+          data:
+            $ref: "#/components/schemas/VpnConnResponse"
+  ReportSecurityResponse:
+    allOf:
+      - $ref: "#/components/schemas/ResponseBase"
+      - type: object
+        properties:
+          data: { type: string }
+
+  ResponseBase:
+    type: object
+    required: [code]
+    properties:
+      code:
+        type: integer
+        format: int32
+      message: { type: string }
+      extra: *json_object

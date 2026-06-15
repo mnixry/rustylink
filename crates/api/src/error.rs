@@ -22,6 +22,12 @@ pub enum Error {
     #[snafu(display("failed to decode response body from {url}"))]
     DecodeResponse { url: String, source: reqwest::Error },
 
+    #[snafu(display("generated API request failed"))]
+    GeneratedClient {
+        #[snafu(source(from(progenitor_client::Error<()>, Box::new)))]
+        source: Box<progenitor_client::Error<()>>,
+    },
+
     #[snafu(display("failed to serialize request body"))]
     EncodeRequest { source: serde_json::Error },
 

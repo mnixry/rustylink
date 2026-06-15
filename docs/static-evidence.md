@@ -68,7 +68,7 @@ Response fields parsed by the Android client:
 - `data.setting.central_dns`
 - `data.setting.ip_nats`
 
-Other API paths in `crates/api/spec/main.tsp` are named by feature and request/response model evidence. Their exact Retrofit route strings still need extraction from obfuscated interface annotations.
+Other API paths in `crates/api/spec/paths.yaml` are named by feature and request/response model evidence. Their exact Retrofit route strings still need extraction from obfuscated interface annotations.
 
 Additional JADX evidence:
 

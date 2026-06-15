@@ -3,45 +3,44 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use reqwest::{
-    Method, StatusCode,
-    header::{ACCEPT_LANGUAGE, COOKIE, HeaderMap, HeaderName, HeaderValue, SET_COOKIE, USER_AGENT},
+use reqwest::header::{
+    ACCEPT_LANGUAGE, COOKIE, HeaderMap, HeaderName, HeaderValue, SET_COOKIE, USER_AGENT,
 };
-use serde::{Serialize, de::DeserializeOwned};
 use snafu::prelude::*;
 use time::OffsetDateTime;
-use tracing::{debug, instrument};
+use tracing::instrument;
 use url::Url;
 
 use crate::{
+    codegen,
+    codegen::types::{
+        ActivateRequest, ActivateResponse, GetLoginSettingResponse, GetTenantConfigResponse,
+        GetUserInfoResponse, GetVpnLocationsResponse, GetVpnSettingResponse,
+        LoginByPasswordResponse, OAuthCallbackRequest, OauthCallbackResponse, PasswordLoginRequest,
+        ReportSecurityResponse, SecurityReportRequest, SendCodeRequest, SendLoginCodeResponse,
+        VerifyCodeRequest, VerifyLoginCodeResponse, VerifyMfaRequest, VerifyMfaResponse,
+        VpnConnEnvelope, VpnConnRequest,
+    },
     error,
     error::Result,
     identity::ClientIdentity,
-    models::{
-        ActivateInfo, ActivateRequest, BaseResponse, LoginResult, LoginSetting,
-        OAuthCallbackRequest, PasswordLoginRequest, SecurityReportRequest, SendCodeRequest,
-        TenantConfig, UserInfo, VerifyCodeRequest, VerifyMfaRequest, VpnConnRequest,
-        VpnConnResponse, VpnLocation, VpnSetting,
-    },
     signing::{PasswordCipher, SigningContext},
 };
 
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-pub struct EndpointPaths {
-    pub activate: String,
-    pub login_password: String,
-    pub send_login_code: String,
-    pub verify_login_code: String,
-    pub verify_mfa: String,
-    pub oauth_callback: String,
-    #[serde(default = "EndpointPaths::default_login_setting_path")]
-    pub login_setting: String,
-    pub user_info: String,
-    pub tenant_config: String,
-    pub vpn_setting: String,
-    pub vpn_locations: String,
-    pub vpn_conn: String,
-    pub security_report: String,
+macro_rules! with_device_query {
+    ($builder:expr, $query:expr) => {
+        $builder
+            .app_version($query.app_version.clone())
+            .brand($query.brand.clone())
+            .build_number($query.build_number.clone())
+            .client_source($query.client_source.clone())
+            .did($query.did.clone())
+            .model($query.model.clone())
+            .os($query.os.clone())
+            .os_version($query.os_version.clone())
+            .os_version_patch($query.os_version_patch.clone())
+            .timestamp($query.timestamp.clone())
+    };
 }
 
 #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
@@ -49,130 +48,171 @@ pub struct SessionCookies {
     pub values: BTreeMap<String, String>,
 }
 
-#[derive(Clone)]
-pub struct ApiClient {
-    base_url: Url,
-    http: reqwest::Client,
+#[derive(Clone, Debug)]
+pub struct ApiHooks {
     identity: ClientIdentity,
-    paths: EndpointPaths,
     cookies: Arc<RwLock<SessionCookies>>,
     csrf_token: Arc<RwLock<Option<String>>>,
     knock_token: Arc<RwLock<Option<String>>>,
     signer: SigningContext,
 }
 
-impl EndpointPaths {
-    #[must_use]
-    pub fn static_evidence_defaults() -> Self {
-        Self {
-            activate: "/activation/match".to_string(),
-            login_password: "/api/login/v2/password".to_string(),
-            send_login_code: "/api/login/v2/code/send".to_string(),
-            verify_login_code: "/api/login/v2/code/verify".to_string(),
-            verify_mfa: "/api/login/v2/mfa/verify".to_string(),
-            oauth_callback: "/api/login/v2/oauth/callback".to_string(),
-            login_setting: Self::default_login_setting_path(),
-            user_info: "/api/user/info".to_string(),
-            tenant_config: "/api/tenant/config".to_string(),
-            vpn_setting: "/api/vpn/setting".to_string(),
-            vpn_locations: "/api/vpn/locations".to_string(),
-            vpn_conn: "/vpn/conn".to_string(),
-            security_report: "/api/security/report".to_string(),
-        }
-    }
-
-    fn default_login_setting_path() -> String {
-        "/api/login/setting".to_string()
-    }
+#[derive(Clone)]
+pub struct ApiClient {
+    http: reqwest::Client,
+    generated: codegen::Client,
+    hooks: ApiHooks,
 }
 
-impl Default for EndpointPaths {
-    fn default() -> Self {
-        Self::static_evidence_defaults()
-    }
+#[derive(Clone, Debug)]
+struct DeviceQuery {
+    os: String,
+    os_version: String,
+    app_version: String,
+    brand: String,
+    model: String,
+    did: String,
+    build_number: String,
+    os_version_patch: String,
+    timestamp: String,
+    client_source: String,
 }
+
+trait ApiEnvelope {
+    fn code(&self) -> i32;
+    fn message(&self) -> Option<&str>;
+}
+
+macro_rules! impl_api_envelope {
+    ($($ty:ty),+ $(,)?) => {
+        $(
+            impl ApiEnvelope for $ty {
+                fn code(&self) -> i32 {
+                    self.code
+                }
+
+                fn message(&self) -> Option<&str> {
+                    self.message.as_deref()
+                }
+            }
+        )+
+    };
+}
+
+impl_api_envelope!(
+    ActivateResponse,
+    GetLoginSettingResponse,
+    GetTenantConfigResponse,
+    GetUserInfoResponse,
+    GetVpnLocationsResponse,
+    GetVpnSettingResponse,
+    LoginByPasswordResponse,
+    OauthCallbackResponse,
+    ReportSecurityResponse,
+    SendLoginCodeResponse,
+    VerifyLoginCodeResponse,
+    VerifyMfaResponse,
+    VpnConnEnvelope,
+);
 
 impl ApiClient {
     pub fn new(
         base_url: impl AsRef<str>, identity: ClientIdentity, signer: SigningContext,
-        paths: EndpointPaths, cookies: SessionCookies,
+        cookies: SessionCookies,
     ) -> Result<Self> {
-        let base_url_value = base_url.as_ref().to_string();
-        let base_url = Url::parse(&base_url_value).context(error::InvalidBaseUrl {
-            value: base_url_value,
-        })?;
+        let base_url = normalize_base_url(base_url.as_ref())?;
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::limited(10))
             .build()
             .context(error::BuildHttpClient)?;
+        let hooks = ApiHooks::new(identity, signer, cookies);
+        let generated = codegen::Client::new_with_client(&base_url, http.clone(), hooks.clone());
         Ok(Self {
-            base_url,
             http,
-            identity,
-            paths,
-            cookies: Arc::new(RwLock::new(cookies)),
-            csrf_token: Arc::new(RwLock::new(None)),
-            knock_token: Arc::new(RwLock::new(None)),
-            signer,
+            generated,
+            hooks,
         })
     }
 
     #[must_use]
     pub fn cookies(&self) -> SessionCookies {
-        self.cookies
-            .read()
-            .map_or_else(|_| SessionCookies::default(), |guard| guard.clone())
+        self.hooks.cookies()
     }
 
     pub fn set_csrf_token(&self, token: Option<String>) {
-        if let Ok(mut guard) = self.csrf_token.write() {
+        if let Ok(mut guard) = self.hooks.csrf_token.write() {
             *guard = token;
         }
     }
 
     pub fn set_knock_token(&self, token: Option<String>) {
-        if let Ok(mut guard) = self.knock_token.write() {
+        if let Ok(mut guard) = self.hooks.knock_token.write() {
             *guard = token;
         }
     }
 
-    pub async fn activate(&self, code: String) -> Result<BaseResponse<ActivateInfo>> {
-        self.post_without_device_query(&self.paths.activate, &ActivateRequest { code })
+    #[instrument(skip(self))]
+    pub async fn activate(&self, code: String) -> Result<ActivateResponse> {
+        let response = self
+            .generated
+            .activate()
+            .body(ActivateRequest { code })
+            .send()
             .await
+            .context(error::GeneratedClient)?
+            .into_inner();
+        check_api_status(&response)?;
+        Ok(response)
     }
 
+    #[instrument(skip(self, password))]
     pub async fn login_password(
         &self, login_scene: String, account_type: String, account: String, password: String,
-    ) -> Result<BaseResponse<LoginResult>> {
-        let cipher = PasswordCipher::generated();
-        let encrypted = cipher
+    ) -> Result<LoginByPasswordResponse> {
+        let password = PasswordCipher::generated()
             .encrypt_aes_cbc(&password)
             .context(error::EncryptPassword)?;
         let body = PasswordLoginRequest {
             login_scene,
             account_type,
             account,
-            password: encrypted,
+            password,
         };
-        self.post_json(&self.paths.login_password, &body).await
+        let query = self.device_query();
+        let response = with_device_query!(self.generated.login_by_password(), query)
+            .body(body)
+            .send()
+            .await
+            .context(error::GeneratedClient)?
+            .into_inner();
+        check_api_status(&response)?;
+        Ok(response)
     }
 
     pub async fn send_login_code(
         &self, login_scene: String, account_type: String, login_type: String, account: String,
-    ) -> Result<BaseResponse<String>> {
+    ) -> Result<SendLoginCodeResponse> {
         let body = SendCodeRequest {
             login_scene,
             account_type,
             login_type,
             account,
         };
-        self.post_json(&self.paths.send_login_code, &body).await
+        let query = self.device_query();
+        let response = with_device_query!(self.generated.send_login_code(), query)
+            .body(body)
+            .send()
+            .await
+            .context(error::GeneratedClient)?
+            .into_inner();
+        check_api_status(&response)?;
+        Ok(response)
     }
 
     pub async fn verify_login_code(
         &self, login_scene: String, account_type: String, login_type: String, account: String,
         code: String,
-    ) -> Result<BaseResponse<LoginResult>> {
+    ) -> Result<VerifyLoginCodeResponse> {
         let body = VerifyCodeRequest {
             login_scene,
             account_type,
@@ -180,203 +220,182 @@ impl ApiClient {
             account,
             code,
         };
-        self.post_json(&self.paths.verify_login_code, &body).await
+        let query = self.device_query();
+        let response = with_device_query!(self.generated.verify_login_code(), query)
+            .body(body)
+            .send()
+            .await
+            .context(error::GeneratedClient)?
+            .into_inner();
+        check_api_status(&response)?;
+        Ok(response)
     }
 
     pub async fn verify_mfa(
         &self, login_scene: String, mfa_type: String, account: String, code: Option<String>,
         password: Option<String>,
-    ) -> Result<BaseResponse<LoginResult>> {
-        let encrypted_password = match password {
-            Some(value) => Some(
+    ) -> Result<VerifyMfaResponse> {
+        let password = password
+            .map(|value| {
                 PasswordCipher::generated()
                     .encrypt_aes_cbc(&value)
-                    .context(error::EncryptPassword)?,
-            ),
-            None => None,
-        };
+                    .context(error::EncryptPassword)
+            })
+            .transpose()?;
         let body = VerifyMfaRequest {
             login_scene,
             mfa_type,
             account,
             code,
-            password: encrypted_password,
+            password,
         };
-        self.post_json(&self.paths.verify_mfa, &body).await
+        let query = self.device_query();
+        let response = with_device_query!(self.generated.verify_mfa(), query)
+            .body(body)
+            .send()
+            .await
+            .context(error::GeneratedClient)?
+            .into_inner();
+        check_api_status(&response)?;
+        Ok(response)
     }
 
     pub async fn oauth_callback(
         &self, alias_key: String, code: String, state: String, code_verifier: String,
-    ) -> Result<BaseResponse<LoginResult>> {
+    ) -> Result<OauthCallbackResponse> {
         let body = OAuthCallbackRequest {
             alias_key,
             code,
             state,
             code_verifier,
         };
-        self.post_json(&self.paths.oauth_callback, &body).await
+        let query = self.device_query();
+        let response = with_device_query!(self.generated.oauth_callback(), query)
+            .body(body)
+            .send()
+            .await
+            .context(error::GeneratedClient)?
+            .into_inner();
+        check_api_status(&response)?;
+        Ok(response)
     }
 
-    pub async fn login_setting(&self) -> Result<BaseResponse<LoginSetting>> {
-        self.get_json(&self.paths.login_setting).await
+    pub async fn login_setting(&self) -> Result<GetLoginSettingResponse> {
+        let query = self.device_query();
+        let response = with_device_query!(self.generated.get_login_setting(), query)
+            .send()
+            .await
+            .context(error::GeneratedClient)?
+            .into_inner();
+        check_api_status(&response)?;
+        Ok(response)
     }
 
-    pub async fn user_info(&self) -> Result<BaseResponse<UserInfo>> {
-        self.get_json(&self.paths.user_info).await
+    pub async fn user_info(&self) -> Result<GetUserInfoResponse> {
+        let query = self.device_query();
+        let response = with_device_query!(self.generated.get_user_info(), query)
+            .send()
+            .await
+            .context(error::GeneratedClient)?
+            .into_inner();
+        check_api_status(&response)?;
+        Ok(response)
     }
 
-    pub async fn tenant_config(&self) -> Result<BaseResponse<TenantConfig>> {
-        self.get_json(&self.paths.tenant_config).await
+    pub async fn tenant_config(&self) -> Result<GetTenantConfigResponse> {
+        let query = self.device_query();
+        let response = with_device_query!(self.generated.get_tenant_config(), query)
+            .send()
+            .await
+            .context(error::GeneratedClient)?
+            .into_inner();
+        check_api_status(&response)?;
+        Ok(response)
     }
 
-    pub async fn vpn_setting(&self) -> Result<BaseResponse<VpnSetting>> {
-        self.get_json(&self.paths.vpn_setting).await
+    pub async fn vpn_setting(&self) -> Result<GetVpnSettingResponse> {
+        let query = self.device_query();
+        let response = with_device_query!(self.generated.get_vpn_setting(), query)
+            .send()
+            .await
+            .context(error::GeneratedClient)?
+            .into_inner();
+        check_api_status(&response)?;
+        Ok(response)
     }
 
-    pub async fn vpn_locations(&self) -> Result<BaseResponse<Vec<VpnLocation>>> {
-        self.get_json(&self.paths.vpn_locations).await
+    pub async fn vpn_locations(&self) -> Result<GetVpnLocationsResponse> {
+        let query = self.device_query();
+        let response = with_device_query!(self.generated.get_vpn_locations(), query)
+            .send()
+            .await
+            .context(error::GeneratedClient)?
+            .into_inner();
+        check_api_status(&response)?;
+        Ok(response)
     }
 
     pub async fn vpn_conn(
         &self, base_url_override: Option<&str>, body: &VpnConnRequest,
-    ) -> Result<BaseResponse<VpnConnResponse>> {
-        if let Some(base_url) = base_url_override {
-            return self
-                .request_json_with_base(
-                    Method::POST,
-                    base_url,
-                    &self.paths.vpn_conn,
-                    Some(body),
-                    true,
-                )
-                .await;
-        }
-        self.post_json(&self.paths.vpn_conn, body).await
+    ) -> Result<VpnConnEnvelope> {
+        let client = match base_url_override {
+            Some(base_url) => self.generated_client_for(base_url)?,
+            None => self.generated.clone(),
+        };
+        let query = self.device_query();
+        let response = with_device_query!(client.vpn_conn(), query)
+            .body(body.clone())
+            .send()
+            .await
+            .context(error::GeneratedClient)?
+            .into_inner();
+        check_api_status(&response)?;
+        Ok(response)
     }
 
     pub async fn report_security(
         &self, body: &SecurityReportRequest,
-    ) -> Result<BaseResponse<String>> {
-        self.post_json(&self.paths.security_report, body).await
+    ) -> Result<ReportSecurityResponse> {
+        let query = self.device_query();
+        let response = with_device_query!(self.generated.report_security(), query)
+            .body(body.clone())
+            .send()
+            .await
+            .context(error::GeneratedClient)?
+            .into_inner();
+        check_api_status(&response)?;
+        Ok(response)
     }
 
-    async fn get_json<T>(&self, path: &str) -> Result<BaseResponse<T>>
-    where
-        T: DeserializeOwned, {
-        self.request_json::<(), T>(Method::GET, path, None, true)
-            .await
+    fn generated_client_for(&self, base_url: &str) -> Result<codegen::Client> {
+        let base_url = normalize_base_url(base_url)?;
+        Ok(codegen::Client::new_with_client(
+            &base_url,
+            self.http.clone(),
+            self.hooks.clone(),
+        ))
     }
 
-    async fn post_json<B, T>(&self, path: &str, body: &B) -> Result<BaseResponse<T>>
-    where
-        B: Serialize + Sync + ?Sized,
-        T: DeserializeOwned, {
-        self.request_json(Method::POST, path, Some(body), true)
-            .await
+    fn device_query(&self) -> DeviceQuery {
+        DeviceQuery::from_identity(&self.hooks.identity, OffsetDateTime::now_utc())
+    }
+}
+
+impl ApiHooks {
+    fn new(identity: ClientIdentity, signer: SigningContext, cookies: SessionCookies) -> Self {
+        Self {
+            identity,
+            cookies: Arc::new(RwLock::new(cookies)),
+            csrf_token: Arc::new(RwLock::new(None)),
+            knock_token: Arc::new(RwLock::new(None)),
+            signer,
+        }
     }
 
-    async fn post_without_device_query<B, T>(
-        &self, path: &str, body: &B,
-    ) -> Result<BaseResponse<T>>
-    where
-        B: Serialize + Sync + ?Sized,
-        T: DeserializeOwned, {
-        self.request_json(Method::POST, path, Some(body), false)
-            .await
-    }
-
-    async fn request_json<B, T>(
-        &self, method: Method, path: &str, body: Option<&B>, include_device_query: bool,
-    ) -> Result<BaseResponse<T>>
-    where
-        B: Serialize + Sync + ?Sized,
-        T: DeserializeOwned, {
-        let base_url = self.base_url.as_str().to_string();
-        self.request_json_with_base(method, &base_url, path, body, include_device_query)
-            .await
-    }
-
-    #[instrument(skip(self, body), fields(method = %method, path = path))]
-    async fn request_json_with_base<B, T>(
-        &self, method: Method, base_url: &str, path: &str, body: Option<&B>,
-        include_device_query: bool,
-    ) -> Result<BaseResponse<T>>
-    where
-        B: Serialize + Sync + ?Sized,
-        T: DeserializeOwned, {
-        let mut url = Url::parse(base_url).context(error::InvalidBaseUrl {
-            value: base_url.to_string(),
-        })?;
-        let absolute_path = format!("/{}", path.trim_start_matches('/'));
-        url = url.join(&absolute_path).context(error::InvalidBaseUrl {
-            value: format!("{base_url}{path}"),
-        })?;
-        let now = OffsetDateTime::now_utc();
-        if include_device_query {
-            let mut pairs = url.query_pairs_mut();
-            for (key, value) in self.identity.query_pairs(now) {
-                pairs.append_pair(key, &value);
-            }
-        }
-
-        let body_bytes = match body {
-            Some(value) => serde_json::to_vec(value).context(error::EncodeRequest)?,
-            None => Vec::new(),
-        };
-
-        let mut headers = self.base_headers()?;
-        for signed in self
-            .signer
-            .sign(method.as_str(), &url, &headers, &body_bytes)
-            .context(error::SignRequest)?
-        {
-            let name =
-                HeaderName::from_bytes(signed.name.as_bytes()).context(error::HeaderName {
-                    name: signed.name.clone(),
-                })?;
-            let value = HeaderValue::from_str(&signed.value)
-                .context(error::HeaderValue { name: signed.name })?;
-            headers.insert(name, value);
-        }
-
-        let mut request = self
-            .http
-            .request(method.clone(), url.clone())
-            .headers(headers);
-        if body.is_some() {
-            request = request
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .body(body_bytes);
-        }
-
-        debug!("sending API request");
-        let response = request.send().await.context(error::HttpRequest {
-            method: method.to_string(),
-            url: url.to_string(),
-        })?;
-        self.store_response_cookies(response.headers());
-        let status = response.status();
-        let decoded = response
-            .json::<BaseResponse<T>>()
-            .await
-            .context(error::DecodeResponse {
-                url: url.to_string(),
-            })?;
-        if status != StatusCode::OK {
-            debug!(%status, "non-200 API status");
-        }
-        if decoded.code != 0 {
-            let message = decoded
-                .message
-                .clone()
-                .unwrap_or_else(|| "unknown API error".to_string());
-            return error::ApiStatus {
-                code: decoded.code,
-                message,
-            }
-            .fail();
-        }
-        Ok(decoded)
+    fn cookies(&self) -> SessionCookies {
+        self.cookies
+            .read()
+            .map_or_else(|_| SessionCookies::default(), |guard| guard.clone())
     }
 
     fn base_headers(&self) -> Result<HeaderMap> {
@@ -463,4 +482,80 @@ impl ApiClient {
                 .insert(name.trim().to_string(), cookie_value.trim().to_string());
         }
     }
+}
+
+impl DeviceQuery {
+    fn from_identity(identity: &ClientIdentity, now: OffsetDateTime) -> Self {
+        Self {
+            os: identity.os.clone(),
+            os_version: identity.os_version.clone(),
+            app_version: identity.app_version.clone(),
+            brand: identity.brand.clone(),
+            model: identity.model.clone(),
+            did: identity.did.clone(),
+            build_number: identity.build_number.clone(),
+            os_version_patch: identity.os_version_patch.clone(),
+            timestamp: now.unix_timestamp().to_string(),
+            client_source: identity.client_source.clone(),
+        }
+    }
+}
+
+pub async fn prepare_generated_request(
+    hooks: &ApiHooks, request: &mut reqwest::Request,
+) -> Result<()> {
+    request.headers_mut().extend(hooks.base_headers()?);
+    let body = request
+        .body()
+        .and_then(reqwest::Body::as_bytes)
+        .map_or_else(Vec::new, ToOwned::to_owned);
+    for signed in hooks
+        .signer
+        .sign(
+            request.method().as_str(),
+            request.url(),
+            request.headers(),
+            &body,
+        )
+        .context(error::SignRequest)?
+    {
+        let name = HeaderName::from_bytes(signed.name.as_bytes()).context(error::HeaderName {
+            name: signed.name.clone(),
+        })?;
+        let value = HeaderValue::from_str(&signed.value)
+            .context(error::HeaderValue { name: signed.name })?;
+        request.headers_mut().insert(name, value);
+    }
+    Ok(())
+}
+
+pub async fn store_generated_response_cookies(
+    hooks: &ApiHooks, result: &reqwest::Result<reqwest::Response>,
+) -> Result<()> {
+    if let Ok(response) = result {
+        hooks.store_response_cookies(response.headers());
+    }
+    Ok(())
+}
+
+fn normalize_base_url(value: &str) -> Result<String> {
+    Url::parse(value).context(error::InvalidBaseUrl {
+        value: value.to_string(),
+    })?;
+    Ok(value.trim_end_matches('/').to_string())
+}
+
+fn check_api_status(response: &impl ApiEnvelope) -> Result<()> {
+    if response.code() != 0 {
+        let message = response
+            .message()
+            .unwrap_or("unknown API error")
+            .to_string();
+        return error::ApiStatus {
+            code: response.code(),
+            message,
+        }
+        .fail();
+    }
+    Ok(())
 }

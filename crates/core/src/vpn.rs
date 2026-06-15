@@ -1,12 +1,12 @@
 use rustylink_api::{
-    BaseResponse, LoginSetting, TenantConfig, UserInfo, VpnConnRequest, VpnConnResponse,
-    VpnLocation, VpnSetting,
+    GetLoginSettingResponse, GetTenantConfigResponse, GetUserInfoResponse, GetVpnLocationsResponse,
+    GetVpnSettingResponse, TenantConfig, VpnConnEnvelope, VpnConnRequest,
 };
 use snafu::prelude::*;
 
 use crate::{AppContext, error, error::Result};
 
-pub async fn user_info(ctx: &mut AppContext) -> Result<BaseResponse<UserInfo>> {
+pub async fn user_info(ctx: &mut AppContext) -> Result<GetUserInfoResponse> {
     let client = ctx.api_client()?;
     let response = client.user_info().await.context(error::Api)?;
     ctx.sync_from_client(&client);
@@ -14,7 +14,7 @@ pub async fn user_info(ctx: &mut AppContext) -> Result<BaseResponse<UserInfo>> {
     Ok(response)
 }
 
-pub async fn tenant_config(ctx: &mut AppContext) -> Result<BaseResponse<TenantConfig>> {
+pub async fn tenant_config(ctx: &mut AppContext) -> Result<GetTenantConfigResponse> {
     let client = ctx.api_client()?;
     let response = client.tenant_config().await.context(error::Api)?;
     ctx.sync_from_client(&client);
@@ -25,7 +25,7 @@ pub async fn tenant_config(ctx: &mut AppContext) -> Result<BaseResponse<TenantCo
     Ok(response)
 }
 
-pub async fn login_setting(ctx: &mut AppContext) -> Result<BaseResponse<LoginSetting>> {
+pub async fn login_setting(ctx: &mut AppContext) -> Result<GetLoginSettingResponse> {
     let client = ctx.api_client()?;
     let response = client.login_setting().await.context(error::Api)?;
     ctx.sync_from_client(&client);
@@ -57,7 +57,7 @@ fn merge_signing_config(ctx: &mut AppContext, data: &TenantConfig) {
         .collect();
 }
 
-pub async fn vpn_setting(ctx: &mut AppContext) -> Result<BaseResponse<VpnSetting>> {
+pub async fn vpn_setting(ctx: &mut AppContext) -> Result<GetVpnSettingResponse> {
     let client = ctx.api_client()?;
     let response = client.vpn_setting().await.context(error::Api)?;
     ctx.sync_from_client(&client);
@@ -65,7 +65,7 @@ pub async fn vpn_setting(ctx: &mut AppContext) -> Result<BaseResponse<VpnSetting
     Ok(response)
 }
 
-pub async fn vpn_locations(ctx: &mut AppContext) -> Result<BaseResponse<Vec<VpnLocation>>> {
+pub async fn vpn_locations(ctx: &mut AppContext) -> Result<GetVpnLocationsResponse> {
     let client = ctx.api_client()?;
     let response = client.vpn_locations().await.context(error::Api)?;
     ctx.sync_from_client(&client);
@@ -75,7 +75,7 @@ pub async fn vpn_locations(ctx: &mut AppContext) -> Result<BaseResponse<Vec<VpnL
 
 pub async fn vpn_conn(
     ctx: &mut AppContext, base_url_override: Option<&str>, request: &VpnConnRequest,
-) -> Result<BaseResponse<VpnConnResponse>> {
+) -> Result<VpnConnEnvelope> {
     let client = ctx.api_client()?;
     let response = client
         .vpn_conn(base_url_override, request)

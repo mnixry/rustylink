@@ -32,7 +32,6 @@ impl AppContext {
             base_url,
             self.state.identity.clone(),
             SigningContext::new(self.state.signing.clone()),
-            self.state.endpoints.clone(),
             self.state.cookies.clone(),
         )
         .context(error::Api)?;

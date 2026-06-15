@@ -1,6 +1,6 @@
 use std::{fs, path::Path};
 
-use rustylink_api::{ClientIdentity, EndpointPaths, SessionCookies, SigningConfig};
+use rustylink_api::{ClientIdentity, SessionCookies, SigningConfig};
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use time::OffsetDateTime;
@@ -30,7 +30,6 @@ pub struct RustylinkState {
     pub csrf_token: Option<String>,
     pub knock_token: Option<String>,
     pub signing: SigningConfig,
-    pub endpoints: EndpointPaths,
     pub oauth: OAuthState,
     pub updated_at_unix: i64,
 }
@@ -45,7 +44,6 @@ impl RustylinkState {
             csrf_token: None,
             knock_token: None,
             signing: SigningConfig::default(),
-            endpoints: EndpointPaths::default(),
             oauth: OAuthState::default(),
             updated_at_unix: OffsetDateTime::now_utc().unix_timestamp(),
         }
