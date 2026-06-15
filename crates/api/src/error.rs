@@ -53,6 +53,12 @@ pub enum Error {
         source: crate::signing::PasswordCipherError,
     },
 
+    #[snafu(display("VPN dot is missing required field `{field}`"))]
+    MissingVpnDotField { field: &'static str },
+
+    #[snafu(display("invalid VPN dot port `{port}`"))]
+    InvalidPort { port: i32 },
+
     #[snafu(display("API returned code {code}: {message}"))]
     ApiStatus { code: i32, message: String },
 }

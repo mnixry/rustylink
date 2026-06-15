@@ -1,45 +1,3 @@
-parameters:
-  Os:
-    name: os
-    in: query
-    schema: { type: string }
-  OsVersion:
-    name: os_version
-    in: query
-    schema: { type: string }
-  AppVersion:
-    name: app_version
-    in: query
-    schema: { type: string }
-  Brand:
-    name: brand
-    in: query
-    schema: { type: string }
-  Model:
-    name: model
-    in: query
-    schema: { type: string }
-  Did:
-    name: did
-    in: query
-    schema: { type: string }
-  BuildNumber:
-    name: build_number
-    in: query
-    schema: { type: string }
-  OsVersionPatch:
-    name: os_version_patch
-    in: query
-    schema: { type: string }
-  Timestamp:
-    name: timestamp
-    in: query
-    schema: { type: string }
-  ClientSource:
-    name: client_source
-    in: query
-    schema: { type: string }
-
 schemas:
   JsonObject: &json_object
     type: object
@@ -111,9 +69,23 @@ schemas:
     type: object
     properties:
       token: { type: string }
+      vpn_token:
+        type: string
+      csrf-token:
+        type: string
       uid: { type: string }
       need_mfa: { type: boolean }
       mfa_token: { type: string }
+      raw: *json_object
+
+  ThirdPartyLoginInfo:
+    type: object
+    properties:
+      alias: { type: string }
+      alias_key: { type: string }
+      name: { type: string }
+      link: { type: string }
+      url: { type: string }
       raw: *json_object
 
   LoginSetting:
@@ -147,11 +119,11 @@ schemas:
       urls:
         type: array
         items: { type: string }
-      enableSigning: { type: boolean }
-      signingInputParams:
+      enable_signing: { type: boolean }
+      signing_input_params:
         type: integer
         format: int32
-      maxTimeDesync:
+      max_time_desync:
         type: integer
         format: int32
 
@@ -177,12 +149,13 @@ schemas:
   VpnLocation:
     type: object
     properties:
-      id:
-        type: integer
-        format: int32
       name: { type: string }
-      is_auto: { type: boolean }
-      dots:
+      ip: { type: string }
+      type: { type: string }
+      isAuto: { type: boolean }
+      currentDotBean:
+        $ref: "#/components/schemas/VpnDot"
+      vpnDotBeans:
         type: array
         items:
           $ref: "#/components/schemas/VpnDot"
@@ -195,20 +168,64 @@ schemas:
         type: integer
         format: int32
       apiIp: { type: string }
-      apiPort:
+      api_port:
         type: integer
         format: int32
-      vpnIp: { type: string }
-      vpnPort:
+      ip: { type: string }
+      vpn_port:
         type: integer
         format: int32
-      protocolMode:
+      protocol_mode:
         type: integer
         format: int32
+      protocol_detect_config:
+        $ref: "#/components/schemas/VpnProtocolDetectConfig"
       timeout:
         type: integer
         format: int32
+      mode:
+        type: integer
+        format: int32
+      type: { type: string }
+      name: { type: string }
+      display_name: { type: string }
+      domain_name: { type: string }
+      fastIp: { type: string }
+      ip4Domain: { type: string }
+      reconnect: { type: boolean }
+      exclude: { type: boolean }
+      dedicated: { type: boolean }
+      backup_ips:
+        type: array
+        items: { type: string }
+      ip_delay_routing_policy:
+        $ref: "#/components/schemas/IpDelayRoutingPolicy"
       raw: *json_object
+
+  IpDelayRoutingPolicy:
+    type: object
+    properties:
+      is_operator: { type: boolean }
+      policy_type:
+        type: integer
+        format: int32
+
+  VpnProtocolDetectConfig:
+    type: object
+    properties:
+      enable: { type: boolean }
+      bad_network_count:
+        type: integer
+        format: int32
+      refresh_timeout_count:
+        type: integer
+        format: int32
+      tcp2udp_available_count:
+        type: integer
+        format: int32
+      udp2tcp_timeout_count:
+        type: integer
+        format: int32
 
   VpnConnRequest:
     type: object
@@ -222,6 +239,27 @@ schemas:
         format: int32
       sign_token: { type: string }
       not_auto: { type: boolean }
+
+  VpnReportRequest:
+    type: object
+    required: [type, ip, public_key, mode]
+    properties:
+      type: { type: string }
+      ip: { type: string }
+      public_key: { type: string }
+      mode: { type: string }
+
+  VpnExportInfo:
+    type: object
+    additionalProperties: true
+
+  VpnExportListInfo:
+    type: object
+    properties:
+      exports:
+        type: array
+        items:
+          $ref: "#/components/schemas/VpnExportInfo"
 
   VpnConnResponse:
     type: object
@@ -335,6 +373,15 @@ schemas:
         properties:
           data:
             $ref: "#/components/schemas/LoginResult"
+  GetThirdPartyLoginLinksResponse:
+    allOf:
+      - $ref: "#/components/schemas/ResponseBase"
+      - type: object
+        properties:
+          data:
+            type: array
+            items:
+              $ref: "#/components/schemas/ThirdPartyLoginInfo"
   GetLoginSettingResponse:
     allOf:
       - $ref: "#/components/schemas/ResponseBase"
@@ -371,7 +418,7 @@ schemas:
           data:
             type: array
             items:
-              $ref: "#/components/schemas/VpnLocation"
+              $ref: "#/components/schemas/VpnDot"
   VpnConnEnvelope:
     allOf:
       - $ref: "#/components/schemas/ResponseBase"
@@ -379,6 +426,25 @@ schemas:
         properties:
           data:
             $ref: "#/components/schemas/VpnConnResponse"
+  VpnPingResponse:
+    allOf:
+      - $ref: "#/components/schemas/ResponseBase"
+      - type: object
+        properties:
+          data: *json_object
+  GetVpnExportsResponse:
+    allOf:
+      - $ref: "#/components/schemas/ResponseBase"
+      - type: object
+        properties:
+          data:
+            $ref: "#/components/schemas/VpnExportListInfo"
+  ReportVpnResponse:
+    allOf:
+      - $ref: "#/components/schemas/ResponseBase"
+      - type: object
+        properties:
+          data: { type: string }
   ReportSecurityResponse:
     allOf:
       - $ref: "#/components/schemas/ResponseBase"

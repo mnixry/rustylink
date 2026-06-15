@@ -27,7 +27,7 @@ pub async fn activate(
 
     ctx.state.signing.enabled = true;
     ctx.state.signing.activation_code = Some(code.clone());
-    ctx.state.signing.device_id = Some(ctx.state.identity.did.clone());
+    ctx.state.signing.device_id = Some(ctx.state.identity.device_id.clone());
     let client = ctx.api_client()?;
     let response = client.activate(code).await.context(error::Api)?;
     ctx.sync_from_client(&client);

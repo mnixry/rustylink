@@ -108,6 +108,9 @@ impl SigningContext {
         if !self.config.enabled {
             return Ok(Vec::new());
         }
+        if method.eq_ignore_ascii_case("PUT") || is_multipart(headers) {
+            return Ok(Vec::new());
+        }
         let Some(signing_input_params) = self.signing_input_params(url) else {
             return Ok(Vec::new());
         };
@@ -261,6 +264,11 @@ fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
         .get(name)
         .and_then(|value| value.to_str().ok())
         .map(ToOwned::to_owned)
+}
+
+fn is_multipart(headers: &HeaderMap) -> bool {
+    header_value(headers, "content-type")
+        .is_some_and(|value| value.to_ascii_lowercase().starts_with("multipart/"))
 }
 
 fn aes_cbc_iv(key: &str) -> [u8; 16] {

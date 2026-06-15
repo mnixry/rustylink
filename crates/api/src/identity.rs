@@ -9,7 +9,7 @@ pub struct ClientIdentity {
     pub app_version: String,
     pub brand: String,
     pub model: String,
-    pub did: String,
+    pub device_id: String,
     pub build_number: String,
     pub os_version_patch: String,
     pub client_source: String,
@@ -20,18 +20,18 @@ pub struct ClientIdentity {
 impl ClientIdentity {
     #[must_use]
     pub fn android_compatible_default() -> Self {
-        let did = Uuid::new_v4().simple().to_string();
+        let device_id = Uuid::new_v4().simple().to_string();
         Self {
             os: "android".to_string(),
             os_version: "35".to_string(),
             app_version: "3.2.16".to_string(),
             brand: "Google".to_string(),
             model: "Pixel 8".to_string(),
-            did,
+            device_id,
             build_number: "2008".to_string(),
             os_version_patch: "2026-01-01".to_string(),
             client_source: "FeiLian".to_string(),
-            language: "en-US".to_string(),
+            language: "en".to_string(),
             user_agent: "CorpLink/3.2.16 (Android; Rustylink)".to_string(),
         }
     }
@@ -44,7 +44,7 @@ impl ClientIdentity {
             ("app_version", self.app_version.clone()),
             ("brand", self.brand.clone()),
             ("model", self.model.clone()),
-            ("did", self.did.clone()),
+            ("language", self.language.clone()),
             ("build_number", self.build_number.clone()),
             ("os_version_patch", self.os_version_patch.clone()),
             ("timestamp", now.unix_timestamp().to_string()),

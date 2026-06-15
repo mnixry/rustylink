@@ -12,16 +12,17 @@ pub mod codegen {
 
 pub type JsonObject = serde_json::Map<String, serde_json::Value>;
 
-pub use client::{ApiClient, SessionCookies};
+pub use client::{ApiClient, SessionCookies, VpnDotServers};
 pub use codegen::types::{
     ActivateInfo, ActivateRequest, ActivateResponse, GetLoginSettingResponse,
-    GetTenantConfigResponse, GetUserInfoResponse, GetVpnLocationsResponse, GetVpnSettingResponse,
-    LoginByPasswordResponse, LoginResult, LoginSetting, OAuthCallbackRequest,
-    OauthCallbackResponse, PasswordLoginRequest, ReportSecurityResponse, SecurityReportItem,
-    SecurityReportRequest, SendCodeRequest, SendLoginCodeResponse,
-    SigningConfig as TenantSigningConfig, SigningRule, TenantConfig, UserInfo, VerifyCodeRequest,
-    VerifyLoginCodeResponse, VerifyMfaRequest, VerifyMfaResponse, VpnConnEnvelope, VpnConnRequest,
-    VpnConnResponse, VpnConnSetting, VpnDot, VpnLocation, VpnSetting,
+    GetTenantConfigResponse, GetUserInfoResponse, GetVpnExportsResponse, GetVpnLocationsResponse,
+    GetVpnSettingResponse, LoginByPasswordResponse, LoginResult, LoginSetting,
+    OAuthCallbackRequest, OauthCallbackResponse, PasswordLoginRequest, ReportSecurityResponse,
+    ReportVpnResponse, SecurityReportItem, SecurityReportRequest, SendCodeRequest,
+    SendLoginCodeResponse, SigningConfig as TenantSigningConfig, SigningRule, TenantConfig,
+    UserInfo, VerifyCodeRequest, VerifyLoginCodeResponse, VerifyMfaRequest, VerifyMfaResponse,
+    VpnConnEnvelope, VpnConnRequest, VpnConnResponse, VpnConnSetting, VpnDot, VpnExportInfo,
+    VpnExportListInfo, VpnLocation, VpnPingResponse, VpnReportRequest, VpnSetting,
 };
 pub use error::{Error, Result};
 pub use identity::ClientIdentity;

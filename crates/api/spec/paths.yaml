@@ -1,4 +1,4 @@
-/activation/match:
+/api/match:
   post:
     operationId: activate
     requestBody:
@@ -15,20 +15,9 @@
             schema:
               $ref: "#/components/schemas/ActivateResponse"
 
-/api/login/v2/password:
+/api/login:
   post:
     operationId: loginByPassword
-    parameters: &device_query
-      - $ref: "#/components/parameters/Os"
-      - $ref: "#/components/parameters/OsVersion"
-      - $ref: "#/components/parameters/AppVersion"
-      - $ref: "#/components/parameters/Brand"
-      - $ref: "#/components/parameters/Model"
-      - $ref: "#/components/parameters/Did"
-      - $ref: "#/components/parameters/BuildNumber"
-      - $ref: "#/components/parameters/OsVersionPatch"
-      - $ref: "#/components/parameters/Timestamp"
-      - $ref: "#/components/parameters/ClientSource"
     requestBody:
       required: true
       content:
@@ -43,10 +32,9 @@
             schema:
               $ref: "#/components/schemas/LoginByPasswordResponse"
 
-/api/login/v2/code/send:
+/api/login/code/send:
   post:
     operationId: sendLoginCode
-    parameters: *device_query
     requestBody:
       required: true
       content:
@@ -61,10 +49,9 @@
             schema:
               $ref: "#/components/schemas/SendLoginCodeResponse"
 
-/api/login/v2/code/verify:
+/api/login/code/verify:
   post:
     operationId: verifyLoginCode
-    parameters: *device_query
     requestBody:
       required: true
       content:
@@ -79,10 +66,9 @@
             schema:
               $ref: "#/components/schemas/VerifyLoginCodeResponse"
 
-/api/login/v2/mfa/verify:
+/api/mfa/code/verify:
   post:
     operationId: verifyMfa
-    parameters: *device_query
     requestBody:
       required: true
       content:
@@ -97,16 +83,38 @@
             schema:
               $ref: "#/components/schemas/VerifyMfaResponse"
 
-/api/login/v2/oauth/callback:
-  post:
+/api/tpslogin/link:
+  get:
+    operationId: getThirdPartyLoginLinks
+    parameters:
+      - name: code_challenge
+        in: query
+        required: true
+        schema: { type: string }
+    responses:
+      "200":
+        description: The request has succeeded.
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GetThirdPartyLoginLinksResponse"
+
+/api/tpslogin/callback/{alias}:
+  get:
     operationId: oauthCallback
-    parameters: *device_query
-    requestBody:
-      required: true
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/OAuthCallbackRequest"
+    parameters:
+      - name: alias
+        in: path
+        required: true
+        schema: { type: string }
+      - name: code
+        in: query
+        required: true
+        schema: { type: string }
+      - name: state
+        in: query
+        required: true
+        schema: { type: string }
     responses:
       "200":
         description: The request has succeeded.
@@ -118,7 +126,6 @@
 /api/login/setting:
   get:
     operationId: getLoginSetting
-    parameters: *device_query
     responses:
       "200":
         description: The request has succeeded.
@@ -127,10 +134,9 @@
             schema:
               $ref: "#/components/schemas/GetLoginSettingResponse"
 
-/api/user/info:
+/api/info/me:
   get:
     operationId: getUserInfo
-    parameters: *device_query
     responses:
       "200":
         description: The request has succeeded.
@@ -142,7 +148,6 @@
 /api/tenant/config:
   get:
     operationId: getTenantConfig
-    parameters: *device_query
     responses:
       "200":
         description: The request has succeeded.
@@ -151,10 +156,9 @@
             schema:
               $ref: "#/components/schemas/GetTenantConfigResponse"
 
-/api/vpn/setting:
+/api/setting:
   get:
     operationId: getVpnSetting
-    parameters: *device_query
     responses:
       "200":
         description: The request has succeeded.
@@ -163,10 +167,9 @@
             schema:
               $ref: "#/components/schemas/GetVpnSettingResponse"
 
-/api/vpn/locations:
+/api/vpn/list:
   get:
     operationId: getVpnLocations
-    parameters: *device_query
     responses:
       "200":
         description: The request has succeeded.
@@ -178,7 +181,6 @@
 /vpn/conn:
   post:
     operationId: vpnConn
-    parameters: *device_query
     requestBody:
       required: true
       content:
@@ -193,10 +195,48 @@
             schema:
               $ref: "#/components/schemas/VpnConnEnvelope"
 
+/vpn/ping:
+  get:
+    operationId: vpnPing
+    responses:
+      "200":
+        description: The request has succeeded.
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VpnPingResponse"
+
+/vpn/export:
+  get:
+    operationId: getVpnExports
+    responses:
+      "200":
+        description: The request has succeeded.
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GetVpnExportsResponse"
+
+/vpn/report:
+  post:
+    operationId: reportVpn
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/VpnReportRequest"
+    responses:
+      "200":
+        description: The request has succeeded.
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReportVpnResponse"
+
 /api/security/report:
   post:
     operationId: reportSecurity
-    parameters: *device_query
     requestBody:
       required: true
       content:
