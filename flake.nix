@@ -15,10 +15,6 @@
       url = "github:numtide/treefmt-nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
-    pnpm2nix = {
-      url = "github:wrvsrx/pnpm2nix-nzbr/adapt-to-v9";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
     crane.url = "github:ipetkov/crane";
   };
 
@@ -37,10 +33,7 @@
         let
           pkgs = import inputs.nixpkgs {
             inherit system;
-            overlays = [
-              (import inputs.rust-overlay)
-              inputs.pnpm2nix.overlays.default
-            ];
+            overlays = [ (import inputs.rust-overlay) ];
           };
           rust = pkgs.rust-bin.stable.latest.default.override {
             extensions = [
@@ -49,7 +42,6 @@
             ];
           };
           rustfmt = pkgs.rust-bin.selectLatestNightlyWith (toolchain: toolchain.rustfmt);
-          typespec = pkgs.callPackage ./nix/typespec { };
           craneLib = (inputs.crane.mkLib pkgs).overrideToolchain (_: rust);
           craneCommonArgs = rec {
             src = ./.;
@@ -62,7 +54,6 @@
                 "${rust}/lib/rustlib/src/rust/library/Cargo.lock"
               ];
             };
-            nativeBuildInputs = [ typespec ];
           };
           cargoArtifacts = craneLib.buildDepsOnly craneCommonArgs;
         in
@@ -86,7 +77,6 @@
             buildInputs = [
               (lib.hiPrio rustfmt)
               rust
-              typespec
             ]
             ++ (
               with pkgs;
