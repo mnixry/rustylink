@@ -1,5 +1,16 @@
 use rustylink_api::VpnConnResponse;
 use serde::{Deserialize, Serialize};
+use snafu::prelude::*;
+use strum::{Display, EnumIter, EnumString};
+
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub(crate)))]
+pub enum Error {
+    #[snafu(display("route manager failed: {message}"))]
+    RouteManager { message: String },
+}
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RouteRule {
@@ -8,13 +19,17 @@ pub struct RouteRule {
     pub mode: RouteMode,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(
+    Clone, Copy, Debug, Deserialize, Display, EnumIter, EnumString, Eq, PartialEq, Serialize,
+)]
 pub enum AddressFamily {
     V4,
     V6,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(
+    Clone, Copy, Debug, Deserialize, Display, EnumIter, EnumString, Eq, PartialEq, Serialize,
+)]
 pub enum RouteMode {
     Full,
     Split,
@@ -56,7 +71,7 @@ impl RoutePlan {
         Self { rules }
     }
 
-    pub fn apply(&self) -> crate::Result<()> {
+    pub fn apply(&self) -> Result<()> {
         tracing::info!(
             routes = self.rules.len(),
             "route plan ready for route_manager"

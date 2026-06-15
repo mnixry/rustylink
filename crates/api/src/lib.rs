@@ -10,6 +10,11 @@ pub mod codegen {
     include!(concat!(env!("OUT_DIR"), "/progenitor.rs"));
 }
 
+#[allow(clippy::all, clippy::cargo, clippy::nursery, clippy::pedantic)]
+pub(crate) mod sign_proto {
+    include!(concat!(env!("OUT_DIR"), "/rustylink.sign.rs"));
+}
+
 pub type JsonObject = serde_json::Map<String, serde_json::Value>;
 
 pub use client::{ApiClient, SessionCookies, VpnDotServers};

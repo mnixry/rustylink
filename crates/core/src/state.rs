@@ -5,7 +5,38 @@ use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use time::OffsetDateTime;
 
-use crate::{error, error::Result};
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub(crate)))]
+pub enum Error {
+    #[snafu(display("failed to read state file {}", path.display()))]
+    ReadState {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
+
+    #[snafu(display("failed to write state file {}", path.display()))]
+    WriteState {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
+
+    #[snafu(display("failed to create state directory {}", path.display()))]
+    CreateStateDir {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
+
+    #[snafu(display("failed to parse state file {}", path.display()))]
+    ParseState {
+        path: std::path::PathBuf,
+        source: serde_json::Error,
+    },
+
+    #[snafu(display("failed to serialize state"))]
+    SerializeState { source: serde_json::Error },
+}
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct TenantState {
@@ -53,10 +84,10 @@ impl RustylinkState {
         if !path.exists() {
             return Ok(Self::new());
         }
-        let bytes = fs::read(path).context(error::ReadState {
+        let bytes = fs::read(path).context(ReadStateSnafu {
             path: path.to_path_buf(),
         })?;
-        serde_json::from_slice(&bytes).context(error::ParseState {
+        serde_json::from_slice(&bytes).context(ParseStateSnafu {
             path: path.to_path_buf(),
         })
     }
@@ -64,12 +95,12 @@ impl RustylinkState {
     pub fn save(&mut self, path: &Path) -> Result<()> {
         self.updated_at_unix = OffsetDateTime::now_utc().unix_timestamp();
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).context(error::CreateStateDir {
+            fs::create_dir_all(parent).context(CreateStateDirSnafu {
                 path: parent.to_path_buf(),
             })?;
         }
-        let bytes = serde_json::to_vec_pretty(self).context(error::SerializeState)?;
-        fs::write(path, bytes).context(error::WriteState {
+        let bytes = serde_json::to_vec_pretty(self).context(SerializeStateSnafu)?;
+        fs::write(path, bytes).context(WriteStateSnafu {
             path: path.to_path_buf(),
         })
     }

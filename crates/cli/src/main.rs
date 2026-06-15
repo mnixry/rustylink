@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf};
+use std::{fs, path::PathBuf, str::FromStr};
 
 use clap::{Args, Parser, Subcommand};
 use rustylink_api::{SecurityReportRequest, VpnConnRequest, VpnReportRequest};
@@ -9,15 +9,34 @@ use rustylink_core::{
 use rustylink_tunnel::{LocalTunnelParams, TunnelConfig, TunnelSession};
 use serde_json::json;
 use snafu::prelude::*;
+use strum::IntoEnumIterator;
 use tracing_subscriber::{EnvFilter, fmt};
 
 #[derive(Debug, Snafu)]
-#[snafu(module, context(suffix(false)))]
+#[snafu(module, visibility(pub(crate)))]
 enum CliError {
-    #[snafu(display("core operation failed"))]
-    Core {
-        #[snafu(source(from(rustylink_core::Error, Box::new)))]
-        source: Box<rustylink_core::Error>,
+    #[snafu(display("application context operation failed"))]
+    CoreContext {
+        #[snafu(source(from(rustylink_core::context::Error, Box::new)))]
+        source: Box<rustylink_core::context::Error>,
+    },
+
+    #[snafu(display("authentication operation failed"))]
+    Auth {
+        #[snafu(source(from(rustylink_core::auth::Error, Box::new)))]
+        source: Box<rustylink_core::auth::Error>,
+    },
+
+    #[snafu(display("VPN core operation failed"))]
+    Vpn {
+        #[snafu(source(from(rustylink_core::vpn::Error, Box::new)))]
+        source: Box<rustylink_core::vpn::Error>,
+    },
+
+    #[snafu(display("security report operation failed"))]
+    Security {
+        #[snafu(source(from(rustylink_core::security::Error, Box::new)))]
+        source: Box<rustylink_core::security::Error>,
     },
 
     #[snafu(display("tunnel operation failed"))]
@@ -38,8 +57,8 @@ enum CliError {
     #[snafu(display("failed to render JSON output"))]
     RenderJson { source: serde_json::Error },
 
-    #[snafu(display("invalid VPN mode `{value}`; expected Full, Split, or Relay"))]
-    InvalidVpnMode { value: String },
+    #[snafu(display("invalid VPN mode `{value}`; expected one of: {expected}"))]
+    InvalidVpnMode { value: String, expected: String },
 
     #[snafu(display("no export_id was provided and /api/setting did not return one"))]
     MissingExportId,
@@ -257,20 +276,30 @@ enum StateSubcommand {
 async fn main() {
     init_tracing();
     if let Err(error) = run().await {
-        eprintln!("{error}");
+        tracing::error!(%error, "command failed");
+        print_error_chain(&error);
         std::process::exit(1);
+    }
+}
+
+fn print_error_chain(error: &CliError) {
+    eprintln!("{error}");
+    let mut source = std::error::Error::source(error);
+    while let Some(error) = source {
+        eprintln!("  caused by: {error}");
+        source = error.source();
     }
 }
 
 async fn run() -> Result<()> {
     let cli = Cli::parse();
-    let mut ctx = AppContext::load(cli.state_path).context(cli_error::Core)?;
+    let mut ctx = AppContext::load(cli.state_path).context(cli_error::CoreContextSnafu)?;
 
     match cli.command {
         Command::Activate(args) => {
             let response = auth::activate(&mut ctx, args.code, args.base_url, args.backup_url)
                 .await
-                .context(cli_error::Core)?;
+                .context(cli_error::AuthSnafu)?;
             print_json(&json!({ "state": &ctx.state, "response": response }))?;
         }
         Command::Login(command) => handle_login(&mut ctx, command.command).await?,
@@ -295,7 +324,7 @@ async fn handle_login(ctx: &mut AppContext, command: LoginSubcommand) -> Result<
                 args.password,
             )
             .await
-            .context(cli_error::Core)?;
+            .context(cli_error::AuthSnafu)?;
             print_json(&response)?;
         }
         LoginSubcommand::OtpSend(args) => {
@@ -307,7 +336,7 @@ async fn handle_login(ctx: &mut AppContext, command: LoginSubcommand) -> Result<
                 args.account,
             )
             .await
-            .context(cli_error::Core)?;
+            .context(cli_error::AuthSnafu)?;
             print_json(&response)?;
         }
         LoginSubcommand::OtpVerify(args) => {
@@ -320,7 +349,7 @@ async fn handle_login(ctx: &mut AppContext, command: LoginSubcommand) -> Result<
                 args.code,
             )
             .await
-            .context(cli_error::Core)?;
+            .context(cli_error::AuthSnafu)?;
             print_json(&response)?;
         }
         LoginSubcommand::MfaVerify(args) => {
@@ -333,7 +362,7 @@ async fn handle_login(ctx: &mut AppContext, command: LoginSubcommand) -> Result<
                 args.password,
             )
             .await
-            .context(cli_error::Core)?;
+            .context(cli_error::AuthSnafu)?;
             print_json(&response)?;
         }
         LoginSubcommand::OauthStart(args) => {
@@ -344,13 +373,13 @@ async fn handle_login(ctx: &mut AppContext, command: LoginSubcommand) -> Result<
                 args.state,
                 &args.redirect_uri,
             )
-            .context(cli_error::Core)?;
+            .context(cli_error::AuthSnafu)?;
             print_json(&json!({ "url": url }))?;
         }
         LoginSubcommand::OauthCallback(args) => {
             let response = auth::oauth_callback(ctx, args.alias_key, args.code, args.state)
                 .await
-                .context(cli_error::Core)?;
+                .context(cli_error::AuthSnafu)?;
             print_json(&response)?;
         }
     }
@@ -360,15 +389,15 @@ async fn handle_login(ctx: &mut AppContext, command: LoginSubcommand) -> Result<
 async fn handle_profile(ctx: &mut AppContext, command: ProfileSubcommand) -> Result<()> {
     match command {
         ProfileSubcommand::LoginSetting => {
-            let response = vpn::login_setting(ctx).await.context(cli_error::Core)?;
+            let response = vpn::login_setting(ctx).await.context(cli_error::VpnSnafu)?;
             print_json(&response)?;
         }
         ProfileSubcommand::User => {
-            let response = vpn::user_info(ctx).await.context(cli_error::Core)?;
+            let response = vpn::user_info(ctx).await.context(cli_error::VpnSnafu)?;
             print_json(&response)?;
         }
         ProfileSubcommand::Tenant => {
-            let response = vpn::tenant_config(ctx).await.context(cli_error::Core)?;
+            let response = vpn::tenant_config(ctx).await.context(cli_error::VpnSnafu)?;
             print_json(&response)?;
         }
     }
@@ -378,18 +407,18 @@ async fn handle_profile(ctx: &mut AppContext, command: ProfileSubcommand) -> Res
 async fn handle_vpn(ctx: &mut AppContext, command: VpnSubcommand) -> Result<()> {
     match command {
         VpnSubcommand::Setting => {
-            let response = vpn::vpn_setting(ctx).await.context(cli_error::Core)?;
+            let response = vpn::vpn_setting(ctx).await.context(cli_error::VpnSnafu)?;
             print_json(&response)?;
         }
         VpnSubcommand::Locations => {
-            let response = vpn::vpn_locations(ctx).await.context(cli_error::Core)?;
+            let response = vpn::vpn_locations(ctx).await.context(cli_error::VpnSnafu)?;
             print_json(&response)?;
         }
         VpnSubcommand::Conn(args) => {
             let request = vpn_conn_request(ctx, args).await?;
             let response = vpn::vpn_conn(ctx, request.1.as_deref(), &request.0)
                 .await
-                .context(cli_error::Core)?;
+                .context(cli_error::VpnSnafu)?;
             print_json(&response)?;
         }
         VpnSubcommand::Connect(args) => {
@@ -408,7 +437,7 @@ async fn handle_vpn(ctx: &mut AppContext, command: VpnSubcommand) -> Result<()> 
             };
             let config_result = vpn::vpn_config_from_dot_list(ctx, &config_request)
                 .await
-                .context(cli_error::Core)?;
+                .context(cli_error::VpnSnafu)?;
             let data = config_result
                 .response
                 .data
@@ -421,9 +450,9 @@ async fn handle_vpn(ctx: &mut AppContext, command: VpnSubcommand) -> Result<()> 
                 config_result.dot.protocol_mode,
                 config_result.dot.protocol_detect_enabled(),
             )
-            .context(cli_error::Tunnel)?;
+            .context(cli_error::TunnelSnafu)?;
             let mut session = TunnelSession::new(config);
-            session.start().await.context(cli_error::Tunnel)?;
+            session.start().await.context(cli_error::TunnelSnafu)?;
             let connect_report =
                 vpn_report_request(100, &data.ip, &local_params.local_public_key, mode);
             let connect_report_response =
@@ -444,13 +473,13 @@ async fn handle_vpn(ctx: &mut AppContext, command: VpnSubcommand) -> Result<()> 
             }))?;
             tokio::signal::ctrl_c()
                 .await
-                .context(cli_error::WaitForSignal)?;
+                .context(cli_error::WaitForSignalSnafu)?;
             let disconnect_report =
                 vpn_report_request(101, &data.ip, &local_params.local_public_key, mode);
             if let Err(error) = vpn::report_vpn(ctx, &config_result.dot, &disconnect_report).await {
                 tracing::warn!(%error, "failed to report VPN disconnection");
             }
-            session.stop().await.context(cli_error::Tunnel)?;
+            session.stop().await.context(cli_error::TunnelSnafu)?;
         }
     }
     Ok(())
@@ -465,7 +494,7 @@ async fn handle_security(ctx: &mut AppContext, command: SecuritySubcommand) -> R
             };
             let response = security::report_security(ctx, &report)
                 .await
-                .context(cli_error::Core)?;
+                .context(cli_error::SecuritySnafu)?;
             print_json(&response)?;
         }
     }
@@ -482,7 +511,7 @@ async fn vpn_conn_request(
         .unwrap_or_else(|| LocalTunnelParams::generate().local_public_key);
     Ok((
         VpnConnRequest {
-            mode: Some(mode.android_name().to_string()),
+            mode: Some(mode.android_name()),
             public_key,
             otp: args.otp,
             export_id,
@@ -497,16 +526,16 @@ async fn resolve_export_id(ctx: &mut AppContext, export_id: Option<i32>) -> Resu
     if let Some(export_id) = export_id {
         return Ok(export_id);
     }
-    let setting = vpn::vpn_setting(ctx).await.context(cli_error::Core)?;
+    let setting = vpn::vpn_setting(ctx).await.context(cli_error::VpnSnafu)?;
     setting
         .data
         .and_then(|data| data.export_id)
-        .context(cli_error::MissingExportId)
+        .context(cli_error::MissingExportIdSnafu)
 }
 
 fn local_params_for_connect(args: &VpnConnArgs) -> Result<LocalTunnelParams> {
     if let Some(private_key) = &args.local_private_key {
-        return LocalTunnelParams::from_private_key(private_key).context(cli_error::Tunnel);
+        return LocalTunnelParams::from_private_key(private_key).context(cli_error::TunnelSnafu);
     }
     Ok(LocalTunnelParams::generate())
 }
@@ -515,15 +544,20 @@ fn parse_vpn_mode(value: Option<&str>) -> Result<VpnConnectMode> {
     let Some(value) = value else {
         return Ok(VpnConnectMode::Full);
     };
-    match value.to_ascii_lowercase().as_str() {
-        "full" => Ok(VpnConnectMode::Full),
-        "split" => Ok(VpnConnectMode::Split),
-        "relay" | "relpy" => Ok(VpnConnectMode::Relay),
-        _ => cli_error::InvalidVpnMode {
+    VpnConnectMode::from_str(value).map_err(|_| {
+        cli_error::InvalidVpnModeSnafu {
             value: value.to_string(),
+            expected: vpn_mode_names(),
         }
-        .fail(),
-    }
+        .build()
+    })
+}
+
+fn vpn_mode_names() -> String {
+    VpnConnectMode::iter()
+        .map(VpnConnectMode::android_name)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn vpn_report_request(
@@ -531,19 +565,19 @@ fn vpn_report_request(
 ) -> VpnReportRequest {
     VpnReportRequest {
         ip: ip.to_string(),
-        mode: mode.android_name().to_string(),
+        mode: mode.android_name(),
         public_key: public_key.to_string(),
         type_: report_type.to_string(),
     }
 }
 
 fn read_security_report(path: PathBuf) -> Result<SecurityReportRequest> {
-    let bytes = fs::read(&path).context(cli_error::ReadFile { path: path.clone() })?;
-    serde_json::from_slice(&bytes).context(cli_error::ParseJson { path })
+    let bytes = fs::read(&path).context(cli_error::ReadFileSnafu { path: path.clone() })?;
+    serde_json::from_slice(&bytes).context(cli_error::ParseJsonSnafu { path })
 }
 
 fn print_json(value: &impl serde::Serialize) -> Result<()> {
-    let rendered = serde_json::to_string_pretty(value).context(cli_error::RenderJson)?;
+    let rendered = serde_json::to_string_pretty(value).context(cli_error::RenderJsonSnafu)?;
     println!("{rendered}");
     Ok(())
 }

@@ -6,13 +6,16 @@ use std::{
     time::Duration,
 };
 
+use etherparse::{NetSlice, PacketBuilder, SlicedPacket, TransportSlice};
 use gotatun::{
     packet::{Ip, Packet, PacketBufPool},
     tun::{IpRecv, IpSend, MtuWatcher, tun_async_device::TunDevice},
 };
+use hickory_proto::op::Message as DnsMessage;
 use rustylink_api::VpnConnResponse;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use snafu::prelude::*;
 use tokio::{
     net::{UdpSocket, lookup_host},
     task::JoinHandle,
@@ -20,8 +23,24 @@ use tokio::{
 
 const DNS_PORT: u16 = 53;
 const DNS_PROXY_PORT: u16 = 2913;
+const DNS_RESPONSE_HOP_LIMIT: u8 = 64;
 const DNS_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_DNS_PACKET: usize = 4096;
+
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub(crate)))]
+pub enum Error {
+    #[snafu(display("failed to bind DNS proxy listener at {bind_addr}"))]
+    BindProxy {
+        bind_addr: SocketAddr,
+        source: io::Error,
+    },
+
+    #[snafu(display("no DNS proxy listener started"))]
+    NoProxyListener,
+}
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DnsRule {
@@ -62,19 +81,12 @@ pub struct DnsHijackTun {
 
 #[derive(Clone, Debug)]
 struct DnsWireQuery {
-    family: IpFamily,
     source: IpAddr,
     destination: IpAddr,
     source_port: u16,
     destination_port: u16,
     payload: Vec<u8>,
     domain: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug)]
-enum IpFamily {
-    V4,
-    V6,
 }
 
 impl DnsHijackPlan {
@@ -184,7 +196,7 @@ impl DnsHijackPlan {
 }
 
 impl DnsProxyRuntime {
-    pub async fn start(plan: &DnsHijackPlan) -> io::Result<Option<Self>> {
+    pub async fn start(plan: &DnsHijackPlan) -> Result<Option<Self>> {
         let Some(hijacker) = plan.hijacker() else {
             tracing::info!("DNS hijack disabled because no DNS upstream was configured");
             return Ok(None);
@@ -206,18 +218,16 @@ impl DnsProxyRuntime {
                 }
                 Err(error) => {
                     tracing::warn!(%bind_addr, %error, "failed to bind DNS proxy listener");
-                    last_error = Some(error);
+                    last_error = Some((bind_addr, error));
                 }
             }
         }
 
         if tasks.is_empty() {
-            return Err(last_error.unwrap_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::AddrNotAvailable,
-                    "no DNS proxy listener started",
-                )
-            }));
+            return match last_error {
+                Some((bind_addr, source)) => Err(Error::BindProxy { bind_addr, source }),
+                None => NoProxyListenerSnafu.fail(),
+            };
         }
         Ok(Some(Self { tasks }))
     }
@@ -307,14 +317,20 @@ impl DnsHijacker {
         let domain = domain_hint
             .map(ToOwned::to_owned)
             .or_else(|| parse_dns_question_domain(payload));
+        let request_payload = normalize_dns_payload(payload)?;
         let upstreams = self.plan.upstreams_for_domain(domain.as_deref());
         if upstreams.is_empty() {
             return Ok(None);
         }
+        tracing::trace!(
+            domain = domain.as_deref().unwrap_or("<unknown>"),
+            upstream_count = upstreams.len(),
+            "selected DNS upstreams"
+        );
 
         let mut last_error = None;
         for upstream in upstreams {
-            match query_dns_upstream(&upstream, payload).await {
+            match query_dns_upstream(&upstream, &request_payload).await {
                 Ok(response) => {
                     tracing::debug!(
                         domain = domain.as_deref().unwrap_or("<unknown>"),
@@ -341,78 +357,30 @@ impl DnsHijacker {
 
 impl DnsWireQuery {
     fn from_ip_packet(packet: &[u8]) -> Option<Self> {
-        match packet.first()? >> 4 {
-            4 => Self::from_ipv4_packet(packet),
-            6 => Self::from_ipv6_packet(packet),
-            _ => None,
-        }
-    }
-
-    fn from_ipv4_packet(packet: &[u8]) -> Option<Self> {
-        if packet.len() < 28 || packet[9] != 17 {
+        let sliced = SlicedPacket::from_ip(packet).ok()?;
+        let TransportSlice::Udp(udp) = sliced.transport? else {
             return None;
-        }
-        let ihl = usize::from(packet[0] & 0x0F) * 4;
-        if ihl < 20 || packet.len() < ihl + 8 {
-            return None;
-        }
-        let total_len = usize::from(u16::from_be_bytes([packet[2], packet[3]]));
-        if total_len < ihl + 8 || total_len > packet.len() {
-            return None;
-        }
-        let udp = &packet[ihl..total_len];
-        let source_port = u16::from_be_bytes([udp[0], udp[1]]);
-        let destination_port = u16::from_be_bytes([udp[2], udp[3]]);
+        };
+        let destination_port = udp.destination_port();
         if destination_port != DNS_PORT {
             return None;
         }
-        let udp_len = usize::from(u16::from_be_bytes([udp[4], udp[5]]));
-        if udp_len < 8 || udp_len > udp.len() {
-            return None;
-        }
-        let payload = udp[8..udp_len].to_vec();
+        let (source, destination) = match sliced.net? {
+            NetSlice::Ipv4(ipv4) => (
+                IpAddr::V4(ipv4.header().source_addr()),
+                IpAddr::V4(ipv4.header().destination_addr()),
+            ),
+            NetSlice::Ipv6(ipv6) => (
+                IpAddr::V6(ipv6.header().source_addr()),
+                IpAddr::V6(ipv6.header().destination_addr()),
+            ),
+            NetSlice::Arp(_) => return None,
+        };
+        let payload = udp.payload().to_vec();
         Some(Self {
-            family: IpFamily::V4,
-            source: IpAddr::V4(Ipv4Addr::new(
-                packet[12], packet[13], packet[14], packet[15],
-            )),
-            destination: IpAddr::V4(Ipv4Addr::new(
-                packet[16], packet[17], packet[18], packet[19],
-            )),
-            source_port,
-            destination_port,
-            domain: parse_dns_question_domain(&payload),
-            payload,
-        })
-    }
-
-    fn from_ipv6_packet(packet: &[u8]) -> Option<Self> {
-        if packet.len() < 48 || packet[6] != 17 {
-            return None;
-        }
-        let payload_len = usize::from(u16::from_be_bytes([packet[4], packet[5]]));
-        let total_len = 40 + payload_len;
-        if payload_len < 8 || total_len > packet.len() {
-            return None;
-        }
-        let udp = &packet[40..total_len];
-        let source_port = u16::from_be_bytes([udp[0], udp[1]]);
-        let destination_port = u16::from_be_bytes([udp[2], udp[3]]);
-        if destination_port != DNS_PORT {
-            return None;
-        }
-        let udp_len = usize::from(u16::from_be_bytes([udp[4], udp[5]]));
-        if udp_len < 8 || udp_len > udp.len() {
-            return None;
-        }
-        let payload = udp[8..udp_len].to_vec();
-        let source = Ipv6Addr::from(<[u8; 16]>::try_from(&packet[8..24]).ok()?);
-        let destination = Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).ok()?);
-        Some(Self {
-            family: IpFamily::V6,
-            source: IpAddr::V6(source),
-            destination: IpAddr::V6(destination),
-            source_port,
+            source,
+            destination,
+            source_port: udp.source_port(),
             destination_port,
             domain: parse_dns_question_domain(&payload),
             payload,
@@ -420,17 +388,17 @@ impl DnsWireQuery {
     }
 
     fn response_packet(&self, dns_payload: &[u8]) -> io::Result<Vec<u8>> {
-        match (self.family, self.source, self.destination) {
-            (IpFamily::V4, IpAddr::V4(source), IpAddr::V4(destination)) => build_ipv4_udp_response(
-                destination,
-                source,
+        match (self.source, self.destination) {
+            (IpAddr::V4(source), IpAddr::V4(destination)) => build_ipv4_udp_response(
+                destination.octets(),
+                source.octets(),
                 self.destination_port,
                 self.source_port,
                 dns_payload,
             ),
-            (IpFamily::V6, IpAddr::V6(source), IpAddr::V6(destination)) => build_ipv6_udp_response(
-                destination,
-                source,
+            (IpAddr::V6(source), IpAddr::V6(destination)) => build_ipv6_udp_response(
+                destination.octets(),
+                source.octets(),
                 self.destination_port,
                 self.source_port,
                 dns_payload,
@@ -502,160 +470,53 @@ async fn query_dns_addr(
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "DNS upstream timed out"))??;
     response.truncate(len);
-    Ok(response)
+    normalize_dns_payload(&response)
 }
 
 fn build_ipv4_udp_response(
-    source: Ipv4Addr, destination: Ipv4Addr, source_port: u16, destination_port: u16,
-    payload: &[u8],
+    source: [u8; 4], destination: [u8; 4], source_port: u16, destination_port: u16, payload: &[u8],
 ) -> io::Result<Vec<u8>> {
-    let udp_len = 8_usize
-        .checked_add(payload.len())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "DNS response too large"))?;
-    let total_len = 20_usize
-        .checked_add(udp_len)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "DNS response too large"))?;
-    let total_len_u16 = u16::try_from(total_len).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "IPv4 DNS response exceeds u16 length",
-        )
-    })?;
-    let udp_len_u16 = u16::try_from(udp_len).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "UDP DNS response exceeds u16 length",
-        )
-    })?;
-
-    let mut packet = vec![0_u8; total_len];
-    packet[0] = 0x45;
-    packet[2..4].copy_from_slice(&total_len_u16.to_be_bytes());
-    packet[8] = 64;
-    packet[9] = 17;
-    packet[12..16].copy_from_slice(&source.octets());
-    packet[16..20].copy_from_slice(&destination.octets());
-    let ip_checksum = checksum(&packet[..20]);
-    packet[10..12].copy_from_slice(&ip_checksum.to_be_bytes());
-
-    write_udp_header(
-        &mut packet[20..28],
-        source_port,
-        destination_port,
-        udp_len_u16,
-    );
-    packet[28..].copy_from_slice(payload);
-    let udp_checksum = ipv4_udp_checksum(source, destination, &packet[20..]);
-    packet[26..28].copy_from_slice(&udp_checksum.to_be_bytes());
-    Ok(packet)
+    write_udp_packet(
+        PacketBuilder::ipv4(source, destination, DNS_RESPONSE_HOP_LIMIT)
+            .udp(source_port, destination_port),
+        payload,
+    )
 }
 
 fn build_ipv6_udp_response(
-    source: Ipv6Addr, destination: Ipv6Addr, source_port: u16, destination_port: u16,
+    source: [u8; 16], destination: [u8; 16], source_port: u16, destination_port: u16,
     payload: &[u8],
 ) -> io::Result<Vec<u8>> {
-    let udp_len = 8_usize
-        .checked_add(payload.len())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "DNS response too large"))?;
-    let udp_len_u16 = u16::try_from(udp_len).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "UDP DNS response exceeds u16 length",
-        )
-    })?;
-    let mut packet = vec![0_u8; 40 + udp_len];
-    packet[0] = 0x60;
-    packet[4..6].copy_from_slice(&udp_len_u16.to_be_bytes());
-    packet[6] = 17;
-    packet[7] = 64;
-    packet[8..24].copy_from_slice(&source.octets());
-    packet[24..40].copy_from_slice(&destination.octets());
+    write_udp_packet(
+        PacketBuilder::ipv6(source, destination, DNS_RESPONSE_HOP_LIMIT)
+            .udp(source_port, destination_port),
+        payload,
+    )
+}
 
-    write_udp_header(
-        &mut packet[40..48],
-        source_port,
-        destination_port,
-        udp_len_u16,
-    );
-    packet[48..].copy_from_slice(payload);
-    let udp_checksum = ipv6_udp_checksum(source, destination, &packet[40..]);
-    packet[46..48].copy_from_slice(&udp_checksum.to_be_bytes());
+fn write_udp_packet(
+    builder: etherparse::PacketBuilderStep<etherparse::UdpHeader>, payload: &[u8],
+) -> io::Result<Vec<u8>> {
+    let mut packet = Vec::with_capacity(builder.size(payload.len()));
+    builder.write(&mut packet, payload).map_err(to_io_error)?;
     Ok(packet)
 }
 
-fn write_udp_header(header: &mut [u8], source_port: u16, destination_port: u16, udp_len: u16) {
-    header[0..2].copy_from_slice(&source_port.to_be_bytes());
-    header[2..4].copy_from_slice(&destination_port.to_be_bytes());
-    header[4..6].copy_from_slice(&udp_len.to_be_bytes());
-    header[6..8].copy_from_slice(&0_u16.to_be_bytes());
-}
-
-fn ipv4_udp_checksum(source: Ipv4Addr, destination: Ipv4Addr, udp: &[u8]) -> u16 {
-    let mut pseudo = Vec::with_capacity(12 + udp.len());
-    pseudo.extend_from_slice(&source.octets());
-    pseudo.extend_from_slice(&destination.octets());
-    pseudo.push(0);
-    pseudo.push(17);
-    pseudo.extend_from_slice(&(u16::try_from(udp.len()).unwrap_or(u16::MAX)).to_be_bytes());
-    pseudo.extend_from_slice(udp);
-    nonzero_checksum(&pseudo)
-}
-
-fn ipv6_udp_checksum(source: Ipv6Addr, destination: Ipv6Addr, udp: &[u8]) -> u16 {
-    let mut pseudo = Vec::with_capacity(40 + udp.len());
-    pseudo.extend_from_slice(&source.octets());
-    pseudo.extend_from_slice(&destination.octets());
-    pseudo.extend_from_slice(&(u32::try_from(udp.len()).unwrap_or(u32::MAX)).to_be_bytes());
-    pseudo.extend_from_slice(&[0, 0, 0, 17]);
-    pseudo.extend_from_slice(udp);
-    nonzero_checksum(&pseudo)
-}
-
-fn checksum(bytes: &[u8]) -> u16 {
-    let mut sum = 0_u32;
-    for chunk in bytes.chunks(2) {
-        let word = if chunk.len() == 2 {
-            u16::from_be_bytes([chunk[0], chunk[1]])
-        } else {
-            u16::from(chunk[0]) << 8
-        };
-        sum += u32::from(word);
-    }
-    while (sum >> 16) != 0 {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    !u16::try_from(sum).expect("checksum sum is folded into u16")
-}
-
-fn nonzero_checksum(bytes: &[u8]) -> u16 {
-    match checksum(bytes) {
-        0 => 0xFFFF,
-        value => value,
-    }
-}
-
 fn parse_dns_question_domain(payload: &[u8]) -> Option<String> {
-    if payload.len() < 12 || u16::from_be_bytes([payload[4], payload[5]]) == 0 {
-        return None;
-    }
-    let mut offset = 12;
-    let mut labels = Vec::new();
-    while offset < payload.len() {
-        let len = usize::from(payload[offset]);
-        if len == 0 {
-            return (!labels.is_empty()).then(|| labels.join("."));
-        }
-        if (len & 0xC0) != 0 || len > 63 {
-            return None;
-        }
-        offset += 1;
-        if offset + len > payload.len() {
-            return None;
-        }
-        labels.push(String::from_utf8_lossy(&payload[offset..offset + len]).to_lowercase());
-        offset += len;
-    }
-    None
+    let message = DnsMessage::from_vec(payload).ok()?;
+    first_query_domain(&message)
+}
+
+fn normalize_dns_payload(payload: &[u8]) -> io::Result<Vec<u8>> {
+    let message = DnsMessage::from_vec(payload).map_err(to_io_error)?;
+    message.to_vec().map_err(to_io_error)
+}
+
+fn first_query_domain(message: &DnsMessage) -> Option<String> {
+    message
+        .queries()
+        .first()
+        .map(|query| normalize_domain(&query.name().to_ascii()))
 }
 
 fn push_optional_dns_endpoints(upstreams: &mut Vec<String>, value: Option<&str>) {
@@ -784,6 +645,11 @@ fn to_io_error(error: impl std::fmt::Display) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    use hickory_proto::{
+        op::{Message as DnsMessage, Query},
+        rr::{Name, RecordType},
+    };
+
     use super::{dns_endpoint, normalize_domain, parse_dns_question_domain};
 
     #[test]
@@ -806,10 +672,12 @@ mod tests {
 
     #[test]
     fn parses_dns_question_domain() {
-        let payload = [
-            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 7, b'e', b'x', b'a', b'm', b'p',
-            b'l', b'e', 3, b'c', b'o', b'm', 0, 0, 1, 0, 1,
-        ];
+        let mut message = DnsMessage::new();
+        message.add_query(Query::query(
+            Name::from_ascii("example.com.").unwrap(),
+            RecordType::A,
+        ));
+        let payload = message.to_vec().unwrap();
         assert_eq!(
             parse_dns_question_domain(&payload),
             Some("example.com".to_string())

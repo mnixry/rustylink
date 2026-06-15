@@ -22,11 +22,61 @@ use crate::{
         VerifyLoginCodeResponse, VerifyMfaRequest, VerifyMfaResponse, VpnConnEnvelope,
         VpnConnRequest, VpnDot, VpnPingResponse, VpnReportRequest,
     },
-    error,
-    error::Result,
     identity::ClientIdentity,
     signing::{PasswordCipher, SigningContext},
 };
+
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub(crate)))]
+pub enum Error {
+    #[snafu(display("invalid base URL `{value}`"))]
+    InvalidBaseUrl {
+        value: String,
+        source: url::ParseError,
+    },
+
+    #[snafu(display("failed to build HTTP client"))]
+    BuildHttpClient { source: reqwest::Error },
+
+    #[snafu(display("generated API request failed"))]
+    GeneratedClient {
+        #[snafu(source(from(progenitor_client::Error<()>, Box::new)))]
+        source: Box<progenitor_client::Error<()>>,
+    },
+
+    #[snafu(display("failed to build header `{name}`"))]
+    HeaderValue {
+        name: String,
+        source: reqwest::header::InvalidHeaderValue,
+    },
+
+    #[snafu(display("failed to build header name `{name}`"))]
+    HeaderName {
+        name: String,
+        source: reqwest::header::InvalidHeaderName,
+    },
+
+    #[snafu(display("failed to sign request"))]
+    SignRequest {
+        source: crate::signing::SigningError,
+    },
+
+    #[snafu(display("failed to encrypt password"))]
+    EncryptPassword {
+        source: crate::signing::PasswordCipherError,
+    },
+
+    #[snafu(display("VPN dot is missing required field `{field}`"))]
+    MissingVpnDotField { field: &'static str },
+
+    #[snafu(display("invalid VPN dot port `{port}`"))]
+    InvalidPort { port: i32 },
+
+    #[snafu(display("API returned code {code}: {message}"))]
+    ApiStatus { code: i32, message: String },
+}
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
 pub struct SessionCookies {
@@ -105,9 +155,10 @@ impl ApiClient {
         let http = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::limited(10))
             .build()
-            .context(error::BuildHttpClient)?;
+            .context(BuildHttpClientSnafu)?;
         let hooks = ApiHooks::new(identity, signer, cookies);
         let generated = codegen::Client::new_with_client(&base_url, http.clone(), hooks.clone());
+        tracing::debug!(%base_url, "created API client");
         Ok(Self {
             http,
             generated,
@@ -140,7 +191,7 @@ impl ApiClient {
             .body(ActivateRequest { code })
             .send()
             .await
-            .context(error::GeneratedClient)?
+            .context(GeneratedClientSnafu)?
             .into_inner();
         check_api_status(&response)?;
         Ok(response)
@@ -152,7 +203,7 @@ impl ApiClient {
     ) -> Result<LoginByPasswordResponse> {
         let password = PasswordCipher::generated()
             .encrypt_aes_cbc(&password)
-            .context(error::EncryptPassword)?;
+            .context(EncryptPasswordSnafu)?;
         let body = PasswordLoginRequest {
             login_scene,
             account_type,
@@ -165,7 +216,7 @@ impl ApiClient {
             .body(body)
             .send()
             .await
-            .context(error::GeneratedClient)?
+            .context(GeneratedClientSnafu)?
             .into_inner();
         check_api_status(&response)?;
         Ok(response)
@@ -186,7 +237,7 @@ impl ApiClient {
             .body(body)
             .send()
             .await
-            .context(error::GeneratedClient)?
+            .context(GeneratedClientSnafu)?
             .into_inner();
         check_api_status(&response)?;
         Ok(response)
@@ -209,7 +260,7 @@ impl ApiClient {
             .body(body)
             .send()
             .await
-            .context(error::GeneratedClient)?
+            .context(GeneratedClientSnafu)?
             .into_inner();
         check_api_status(&response)?;
         Ok(response)
@@ -223,7 +274,7 @@ impl ApiClient {
             .map(|value| {
                 PasswordCipher::generated()
                     .encrypt_aes_cbc(&value)
-                    .context(error::EncryptPassword)
+                    .context(EncryptPasswordSnafu)
             })
             .transpose()?;
         let body = VerifyMfaRequest {
@@ -239,7 +290,7 @@ impl ApiClient {
             .body(body)
             .send()
             .await
-            .context(error::GeneratedClient)?
+            .context(GeneratedClientSnafu)?
             .into_inner();
         check_api_status(&response)?;
         Ok(response)
@@ -257,7 +308,7 @@ impl ApiClient {
             .state(state)
             .send()
             .await
-            .context(error::GeneratedClient)?
+            .context(GeneratedClientSnafu)?
             .into_inner();
         check_api_status(&response)?;
         Ok(response)
@@ -272,7 +323,7 @@ impl ApiClient {
             .code_challenge(code_challenge)
             .send()
             .await
-            .context(error::GeneratedClient)?
+            .context(GeneratedClientSnafu)?
             .into_inner();
         check_api_status(&response)?;
         Ok(response)
@@ -284,7 +335,7 @@ impl ApiClient {
             .get_login_setting()
             .send()
             .await
-            .context(error::GeneratedClient)?
+            .context(GeneratedClientSnafu)?
             .into_inner();
         check_api_status(&response)?;
         Ok(response)
@@ -296,7 +347,7 @@ impl ApiClient {
             .get_user_info()
             .send()
             .await
-            .context(error::GeneratedClient)?
+            .context(GeneratedClientSnafu)?
             .into_inner();
         check_api_status(&response)?;
         Ok(response)
@@ -308,7 +359,7 @@ impl ApiClient {
             .get_tenant_config()
             .send()
             .await
-            .context(error::GeneratedClient)?
+            .context(GeneratedClientSnafu)?
             .into_inner();
         check_api_status(&response)?;
         Ok(response)
@@ -320,7 +371,7 @@ impl ApiClient {
             .get_vpn_setting()
             .send()
             .await
-            .context(error::GeneratedClient)?
+            .context(GeneratedClientSnafu)?
             .into_inner();
         check_api_status(&response)?;
         Ok(response)
@@ -332,7 +383,7 @@ impl ApiClient {
             .get_vpn_locations()
             .send()
             .await
-            .context(error::GeneratedClient)?
+            .context(GeneratedClientSnafu)?
             .into_inner();
         check_api_status(&response)?;
         Ok(response)
@@ -350,7 +401,7 @@ impl ApiClient {
             .body(body.clone())
             .send()
             .await
-            .context(error::GeneratedClient)?
+            .context(GeneratedClientSnafu)?
             .into_inner();
         check_api_status(&response)?;
         Ok(response)
@@ -370,7 +421,7 @@ impl ApiClient {
             .vpn_ping()
             .send()
             .await
-            .context(error::GeneratedClient)?
+            .context(GeneratedClientSnafu)?
             .into_inner();
         check_api_status(&response)?;
         Ok(response)
@@ -383,7 +434,7 @@ impl ApiClient {
             .get_vpn_exports()
             .send()
             .await
-            .context(error::GeneratedClient)?
+            .context(GeneratedClientSnafu)?
             .into_inner();
         check_api_status(&response)?;
         Ok(response)
@@ -399,7 +450,7 @@ impl ApiClient {
             .body(body.clone())
             .send()
             .await
-            .context(error::GeneratedClient)?
+            .context(GeneratedClientSnafu)?
             .into_inner();
         check_api_status(&response)?;
         Ok(response)
@@ -414,7 +465,7 @@ impl ApiClient {
             .body(body.clone())
             .send()
             .await
-            .context(error::GeneratedClient)?
+            .context(GeneratedClientSnafu)?
             .into_inner();
         check_api_status(&response)?;
         Ok(response)
@@ -456,13 +507,13 @@ impl ApiHooks {
         };
         headers.insert(
             ACCEPT_LANGUAGE,
-            HeaderValue::from_str(accept_language).context(error::HeaderValue {
+            HeaderValue::from_str(accept_language).context(HeaderValueSnafu {
                 name: "Accept-Language".to_string(),
             })?,
         );
         headers.insert(
             USER_AGENT,
-            HeaderValue::from_str(&self.identity.user_agent).context(error::HeaderValue {
+            HeaderValue::from_str(&self.identity.user_agent).context(HeaderValueSnafu {
                 name: "User-Agent".to_string(),
             })?,
         );
@@ -470,7 +521,7 @@ impl ApiHooks {
         if let Some(cookie_header) = self.cookie_header() {
             headers.insert(
                 COOKIE,
-                HeaderValue::from_str(&cookie_header).context(error::HeaderValue {
+                HeaderValue::from_str(&cookie_header).context(HeaderValueSnafu {
                     name: "Cookie".to_string(),
                 })?,
             );
@@ -484,7 +535,7 @@ impl ApiHooks {
         {
             headers.insert(
                 HeaderName::from_static("csrf-token"),
-                HeaderValue::from_str(&csrf).context(error::HeaderValue {
+                HeaderValue::from_str(&csrf).context(HeaderValueSnafu {
                     name: "csrf-token".to_string(),
                 })?,
             );
@@ -492,7 +543,7 @@ impl ApiHooks {
         if let Some(knock) = self.knock_token.read().ok().and_then(|guard| guard.clone()) {
             headers.insert(
                 HeaderName::from_static("knock-token"),
-                HeaderValue::from_str(&knock).context(error::HeaderValue {
+                HeaderValue::from_str(&knock).context(HeaderValueSnafu {
                     name: "knock-token".to_string(),
                 })?,
             );
@@ -500,7 +551,7 @@ impl ApiHooks {
         if let Some(vpn_token) = self.cookie_value("vpn-token") {
             headers.insert(
                 HeaderName::from_static("jwt-token"),
-                HeaderValue::from_str(&vpn_token).context(error::HeaderValue {
+                HeaderValue::from_str(&vpn_token).context(HeaderValueSnafu {
                     name: "jwt-token".to_string(),
                 })?,
             );
@@ -529,8 +580,10 @@ impl ApiHooks {
 
     fn store_response_cookies(&self, headers: &HeaderMap) {
         let Ok(mut guard) = self.cookies.write() else {
+            tracing::warn!("failed to acquire cookie jar write lock");
             return;
         };
+        let before_count = guard.values.len();
         for value in &headers.get_all(SET_COOKIE) {
             let Ok(raw) = value.to_str() else {
                 continue;
@@ -543,6 +596,12 @@ impl ApiHooks {
                 .values
                 .insert(name.trim().to_string(), cookie_value.trim().to_string());
         }
+        let after_count = guard.values.len();
+        tracing::debug!(
+            stored_cookie_delta = after_count.saturating_sub(before_count),
+            total_cookie_count = after_count,
+            "stored response cookies"
+        );
     }
 }
 
@@ -601,20 +660,20 @@ impl VpnDot {
 
 impl VpnDotServers {
     pub fn from_dot(dot: &VpnDot, use_vpn_ip_for_api: bool) -> Result<Self> {
-        let api_host = dot.api_host().context(error::MissingVpnDotField {
+        let api_host = dot.api_host().context(MissingVpnDotFieldSnafu {
             field: "apiIp/ip4Domain/fastIp",
         })?;
         let api_host_for_conn =
             dot.config_api_host(use_vpn_ip_for_api)
-                .context(error::MissingVpnDotField {
+                .context(MissingVpnDotFieldSnafu {
                     field: "apiIp/ip4Domain/fastIp",
                 })?;
         let api_port = dot
             .api_port
-            .context(error::MissingVpnDotField { field: "api_port" })?;
+            .context(MissingVpnDotFieldSnafu { field: "api_port" })?;
         let vpn_port = dot
             .vpn_port
-            .context(error::MissingVpnDotField { field: "vpn_port" })?;
+            .context(MissingVpnDotFieldSnafu { field: "vpn_port" })?;
         let api_base_url = format_https_host_port(api_host_for_conn, api_port)?;
         let wireguard_endpoint = format_host_port(api_host, vpn_port)?;
         Ok(Self {
@@ -638,7 +697,7 @@ pub async fn prepare_generated_request(
         .body()
         .and_then(reqwest::Body::as_bytes)
         .map_or_else(Vec::new, ToOwned::to_owned);
-    for signed in hooks
+    let signed_headers = hooks
         .signer
         .sign(
             request.method().as_str(),
@@ -646,15 +705,23 @@ pub async fn prepare_generated_request(
             request.headers(),
             &body,
         )
-        .context(error::SignRequest)?
-    {
-        let name = HeaderName::from_bytes(signed.name.as_bytes()).context(error::HeaderName {
+        .context(SignRequestSnafu)?;
+    let signed_header_count = signed_headers.len();
+    for signed in signed_headers {
+        let name = HeaderName::from_bytes(signed.name.as_bytes()).context(HeaderNameSnafu {
             name: signed.name.clone(),
         })?;
-        let value = HeaderValue::from_str(&signed.value)
-            .context(error::HeaderValue { name: signed.name })?;
+        let value =
+            HeaderValue::from_str(&signed.value).context(HeaderValueSnafu { name: signed.name })?;
         request.headers_mut().insert(name, value);
     }
+    tracing::debug!(
+        method = %request.method(),
+        host = request.url().host_str().unwrap_or("<none>"),
+        path = request.url().path(),
+        signed_header_count,
+        "prepared generated API request"
+    );
     Ok(())
 }
 
@@ -668,7 +735,7 @@ pub async fn store_generated_response_cookies(
 }
 
 fn normalize_base_url(value: &str) -> Result<String> {
-    Url::parse(value).context(error::InvalidBaseUrl {
+    Url::parse(value).context(InvalidBaseUrlSnafu {
         value: value.to_string(),
     })?;
     Ok(value.trim_end_matches('/').to_string())
@@ -680,11 +747,11 @@ fn format_https_host_port(host: &str, port: i32) -> Result<String> {
 
 fn format_host_port(host: &str, port: i32) -> Result<String> {
     if port <= 0 || port > i32::from(u16::MAX) {
-        return error::InvalidPort { port }.fail();
+        return InvalidPortSnafu { port }.fail();
     }
     let host = host.trim();
     if host.is_empty() {
-        return error::MissingVpnDotField { field: "host" }.fail();
+        return MissingVpnDotFieldSnafu { field: "host" }.fail();
     }
     if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
         Ok(format!("[{host}]:{port}"))
@@ -699,7 +766,7 @@ fn check_api_status(response: &impl ApiEnvelope) -> Result<()> {
             .message()
             .unwrap_or("unknown API error")
             .to_string();
-        return error::ApiStatus {
+        return ApiStatusSnafu {
             code: response.code(),
             message,
         }

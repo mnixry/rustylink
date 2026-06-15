@@ -4,17 +4,25 @@ use rustylink_api::{
     VpnDot, VpnDotServers, VpnReportRequest,
 };
 use snafu::prelude::*;
+use strum::{Display, EnumIter, EnumString, FromRepr, IntoStaticStr};
 
-use crate::{AppContext, error, error::Result};
+use crate::AppContext;
 
 const MAX_DOT_ATTEMPTS: usize = 3;
 const MAX_CONFIG_ATTEMPTS_PER_DOT: usize = 3;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(
+    Clone, Copy, Debug, Display, EnumIter, EnumString, Eq, FromRepr, IntoStaticStr, PartialEq,
+)]
+#[repr(i32)]
+#[strum(ascii_case_insensitive)]
 pub enum VpnConnectMode {
-    Full,
-    Split,
-    Relay,
+    #[strum(to_string = "Full", serialize = "full")]
+    Full  = 0,
+    #[strum(to_string = "Split", serialize = "split")]
+    Split = 1,
+    #[strum(to_string = "Relay", serialize = "relay", serialize = "relpy")]
+    Relay = 2,
 }
 
 #[derive(Clone, Debug)]
@@ -36,50 +44,69 @@ pub struct VpnConfigResult {
     pub response: VpnConnEnvelope,
 }
 
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub(crate)))]
+pub enum Error {
+    #[snafu(display("application context operation failed"))]
+    Context {
+        #[snafu(source(from(crate::context::Error, Box::new)))]
+        source: Box<crate::context::Error>,
+    },
+
+    #[snafu(display("API operation failed"))]
+    Api {
+        #[snafu(source(from(rustylink_api::Error, Box::new)))]
+        source: Box<rustylink_api::Error>,
+    },
+
+    #[snafu(display("no VPN dots were returned by /api/vpn/list"))]
+    NoVpnDots,
+
+    #[snafu(display("no VPN dot supports requested mode `{mode}`"))]
+    NoSupportedVpnDot { mode: String },
+
+    #[snafu(display("VPN config response did not contain data"))]
+    MissingVpnConfigData,
+}
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
 impl VpnConnectMode {
     #[must_use]
     pub const fn android_id(self) -> i32 {
-        match self {
-            Self::Full => 0,
-            Self::Split => 1,
-            Self::Relay => 2,
-        }
+        self as i32
     }
 
     #[must_use]
-    pub const fn android_name(self) -> &'static str {
-        match self {
-            Self::Full => "Full",
-            Self::Split => "Split",
-            Self::Relay => "Relay",
-        }
+    pub fn android_name(self) -> String {
+        self.to_string()
     }
 }
 
 pub async fn user_info(ctx: &mut AppContext) -> Result<GetUserInfoResponse> {
-    let client = ctx.api_client()?;
-    let response = client.user_info().await.context(error::Api)?;
+    let client = ctx.api_client().context(ContextSnafu)?;
+    let response = client.user_info().await.context(ApiSnafu)?;
     ctx.sync_from_client(&client);
-    ctx.save()?;
+    ctx.save().context(ContextSnafu)?;
     Ok(response)
 }
 
 pub async fn tenant_config(ctx: &mut AppContext) -> Result<GetTenantConfigResponse> {
-    let client = ctx.api_client()?;
-    let response = client.tenant_config().await.context(error::Api)?;
+    let client = ctx.api_client().context(ContextSnafu)?;
+    let response = client.tenant_config().await.context(ApiSnafu)?;
     ctx.sync_from_client(&client);
     if let Some(data) = &response.data {
         merge_signing_config(ctx, data);
     }
-    ctx.save()?;
+    ctx.save().context(ContextSnafu)?;
     Ok(response)
 }
 
 pub async fn login_setting(ctx: &mut AppContext) -> Result<GetLoginSettingResponse> {
-    let client = ctx.api_client()?;
-    let response = client.login_setting().await.context(error::Api)?;
+    let client = ctx.api_client().context(ContextSnafu)?;
+    let response = client.login_setting().await.context(ApiSnafu)?;
     ctx.sync_from_client(&client);
-    ctx.save()?;
+    ctx.save().context(ContextSnafu)?;
     Ok(response)
 }
 
@@ -108,43 +135,43 @@ fn merge_signing_config(ctx: &mut AppContext, data: &TenantConfig) {
 }
 
 pub async fn vpn_setting(ctx: &mut AppContext) -> Result<GetVpnSettingResponse> {
-    let client = ctx.api_client()?;
-    let response = client.vpn_setting().await.context(error::Api)?;
+    let client = ctx.api_client().context(ContextSnafu)?;
+    let response = client.vpn_setting().await.context(ApiSnafu)?;
     ctx.sync_from_client(&client);
-    ctx.save()?;
+    ctx.save().context(ContextSnafu)?;
     Ok(response)
 }
 
 pub async fn vpn_locations(ctx: &mut AppContext) -> Result<GetVpnLocationsResponse> {
-    let client = ctx.api_client()?;
-    let response = client.vpn_locations().await.context(error::Api)?;
+    let client = ctx.api_client().context(ContextSnafu)?;
+    let response = client.vpn_locations().await.context(ApiSnafu)?;
     ctx.sync_from_client(&client);
-    ctx.save()?;
+    ctx.save().context(ContextSnafu)?;
     Ok(response)
 }
 
 pub async fn vpn_conn(
     ctx: &mut AppContext, base_url_override: Option<&str>, request: &VpnConnRequest,
 ) -> Result<VpnConnEnvelope> {
-    let client = ctx.api_client()?;
+    let client = ctx.api_client().context(ContextSnafu)?;
     let response = client
         .vpn_conn(base_url_override, request)
         .await
-        .context(error::Api)?;
+        .context(ApiSnafu)?;
     ctx.sync_from_client(&client);
-    ctx.save()?;
+    ctx.save().context(ContextSnafu)?;
     Ok(response)
 }
 
 pub async fn vpn_config_from_dot_list(
     ctx: &mut AppContext, request: &VpnConfigRequest,
 ) -> Result<VpnConfigResult> {
-    let client = ctx.api_client()?;
-    let locations = client.vpn_locations().await.context(error::Api)?;
+    let client = ctx.api_client().context(ContextSnafu)?;
+    let locations = client.vpn_locations().await.context(ApiSnafu)?;
     ctx.sync_from_client(&client);
     let dots = locations.data.clone();
     if dots.is_empty() {
-        return error::NoVpnDots.fail();
+        return NoVpnDotsSnafu.fail();
     }
 
     let mut candidates = dots
@@ -159,8 +186,8 @@ pub async fn vpn_config_from_dot_list(
         .collect::<Vec<_>>();
 
     if candidates.is_empty() {
-        return error::NoSupportedVpnDot {
-            mode: request.mode.android_name().to_string(),
+        return NoSupportedVpnDotSnafu {
+            mode: request.mode.android_name(),
         }
         .fail();
     }
@@ -169,9 +196,9 @@ pub async fn vpn_config_from_dot_list(
     let mut last_error = None;
     for dot in candidates {
         let use_vpn_ip_for_api = dot.should_use_vpn_ip_for_config_api(!request.not_auto);
-        let servers = VpnDotServers::from_dot(&dot, use_vpn_ip_for_api).context(error::Api)?;
+        let servers = VpnDotServers::from_dot(&dot, use_vpn_ip_for_api).context(ApiSnafu)?;
         let body = VpnConnRequest {
-            mode: Some(request.mode.android_name().to_string()),
+            mode: Some(request.mode.android_name()),
             public_key: request.public_key.clone(),
             otp: request.otp.clone(),
             export_id: request.export_id,
@@ -191,9 +218,9 @@ pub async fn vpn_config_from_dot_list(
             {
                 Ok(response) => {
                     ctx.sync_from_client(&client);
-                    ctx.save()?;
+                    ctx.save().context(ContextSnafu)?;
                     if response.data.is_none() {
-                        return error::MissingVpnConfigData.fail();
+                        return MissingVpnConfigDataSnafu.fail();
                     }
                     return Ok(VpnConfigResult {
                         dot,
@@ -216,14 +243,14 @@ pub async fn vpn_config_from_dot_list(
     }
 
     ctx.sync_from_client(&client);
-    ctx.save()?;
+    ctx.save().context(ContextSnafu)?;
     if let Some(source) = last_error {
-        return Err(error::Error::Api {
+        return Err(Error::Api {
             source: Box::new(source),
         });
     }
-    error::NoSupportedVpnDot {
-        mode: request.mode.android_name().to_string(),
+    NoSupportedVpnDotSnafu {
+        mode: request.mode.android_name(),
     }
     .fail()
 }
@@ -231,12 +258,12 @@ pub async fn vpn_config_from_dot_list(
 pub async fn report_vpn(
     ctx: &mut AppContext, dot: &VpnDot, request: &VpnReportRequest,
 ) -> Result<ReportVpnResponse> {
-    let client = ctx.api_client()?;
+    let client = ctx.api_client().context(ContextSnafu)?;
     let response = client
         .report_vpn_for_dot(dot, request)
         .await
-        .context(error::Api)?;
+        .context(ApiSnafu)?;
     ctx.sync_from_client(&client);
-    ctx.save()?;
+    ctx.save().context(ContextSnafu)?;
     Ok(response)
 }

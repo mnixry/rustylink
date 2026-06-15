@@ -15,6 +15,7 @@ rustylink-tunnel             = { path = "../tunnel" }
 serde.workspace              = true
 serde_json.workspace         = true
 snafu.workspace              = true
+strum.workspace              = true
 tokio.workspace              = true
 tracing.workspace            = true
 tracing-subscriber.workspace = true

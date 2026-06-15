@@ -3,7 +3,25 @@ use std::path::PathBuf;
 use rustylink_api::{ApiClient, SigningContext};
 use snafu::prelude::*;
 
-use crate::{error, error::Result, state::RustylinkState};
+use crate::state::RustylinkState;
+
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub(crate)))]
+pub enum Error {
+    #[snafu(display("state operation failed"))]
+    State { source: crate::state::Error },
+
+    #[snafu(display("no tenant base URL configured; run activate with --base-url first"))]
+    MissingBaseUrl,
+
+    #[snafu(display("API client setup failed"))]
+    Api {
+        #[snafu(source(from(rustylink_api::Error, Box::new)))]
+        source: Box<rustylink_api::Error>,
+    },
+}
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Clone, Debug)]
 pub struct AppContext {
@@ -14,19 +32,19 @@ pub struct AppContext {
 impl AppContext {
     pub fn load(path: Option<PathBuf>) -> Result<Self> {
         let state_path = path.unwrap_or_else(default_state_path);
-        let state = RustylinkState::load_or_default(&state_path)?;
+        let state = RustylinkState::load_or_default(&state_path).context(StateSnafu)?;
         Ok(Self { state_path, state })
     }
 
     pub fn save(&mut self) -> Result<()> {
-        self.state.save(&self.state_path)
+        self.state.save(&self.state_path).context(StateSnafu)
     }
 
     pub fn api_client(&self) -> Result<ApiClient> {
         let base_url = self
             .state
             .selected_base_url()
-            .context(error::MissingBaseUrl)?
+            .context(MissingBaseUrlSnafu)?
             .to_string();
         let client = ApiClient::new(
             base_url,
@@ -34,7 +52,7 @@ impl AppContext {
             SigningContext::new(self.state.signing.clone()),
             self.state.cookies.clone(),
         )
-        .context(error::Api)?;
+        .context(ApiSnafu)?;
         client.set_csrf_token(self.state.csrf_token.clone());
         client.set_knock_token(self.state.knock_token.clone());
         Ok(client)

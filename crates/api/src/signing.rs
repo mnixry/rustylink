@@ -1,10 +1,12 @@
 use aes::Aes256;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use bitflags::bitflags;
 use cbc::{
     Encryptor,
     cipher::{BlockEncryptMut, KeyIvInit, block_padding::Pkcs7},
 };
 use hmac::{Hmac, Mac};
+use prost::Message;
 use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
 use sha1::Sha1;
@@ -14,10 +16,26 @@ use url::Url;
 
 type HmacSha256 = Hmac<Sha256>;
 
+const AES_CBC_BLOCK_SIZE: usize = 16;
 const DEFAULT_ROOT_KEY_VERSION: u64 = 1;
-const DEFAULT_SIGNING_INPUT_PARAMS: u64 = 510;
 const FIXED_PASSWORD_KEY: &str = "8bfa9ad090fbbf87e518f1ce24a93eee";
 const HTTP_SIGN_HKDF_SECRET: &[u8] = b"ygicehnydny4fj";
+
+bitflags! {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct SigningInputFlags: u64 {
+        const METHOD = 1 << 1;
+        const PATH = 1 << 2;
+        const QUERY = 1 << 3;
+        const BODY_SHA256 = 1 << 4;
+        const COOKIE = 1 << 5;
+        const ANDROID_RESERVED_6 = 1 << 6;
+        const CSRF_TOKEN = 1 << 7;
+        const KNOCK_TOKEN = 1 << 8;
+        const JWT_TOKEN = 1 << 9;
+        const _ = !0;
+    }
+}
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct SigningConfig {
@@ -58,7 +76,7 @@ pub struct SigningContext {
 }
 
 #[derive(Debug, Snafu)]
-#[snafu(module, context(suffix(false)))]
+#[snafu(module, visibility(pub(crate)))]
 pub enum SigningError {
     #[snafu(display("no signing secret configured"))]
     MissingSecret,
@@ -71,7 +89,7 @@ pub enum SigningError {
 }
 
 #[derive(Debug, Snafu)]
-#[snafu(module, context(suffix(false)))]
+#[snafu(module, visibility(pub(crate)))]
 pub enum PasswordCipherError {
     #[snafu(display("AES-CBC padding failed"))]
     Padding,
@@ -111,16 +129,16 @@ impl SigningContext {
         if method.eq_ignore_ascii_case("PUT") || is_multipart(headers) {
             return Ok(Vec::new());
         }
-        let Some(signing_input_params) = self.signing_input_params(url) else {
+        let Some(signing_input_flags) = self.signing_input_flags(url) else {
             return Ok(Vec::new());
         };
         let key = self.hmac_key()?;
-        let input = signing_input(method, url, headers, body, signing_input_params);
-        let mut mac = HmacSha256::new_from_slice(&key).context(signing_error::InvalidKey)?;
+        let input = signing_input(method, url, headers, body, signing_input_flags);
+        let mut mac = HmacSha256::new_from_slice(&key).context(signing_error::InvalidKeySnafu)?;
         mac.update(&input);
         let signature = mac.finalize().into_bytes();
         let header =
-            encode_http_sign_header(self.root_key_version(), signing_input_params, &signature);
+            encode_http_sign_header(self.root_key_version(), signing_input_flags, &signature);
         Ok(vec![SignedHeader {
             name: "Sign".to_string(),
             value: format!("v1;{}", STANDARD.encode(header)),
@@ -131,7 +149,7 @@ impl SigningContext {
         if let Some(encoded) = self.config.hmac_key_base64.as_deref() {
             return STANDARD
                 .decode(encoded)
-                .context(signing_error::InvalidBase64);
+                .context(signing_error::InvalidBase64Snafu);
         }
 
         if let (Some(activation_code), Some(device_id)) = (
@@ -145,7 +163,7 @@ impl SigningContext {
             .shared_secret
             .as_ref()
             .map(|value| value.as_bytes().to_vec())
-            .context(signing_error::MissingSecret)
+            .context(signing_error::MissingSecretSnafu)
     }
 
     fn root_key_version(&self) -> u64 {
@@ -156,13 +174,14 @@ impl SigningContext {
         }
     }
 
-    fn signing_input_params(&self, url: &Url) -> Option<u64> {
+    fn signing_input_flags(&self, url: &Url) -> Option<SigningInputFlags> {
         if self.config.rules.is_empty() {
-            return Some(if self.config.signing_input_params == 0 {
-                DEFAULT_SIGNING_INPUT_PARAMS
+            let flags = if self.config.signing_input_params == 0 {
+                default_signing_input_flags()
             } else {
-                self.config.signing_input_params
-            });
+                SigningInputFlags::from_bits_retain(self.config.signing_input_params)
+            };
+            return Some(flags);
         }
 
         self.config
@@ -173,9 +192,9 @@ impl SigningContext {
             })
             .map(|rule| {
                 if rule.signing_input_params == 0 {
-                    DEFAULT_SIGNING_INPUT_PARAMS
+                    default_signing_input_flags()
                 } else {
-                    rule.signing_input_params
+                    SigningInputFlags::from_bits_retain(rule.signing_input_params)
                 }
             })
     }
@@ -195,12 +214,12 @@ impl PasswordCipher {
     pub fn encrypt_aes_cbc(&self, plaintext: &str) -> Result<String, PasswordCipherError> {
         let key = self.fixed_string.as_bytes();
         if key.len() != 32 {
-            return password_cipher_error::InvalidKeyLength { length: key.len() }.fail();
+            return password_cipher_error::InvalidKeyLengthSnafu { length: key.len() }.fail();
         }
         let iv = aes_cbc_iv(&self.fixed_string);
         let mut buf = plaintext.as_bytes().to_vec();
         let plain_len = buf.len();
-        buf.resize(plain_len + 16, 0);
+        buf.resize(plain_len + AES_CBC_BLOCK_SIZE, 0);
         let ciphertext = Encryptor::<Aes256>::new_from_slices(key, &iv)
             .map_err(|_| PasswordCipherError::InvalidKeyLength { length: key.len() })?
             .encrypt_padded_mut::<Pkcs7>(&mut buf, plain_len)
@@ -215,39 +234,40 @@ impl PasswordCipher {
 }
 
 fn signing_input(
-    method: &str, url: &Url, headers: &HeaderMap, body: &[u8], signing_input_params: u64,
+    method: &str, url: &Url, headers: &HeaderMap, body: &[u8],
+    signing_input_flags: SigningInputFlags,
 ) -> Vec<u8> {
     let mut out = Vec::new();
-    if bit_set(signing_input_params, 1) {
+    if signing_input_flags.contains(SigningInputFlags::METHOD) {
         out.extend_from_slice(method.as_bytes());
     }
-    if bit_set(signing_input_params, 2) {
+    if signing_input_flags.contains(SigningInputFlags::PATH) {
         out.extend_from_slice(url.path().as_bytes());
     }
-    if bit_set(signing_input_params, 3)
+    if signing_input_flags.contains(SigningInputFlags::QUERY)
         && let Some(query) = url.query()
     {
         out.extend_from_slice(query.as_bytes());
     }
-    if bit_set(signing_input_params, 4) && !body.is_empty() {
+    if signing_input_flags.contains(SigningInputFlags::BODY_SHA256) && !body.is_empty() {
         out.extend_from_slice(&Sha256::digest(body));
     }
-    if bit_set(signing_input_params, 5)
+    if signing_input_flags.contains(SigningInputFlags::COOKIE)
         && let Some(value) = header_value(headers, "cookie")
     {
         out.extend_from_slice(value.as_bytes());
     }
-    if bit_set(signing_input_params, 7)
+    if signing_input_flags.contains(SigningInputFlags::CSRF_TOKEN)
         && let Some(value) = header_value(headers, "csrf-token")
     {
         out.extend_from_slice(value.as_bytes());
     }
-    if bit_set(signing_input_params, 8)
+    if signing_input_flags.contains(SigningInputFlags::KNOCK_TOKEN)
         && let Some(value) = header_value(headers, "knock-token")
     {
         out.extend_from_slice(value.as_bytes());
     }
-    if bit_set(signing_input_params, 9)
+    if signing_input_flags.contains(SigningInputFlags::JWT_TOKEN)
         && let Some(value) = header_value(headers, "jwt-token")
     {
         out.extend_from_slice(value.trim().as_bytes());
@@ -255,8 +275,15 @@ fn signing_input(
     out
 }
 
-fn bit_set(value: u64, bit: u8) -> bool {
-    value & (1_u64 << bit) != 0
+fn default_signing_input_flags() -> SigningInputFlags {
+    SigningInputFlags::METHOD
+        | SigningInputFlags::PATH
+        | SigningInputFlags::QUERY
+        | SigningInputFlags::BODY_SHA256
+        | SigningInputFlags::COOKIE
+        | SigningInputFlags::ANDROID_RESERVED_6
+        | SigningInputFlags::CSRF_TOKEN
+        | SigningInputFlags::KNOCK_TOKEN
 }
 
 fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -271,12 +298,16 @@ fn is_multipart(headers: &HeaderMap) -> bool {
         .is_some_and(|value| value.to_ascii_lowercase().starts_with("multipart/"))
 }
 
-fn aes_cbc_iv(key: &str) -> [u8; 16] {
+fn aes_cbc_iv(key: &str) -> [u8; AES_CBC_BLOCK_SIZE] {
     let digest = Sha1::digest(key.as_bytes());
     let digest_hex = hex::encode(digest);
-    let mut iv = [0_u8; 16];
-    iv.copy_from_slice(&digest_hex.as_bytes()[..16]);
-    iv
+    let iv_bytes = digest_hex
+        .as_bytes()
+        .get(..AES_CBC_BLOCK_SIZE)
+        .expect("SHA-1 hex digest is long enough for AES-CBC IV");
+    iv_bytes
+        .try_into()
+        .expect("AES-CBC IV slice has the configured block size")
 }
 
 fn generate_http_sign_key_bytes(
@@ -290,7 +321,7 @@ fn generate_http_sign_key_bytes(
 fn hkdf_sha256(
     ikm: &[u8], salt: &[u8], info: &[u8], length: usize,
 ) -> Result<Vec<u8>, SigningError> {
-    let mut extract = HmacSha256::new_from_slice(salt).context(signing_error::InvalidKey)?;
+    let mut extract = HmacSha256::new_from_slice(salt).context(signing_error::InvalidKeySnafu)?;
     extract.update(ikm);
     let prk = extract.finalize().into_bytes();
 
@@ -298,7 +329,8 @@ fn hkdf_sha256(
     let mut previous = Vec::new();
     let mut counter = 1_u8;
     while okm.len() < length {
-        let mut expand = HmacSha256::new_from_slice(&prk).context(signing_error::InvalidKey)?;
+        let mut expand =
+            HmacSha256::new_from_slice(&prk).context(signing_error::InvalidKeySnafu)?;
         expand.update(&previous);
         expand.update(info);
         expand.update(&[counter]);
@@ -311,50 +343,27 @@ fn hkdf_sha256(
 }
 
 fn encode_http_sign_header(
-    root_key_version: u64, signing_input_params: u64, signing_result: &[u8],
+    root_key_version: u64, signing_input_flags: SigningInputFlags, signing_result: &[u8],
 ) -> Vec<u8> {
-    let mut out = Vec::new();
-    if root_key_version != 0 {
-        encode_varint_field(1, root_key_version, &mut out);
+    crate::sign_proto::HttpSignHeader {
+        root_key_version,
+        signing_input_params: signing_input_flags.bits(),
+        signing_result: signing_result.to_vec(),
     }
-    if signing_input_params != 0 {
-        encode_varint_field(3, signing_input_params, &mut out);
-    }
-    if !signing_result.is_empty() {
-        encode_bytes_field(4, signing_result, &mut out);
-    }
-    out
-}
-
-fn encode_varint_field(field: u8, value: u64, out: &mut Vec<u8>) {
-    encode_varint(u64::from(field) << 3, out);
-    encode_varint(value, out);
-}
-
-fn encode_bytes_field(field: u8, value: &[u8], out: &mut Vec<u8>) {
-    encode_varint((u64::from(field) << 3) | 2, out);
-    encode_varint(value.len() as u64, out);
-    out.extend_from_slice(value);
-}
-
-fn encode_varint(mut value: u64, out: &mut Vec<u8>) {
-    while value >= 0x80 {
-        let byte = u8::try_from(value & 0x7F).expect("varint byte is masked to 7 bits");
-        out.push(byte | 0x80);
-        value >>= 7;
-    }
-    out.push(u8::try_from(value).expect("final varint byte is below 128"));
+    .encode_to_vec()
 }
 
 #[cfg(test)]
 mod tests {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use prost::Message;
     use reqwest::header::{HeaderMap, HeaderValue};
+    use sha2::{Digest as _, Sha256};
     use url::Url;
 
     use super::{
-        PasswordCipher, SigningConfig, SigningContext, encode_http_sign_header,
-        generate_http_sign_key_bytes,
+        PasswordCipher, SigningConfig, SigningContext, default_signing_input_flags,
+        encode_http_sign_header, generate_http_sign_key_bytes,
     };
 
     #[test]
@@ -376,11 +385,15 @@ mod tests {
 
     #[test]
     fn http_sign_header_uses_evidenced_proto_fields() {
-        let encoded = encode_http_sign_header(1, 510, &[0xAB; 32]);
-        assert_eq!(&encoded[..5], &[0x08, 0x01, 0x18, 0xFE, 0x03]);
-        assert_eq!(encoded[5], 0x22);
-        assert_eq!(encoded[6], 32);
-        assert_eq!(encoded.len(), 39);
+        let signature = Sha256::digest(b"signing result").to_vec();
+        let encoded = encode_http_sign_header(1, default_signing_input_flags(), &signature);
+        let decoded = crate::sign_proto::HttpSignHeader::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.root_key_version, 1);
+        assert_eq!(
+            decoded.signing_input_params,
+            default_signing_input_flags().bits()
+        );
+        assert_eq!(decoded.signing_result, signature);
     }
 
     #[test]

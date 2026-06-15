@@ -3,15 +3,33 @@ use rustylink_api::{
 };
 use snafu::prelude::*;
 
-use crate::{AppContext, error, error::Result};
+use crate::AppContext;
+
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub(crate)))]
+pub enum Error {
+    #[snafu(display("application context operation failed"))]
+    Context {
+        #[snafu(source(from(crate::context::Error, Box::new)))]
+        source: Box<crate::context::Error>,
+    },
+
+    #[snafu(display("API operation failed"))]
+    Api {
+        #[snafu(source(from(rustylink_api::Error, Box::new)))]
+        source: Box<rustylink_api::Error>,
+    },
+}
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub async fn report_security(
     ctx: &mut AppContext, report: &SecurityReportRequest,
 ) -> Result<ReportSecurityResponse> {
-    let client = ctx.api_client()?;
-    let response = client.report_security(report).await.context(error::Api)?;
+    let client = ctx.api_client().context(ContextSnafu)?;
+    let response = client.report_security(report).await.context(ApiSnafu)?;
     ctx.sync_from_client(&client);
-    ctx.save()?;
+    ctx.save().context(ContextSnafu)?;
     Ok(response)
 }
 

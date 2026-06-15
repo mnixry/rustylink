@@ -12,12 +12,10 @@ use ipnetwork::IpNetwork;
 use rustylink_api::VpnConnResponse;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
+use strum::{Display, EnumIter, FromRepr};
 use tokio::net::lookup_host;
 
-use crate::{
-    DnsHijackPlan, DnsHijackTun, DnsProxyRuntime, FeilianTcpTransportFactory, RoutePlan, error,
-    error::Result,
-};
+use crate::{DnsHijackPlan, DnsHijackTun, DnsProxyRuntime, FeilianTcpTransportFactory, RoutePlan};
 
 const ANDROID_LOCAL_PORT_START: u16 = 12912;
 const WIREGUARD_KEEPALIVE_SECS: u16 = 25;
@@ -26,6 +24,50 @@ const FEILIAN_V2_PROTOCOL_IDENTIFIER: &[u8] = b"CorpLink v1 vpn@feilian---------
 
 type UdpTunnelDevice = Device<(UdpSocketFactory, DnsHijackTun, DnsHijackTun)>;
 type TcpTunnelDevice = Device<(FeilianTcpTransportFactory, DnsHijackTun, DnsHijackTun)>;
+
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub(crate)))]
+pub enum Error {
+    #[snafu(display("invalid tunnel config: {reason}"))]
+    InvalidConfig { reason: String },
+
+    #[snafu(display("route manager failed"))]
+    Route { source: crate::route::Error },
+
+    #[snafu(display("TUN device setup failed"))]
+    TunDevice {
+        source: gotatun::tun::tun_async_device::Error,
+    },
+
+    #[snafu(display("DNS hijack setup failed"))]
+    Dns { source: crate::dns::Error },
+
+    #[snafu(display("gotatun device setup failed"))]
+    Device { source: gotatun::device::Error },
+
+    #[snafu(display("failed to resolve WireGuard endpoint `{endpoint}`"))]
+    ResolveEndpoint {
+        endpoint: String,
+        source: std::io::Error,
+    },
+
+    #[snafu(display("WireGuard endpoint `{endpoint}` did not resolve to any address"))]
+    EmptyEndpointResolution { endpoint: String },
+
+    #[snafu(display("invalid WireGuard key `{name}`"))]
+    InvalidKey { name: &'static str },
+
+    #[snafu(display("invalid route CIDR `{cidr}`"))]
+    InvalidRoute {
+        cidr: String,
+        source: ipnetwork::IpNetworkError,
+    },
+
+    #[snafu(display("custom WireGuard engine failed: {message}"))]
+    WireGuard { message: String },
+}
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct LocalTunnelParams {
@@ -75,9 +117,18 @@ enum TunnelDevice {
     FeilianTcp(TcpTunnelDevice),
 }
 
+#[derive(Clone, Copy, Debug)]
 enum TunnelTransport {
     Udp,
     FeilianTcp,
+}
+
+#[derive(Clone, Copy, Debug, Display, EnumIter, Eq, FromRepr, PartialEq)]
+#[repr(i32)]
+enum ProtocolMode {
+    Udp        = 0,
+    FeilianTcp = 1,
+    Dual       = 2,
 }
 
 impl LocalTunnelParams {
@@ -109,7 +160,7 @@ impl TunnelConfig {
         protocol_mode: Option<i32>, protocol_detect_enable: bool,
     ) -> Result<Self> {
         if conn.setting.vpn_mtu <= 0 {
-            return error::InvalidConfig {
+            return InvalidConfigSnafu {
                 reason: "vpn_mtu must be positive".to_string(),
             }
             .fail();
@@ -157,6 +208,14 @@ impl TunnelSession {
         );
         validate_protocol_mode(&self.config)?;
         let transport = tunnel_transport(&self.config);
+        tracing::info!(
+            transport = ?transport,
+            protocol_mode = ?self.config.protocol_mode,
+            protocol_version = ?self.config.protocol_version,
+            dns_proxy_port = self.config.dns_plan.proxy_port,
+            split_domain_rules = self.config.dns_plan.domain_rules.len(),
+            "selected tunnel runtime options"
+        );
         let endpoint = resolve_endpoint(&self.config.endpoint).await?;
         let private_key = StaticSecret::from(decode_key(
             "local_private_key",
@@ -179,12 +238,12 @@ impl TunnelSession {
             peer = peer.with_preshared_key(decode_key("server_preshared_key", preshared_key)?);
         }
 
-        self.config.route_plan.apply()?;
+        self.config.route_plan.apply().context(RouteSnafu)?;
         self.status = TunnelStatus::RoutesApplied;
         self.dns_proxy = DnsProxyRuntime::start(&self.config.dns_plan)
             .await
-            .context(error::Dns)?;
-        let tun = TunDevice::from_name(&self.config.interface_name).context(error::TunDevice)?;
+            .context(DnsSnafu)?;
+        let tun = TunDevice::from_name(&self.config.interface_name).context(TunDeviceSnafu)?;
         let tun = DnsHijackTun::new(tun, &self.config.dns_plan);
         let device = match transport {
             TunnelTransport::Udp => {
@@ -195,7 +254,7 @@ impl TunnelSession {
                     .with_listen_port(self.config.local_port)
                     .with_peer(peer);
                 let builder = with_feilian_protocol_identifier(builder, &self.config);
-                TunnelDevice::Udp(builder.build().await.context(error::Device)?)
+                TunnelDevice::Udp(builder.build().await.context(DeviceSnafu)?)
             }
             TunnelTransport::FeilianTcp => {
                 let builder = DeviceBuilder::new()
@@ -205,7 +264,7 @@ impl TunnelSession {
                     .with_listen_port(self.config.local_port)
                     .with_peer(peer);
                 let builder = with_feilian_protocol_identifier(builder, &self.config);
-                TunnelDevice::FeilianTcp(builder.build().await.context(error::Device)?)
+                TunnelDevice::FeilianTcp(builder.build().await.context(DeviceSnafu)?)
             }
         };
         self.device = Some(device);
@@ -280,9 +339,9 @@ fn validate_protocol_mode(config: &TunnelConfig) -> Result<()> {
         );
     }
     if let Some(mode) = config.protocol_mode
-        && !matches!(mode, 0..=2)
+        && ProtocolMode::from_repr(mode).is_none()
     {
-        return error::WireGuard {
+        return WireGuardSnafu {
             message: format!("unsupported protocol_mode={mode}"),
         }
         .fail();
@@ -290,10 +349,10 @@ fn validate_protocol_mode(config: &TunnelConfig) -> Result<()> {
     Ok(())
 }
 
-const fn tunnel_transport(config: &TunnelConfig) -> TunnelTransport {
-    match config.protocol_mode {
-        Some(1) => TunnelTransport::FeilianTcp,
-        _ => TunnelTransport::Udp,
+fn tunnel_transport(config: &TunnelConfig) -> TunnelTransport {
+    match config.protocol_mode.and_then(ProtocolMode::from_repr) {
+        Some(ProtocolMode::FeilianTcp) => TunnelTransport::FeilianTcp,
+        Some(ProtocolMode::Udp | ProtocolMode::Dual) | None => TunnelTransport::Udp,
     }
 }
 
@@ -327,12 +386,10 @@ fn feilian_protocol_identifier(config: &TunnelConfig) -> Option<ProtocolIdentifi
 }
 
 async fn resolve_endpoint(endpoint: &str) -> Result<std::net::SocketAddr> {
-    let mut addrs = lookup_host(endpoint)
-        .await
-        .context(error::ResolveEndpoint {
-            endpoint: endpoint.to_string(),
-        })?;
-    addrs.next().context(error::EmptyEndpointResolution {
+    let mut addrs = lookup_host(endpoint).await.context(ResolveEndpointSnafu {
+        endpoint: endpoint.to_string(),
+    })?;
+    addrs.next().context(EmptyEndpointResolutionSnafu {
         endpoint: endpoint.to_string(),
     })
 }
@@ -342,7 +399,7 @@ fn allowed_ips(route_plan: &RoutePlan) -> Result<Vec<IpNetwork>> {
         .rules
         .iter()
         .map(|rule| {
-            rule.cidr.parse::<IpNetwork>().context(error::InvalidRoute {
+            rule.cidr.parse::<IpNetwork>().context(InvalidRouteSnafu {
                 cidr: rule.cidr.clone(),
             })
         })
@@ -358,8 +415,8 @@ fn decode_key(name: &'static str, value: &str) -> Result<[u8; 32]> {
     let bytes = STANDARD
         .decode(trimmed)
         .or_else(|_| hex::decode(trimmed))
-        .map_err(|_| error::InvalidKey { name }.build())?;
+        .map_err(|_| InvalidKeySnafu { name }.build())?;
     bytes
         .try_into()
-        .map_err(|_| error::InvalidKey { name }.build())
+        .map_err(|_| InvalidKeySnafu { name }.build())
 }
