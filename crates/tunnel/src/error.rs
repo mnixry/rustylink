@@ -12,6 +12,14 @@ pub enum Error {
     #[snafu(display("TUN setup failed"))]
     Tun { source: std::io::Error },
 
+    #[snafu(display("TUN device setup failed"))]
+    TunDevice {
+        source: gotatun::tun::tun_async_device::Error,
+    },
+
+    #[snafu(display("DNS hijack setup failed"))]
+    Dns { source: std::io::Error },
+
     #[snafu(display("gotatun device setup failed"))]
     Device { source: gotatun::device::Error },
 

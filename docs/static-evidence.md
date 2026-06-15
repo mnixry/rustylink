@@ -166,6 +166,13 @@ Evidenced Android behavior:
 - Tunnel startup configures TUN, then starts WireGuard, then checks `Wireguard.onTunOk`.
 - `WgHelper.java:69-101` runs `tunnelInit`, `startup`, `configMode`, then `configSet`.
 - `WgHelper.java:86-96` configures the peer endpoint from dot `getApiIp()` and `vpnPort`, keepalive `25`, dot `protocolMode`, protocol version, protocol detect flag, and device id.
+- `WgHelper.java:18-56` passes DNS list, local DNS, dynamic split-domain JSON, central DNS JSON, IP NAT JSON, local address, export id, and user open id into `Wireguard.configMode`; the local DNS proxy port is `2913`.
+- `VpnLocationBean.java:879-887` treats `protocolMode == 1 || protocolMode == 2` as TCP-capable and `protocolMode == 0 || protocolMode == 2` as UDP-capable.
+- IDA `wireguardbase.(*nativeTCPBind).Send` at `0x4d4010` dials TCP and writes each WireGuard datagram as a 4-byte little-endian length followed by the payload.
+- IDA `wireguardbase.(*nativeTCPBind).recvFromConn` at `0x4d4590` reads the same little-endian length prefix, rejects invalid frame lengths, then reads the framed payload.
+- IDA `wireguardbase.init.0` at `0x4f9170` precomputes standard WireGuard Noise values and FeiLian `CorpLink v1 vpn@feilian-----------` values.
+- IDA `wireguardbase.(*Device).CreateMessageInitiation` at `0x4f92f0` selects the CorpLink identifier only when `wgIdentifierVer` is exactly `v2`.
+- IDA `wireguardbase.(*Device).DnsProxyStart` at `0x4dadb0`, `wireguardbase.newDnsMode` at `0x4e39c0`, and `wireguardbase.(*dnsmode).isInSplitDomainAndSend` at `0x4e6560` show a DNS proxy/filter path for UDP/53 split-domain handling rather than a config-only field.
 - `VpnReportOperator.java:27-39` reports connect/disconnect to the dot API `/vpn/report` with `type`, `ip`, `public_key`, and `mode`.
 - Handshake watcher polls every 500 ms.
 - Handshake timeout depends on protocol mode: 15 s, 9 s, or 6 s.
@@ -176,5 +183,8 @@ Rust implementation boundary:
 
 - `crates/api/src/client.rs` injects the common query and signing headers in Progenitor pre-hooks, rather than declaring always-sent query parameters on every OpenAPI operation.
 - `crates/core/src/vpn.rs` selects dots and requests `/vpn/conn` through generated Progenitor operations using a per-dot generated client base URL.
-- `crates/tunnel/src/session.rs` uses `gotatun::device::DeviceBuilder`, `Peer`, and `TunDevice` to start a real WireGuard device for standard UDP-capable dots.
-- Android TCP-only `protocol_mode=1` is not implemented with gotatun and is rejected explicitly. `protocol_mode=2` is treated as UDP-capable; native protocol detection/custom switching is logged as unsupported until the native protocol identifier mapping is fully recovered.
+- `crates/tunnel/src/session.rs` uses `gotatun::device::DeviceBuilder`, `Peer`, and a `DnsHijackTun` wrapper to start a real WireGuard device.
+- `protocol_mode=1` uses `crates/tunnel/src/transport.rs` FeiLian TCP framing over gotatun's custom UDP transport hook. `protocol_mode=0` and `protocol_mode=2` start UDP first, matching Android's UDP-capable condition.
+- `protocol_version == "v2"` maps gotatun's `ProtocolIdentifier` to the recovered FeiLian CorpLink identifier; other protocol versions use standard WireGuard and log the evidence boundary.
+- `crates/tunnel/src/dns.rs` starts a local UDP DNS proxy on FeiLian's port `2913` when DNS upstreams are configured and wraps TUN receive to intercept IPv4/IPv6 UDP destination port `53`, forward the DNS payload to selected local or VPN DNS upstreams, and synthesize the UDP response back to the TUN.
+- Native protocol-detection switching thresholds and automatic UDP/TCP switching for `protocol_mode=2` are not fully reproduced yet; Rust starts with UDP for dual-capable dots.

@@ -2,7 +2,10 @@ use std::net::UdpSocket;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use gotatun::{
-    device::{DefaultDeviceTransports, Device, DeviceBuilder, Peer},
+    device::{Device, DeviceBuilder, Peer},
+    noise::ProtocolIdentifier,
+    tun::tun_async_device::TunDevice,
+    udp::socket::UdpSocketFactory,
     x25519::{PublicKey, StaticSecret},
 };
 use ipnetwork::IpNetwork;
@@ -11,10 +14,18 @@ use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use tokio::net::lookup_host;
 
-use crate::{DnsHijackPlan, RoutePlan, error, error::Result};
+use crate::{
+    DnsHijackPlan, DnsHijackTun, DnsProxyRuntime, FeilianTcpTransportFactory, RoutePlan, error,
+    error::Result,
+};
 
 const ANDROID_LOCAL_PORT_START: u16 = 12912;
 const WIREGUARD_KEEPALIVE_SECS: u16 = 25;
+const STANDARD_NOISE_CONSTRUCTION: &[u8] = b"Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s";
+const FEILIAN_V2_PROTOCOL_IDENTIFIER: &[u8] = b"CorpLink v1 vpn@feilian-----------";
+
+type UdpTunnelDevice = Device<(UdpSocketFactory, DnsHijackTun, DnsHijackTun)>;
+type TcpTunnelDevice = Device<(FeilianTcpTransportFactory, DnsHijackTun, DnsHijackTun)>;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct LocalTunnelParams {
@@ -55,7 +66,18 @@ pub enum TunnelStatus {
 pub struct TunnelSession {
     pub config: TunnelConfig,
     pub status: TunnelStatus,
-    device: Option<Device<DefaultDeviceTransports>>,
+    device: Option<TunnelDevice>,
+    dns_proxy: Option<DnsProxyRuntime>,
+}
+
+enum TunnelDevice {
+    Udp(UdpTunnelDevice),
+    FeilianTcp(TcpTunnelDevice),
+}
+
+enum TunnelTransport {
+    Udp,
+    FeilianTcp,
 }
 
 impl LocalTunnelParams {
@@ -92,6 +114,8 @@ impl TunnelConfig {
             }
             .fail();
         }
+        let dns_plan =
+            DnsHijackPlan::from_vpn_conn(conn).with_local_dns(local_params.local_dns.clone());
         Ok(Self {
             interface_name: default_interface_name(),
             local_addr: conn.ip.clone(),
@@ -108,7 +132,7 @@ impl TunnelConfig {
             protocol_version: conn.protocol_version.clone(),
             protocol_detect_enable,
             route_plan: RoutePlan::from_vpn_conn(conn),
-            dns_plan: DnsHijackPlan::from_vpn_conn(conn),
+            dns_plan,
         })
     }
 }
@@ -120,6 +144,7 @@ impl TunnelSession {
             config,
             status: TunnelStatus::Created,
             device: None,
+            dns_proxy: None,
         }
     }
 
@@ -131,6 +156,7 @@ impl TunnelSession {
             "starting tunnel session"
         );
         validate_protocol_mode(&self.config)?;
+        let transport = tunnel_transport(&self.config);
         let endpoint = resolve_endpoint(&self.config.endpoint).await?;
         let private_key = StaticSecret::from(decode_key(
             "local_private_key",
@@ -155,19 +181,40 @@ impl TunnelSession {
 
         self.config.route_plan.apply()?;
         self.status = TunnelStatus::RoutesApplied;
-        let device = DeviceBuilder::new()
-            .with_default_udp()
-            .create_tun(&self.config.interface_name)
-            .context(error::Device)?
-            .with_private_key(private_key)
-            .with_listen_port(self.config.local_port)
-            .with_peer(peer)
-            .build()
+        self.dns_proxy = DnsProxyRuntime::start(&self.config.dns_plan)
             .await
-            .context(error::Device)?;
+            .context(error::Dns)?;
+        let tun = TunDevice::from_name(&self.config.interface_name).context(error::TunDevice)?;
+        let tun = DnsHijackTun::new(tun, &self.config.dns_plan);
+        let device = match transport {
+            TunnelTransport::Udp => {
+                let builder = DeviceBuilder::new()
+                    .with_default_udp()
+                    .with_ip(tun)
+                    .with_private_key(private_key)
+                    .with_listen_port(self.config.local_port)
+                    .with_peer(peer);
+                let builder = with_feilian_protocol_identifier(builder, &self.config);
+                TunnelDevice::Udp(builder.build().await.context(error::Device)?)
+            }
+            TunnelTransport::FeilianTcp => {
+                let builder = DeviceBuilder::new()
+                    .with_udp(FeilianTcpTransportFactory)
+                    .with_ip(tun)
+                    .with_private_key(private_key)
+                    .with_listen_port(self.config.local_port)
+                    .with_peer(peer);
+                let builder = with_feilian_protocol_identifier(builder, &self.config);
+                TunnelDevice::FeilianTcp(builder.build().await.context(error::Device)?)
+            }
+        };
         self.device = Some(device);
         self.status = TunnelStatus::Running;
-        tracing::info!(interface = %self.config.interface_name, "gotatun WireGuard device started");
+        tracing::info!(
+            interface = %self.config.interface_name,
+            transport = ?self.config.protocol_mode,
+            "gotatun WireGuard device started"
+        );
         Ok(())
     }
 
@@ -175,6 +222,9 @@ impl TunnelSession {
         tracing::info!(interface = %self.config.interface_name, "stopping tunnel session");
         if let Some(device) = self.device.take() {
             device.stop().await;
+        }
+        if let Some(dns_proxy) = self.dns_proxy.take() {
+            dns_proxy.stop();
         }
         self.status = TunnelStatus::Stopped;
         Ok(())
@@ -184,6 +234,22 @@ impl TunnelSession {
         if let Some(device) = self.device.as_mut() {
             device.wait().await;
             self.status = TunnelStatus::Stopped;
+        }
+    }
+}
+
+impl TunnelDevice {
+    async fn stop(self) {
+        match self {
+            Self::Udp(device) => device.stop().await,
+            Self::FeilianTcp(device) => device.stop().await,
+        }
+    }
+
+    async fn wait(&mut self) {
+        match self {
+            Self::Udp(device) => device.wait().await,
+            Self::FeilianTcp(device) => device.wait().await,
         }
     }
 }
@@ -209,16 +275,55 @@ fn validate_protocol_mode(config: &TunnelConfig) -> Result<()> {
     if config.protocol_detect_enable {
         tracing::warn!(
             protocol_version = ?config.protocol_version,
-            "protocol detection is native-app specific and is not implemented for gotatun"
+            protocol_mode = ?config.protocol_mode,
+            "protocol detection switch thresholds are native-app specific; tunnel starts with the dot's advertised transport"
         );
     }
-    if config.protocol_mode == Some(1) {
+    if let Some(mode) = config.protocol_mode
+        && !matches!(mode, 0..=2)
+    {
         return error::WireGuard {
-            message: "TCP-only protocol_mode=1 is not supported by gotatun".to_string(),
+            message: format!("unsupported protocol_mode={mode}"),
         }
         .fail();
     }
     Ok(())
+}
+
+const fn tunnel_transport(config: &TunnelConfig) -> TunnelTransport {
+    match config.protocol_mode {
+        Some(1) => TunnelTransport::FeilianTcp,
+        _ => TunnelTransport::Udp,
+    }
+}
+
+fn with_feilian_protocol_identifier<Udp, TunTx, TunRx>(
+    builder: DeviceBuilder<Udp, TunTx, TunRx>, config: &TunnelConfig,
+) -> DeviceBuilder<Udp, TunTx, TunRx> {
+    let Some(identifier) = feilian_protocol_identifier(config) else {
+        return builder;
+    };
+    builder.with_protocol_identifier(identifier)
+}
+
+fn feilian_protocol_identifier(config: &TunnelConfig) -> Option<ProtocolIdentifier> {
+    match config.protocol_version.as_deref().map(str::trim) {
+        Some("v2") => {
+            tracing::info!("using FeiLian CorpLink WireGuard protocol identifier");
+            Some(ProtocolIdentifier::new(
+                STANDARD_NOISE_CONSTRUCTION,
+                FEILIAN_V2_PROTOCOL_IDENTIFIER,
+            ))
+        }
+        Some(value) if !value.is_empty() => {
+            tracing::warn!(
+                protocol_version = value,
+                "unknown FeiLian WireGuard identifier version; using standard WireGuard identifier"
+            );
+            None
+        }
+        _ => None,
+    }
 }
 
 async fn resolve_endpoint(endpoint: &str) -> Result<std::net::SocketAddr> {
