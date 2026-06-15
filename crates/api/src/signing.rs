@@ -21,6 +21,16 @@ const DEFAULT_ROOT_KEY_VERSION: u64 = 1;
 const FIXED_PASSWORD_KEY: &str = "8bfa9ad090fbbf87e518f1ce24a93eee";
 const HTTP_SIGN_HKDF_SECRET: &[u8] = b"ygicehnydny4fj";
 
+#[derive(Clone, Deserialize, Serialize, prost::Message)]
+struct HttpSignHeader {
+    #[prost(uint64, tag = "1")]
+    pub root_key_version: u64,
+    #[prost(uint64, tag = "3")]
+    pub signing_input_params: u64,
+    #[prost(bytes, tag = "4")]
+    pub signing_result: Vec<u8>,
+}
+
 bitflags! {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct SigningInputFlags: u64 {
@@ -345,7 +355,7 @@ fn hkdf_sha256(
 fn encode_http_sign_header(
     root_key_version: u64, signing_input_flags: SigningInputFlags, signing_result: &[u8],
 ) -> Vec<u8> {
-    crate::sign_proto::HttpSignHeader {
+    HttpSignHeader {
         root_key_version,
         signing_input_params: signing_input_flags.bits(),
         signing_result: signing_result.to_vec(),
@@ -362,7 +372,7 @@ mod tests {
     use url::Url;
 
     use super::{
-        PasswordCipher, SigningConfig, SigningContext, default_signing_input_flags,
+        HttpSignHeader, PasswordCipher, SigningConfig, SigningContext, default_signing_input_flags,
         encode_http_sign_header, generate_http_sign_key_bytes,
     };
 
@@ -387,7 +397,7 @@ mod tests {
     fn http_sign_header_uses_evidenced_proto_fields() {
         let signature = Sha256::digest(b"signing result").to_vec();
         let encoded = encode_http_sign_header(1, default_signing_input_flags(), &signature);
-        let decoded = crate::sign_proto::HttpSignHeader::decode(encoded.as_slice()).unwrap();
+        let decoded = HttpSignHeader::decode(encoded.as_slice()).unwrap();
         assert_eq!(decoded.root_key_version, 1);
         assert_eq!(
             decoded.signing_input_params,

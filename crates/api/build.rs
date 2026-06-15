@@ -7,23 +7,6 @@ use progenitor::{GenerationSettings, Generator, InterfaceStyle, TagStyle};
 use serde_yaml::{Mapping, Value};
 
 fn main() {
-    generate_protobuf();
-    generate_openapi_client();
-}
-
-fn generate_protobuf() {
-    let proto_dir = Path::new("proto");
-    let sign_proto = proto_dir.join("sign.proto");
-    println!("cargo:rerun-if-changed={}", sign_proto.display());
-
-    let descriptors = protox::compile([sign_proto.as_path()], [proto_dir])
-        .expect("compile checked-in protobuf schemas");
-    prost_build::Config::new()
-        .compile_fds(descriptors)
-        .expect("generate protobuf Rust types");
-}
-
-fn generate_openapi_client() {
     let spec_dir = Path::new("spec");
     let root_path = spec_dir.join("openapi.yaml");
     let paths_path = spec_dir.join("paths.yaml");

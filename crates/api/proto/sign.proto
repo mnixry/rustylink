@@ -1,9 +1,0 @@
-syntax = "proto3";
-
-package rustylink.sign;
-
-message HttpSignHeader {
-  uint64 root_key_version = 1;
-  uint64 signing_input_params = 3;
-  bytes signing_result = 4;
-}
