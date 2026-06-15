@@ -12,12 +12,15 @@ base64             = "0.22.1"
 bitflags           = "2.13.0"
 cbc                = "0.2.1"
 clap               = { version = "4.6.1", features = ["derive", "env"] }
+default-net        = "0.22.0"
 dirs               = "6.0.0"
 etherparse         = "0.20.2"
 hex                = "0.4.3"
 hickory-proto      = "0.26.1"
 hmac               = "0.13.0"
 ipnetwork          = "0.21.1"
+jiff               = "0.2.28"
+machine-uid        = "0.6.0"
 openapiv3          = "2.2.0"
 prettyplease       = "0.2.37"
 progenitor         = "0.14.0"
@@ -32,9 +35,9 @@ serde_yaml         = "0.9.34"
 sha1               = "0.11.0"
 sha2               = "0.11.0"
 snafu              = "0.9.1"
+socket2            = { version = "0.6.4", features = ["all"] }
 strum              = { version = "0.28.0", features = ["derive"] }
 syn                = "2.0.117"
-time               = { version = "0.3.49", features = ["formatting", "macros", "serde"] }
 tokio              = { version = "1.52.3", features = ["full"] }
 tracing            = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
@@ -52,9 +55,9 @@ nursery  = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 
 cargo_common_metadata   = "allow"
-multiple_crate_versions = "allow"
-missing_errors_doc      = "allow"
 missing_const_for_fn    = "allow"
+missing_errors_doc      = "allow"
+multiple_crate_versions = "allow"
 
 [profile.release]
 codegen-units = 1

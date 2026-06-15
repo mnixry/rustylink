@@ -1,12 +1,12 @@
 use std::{fs, path::PathBuf, str::FromStr};
 
 use clap::{Args, Parser, Subcommand};
-use rustylink_api::{SecurityReportRequest, VpnConnRequest, VpnReportRequest};
+use rustylink_api::{ApiClientOptions, SecurityReportRequest, VpnConnRequest, VpnReportRequest};
 use rustylink_core::{
     AppContext, auth, security,
     vpn::{self, VpnConfigRequest, VpnConnectMode},
 };
-use rustylink_tunnel::{LocalTunnelParams, TunnelConfig, TunnelSession};
+use rustylink_tunnel::{LocalTunnelParams, OutboundInterface, TunnelConfig, TunnelSession};
 use serde_json::json;
 use snafu::prelude::*;
 use strum::IntoEnumIterator;
@@ -41,6 +41,11 @@ enum CliError {
 
     #[snafu(display("tunnel operation failed"))]
     Tunnel { source: rustylink_tunnel::Error },
+
+    #[snafu(display("outbound interface selection failed"))]
+    OutboundInterface {
+        source: rustylink_tunnel::outbound::Error,
+    },
 
     #[snafu(display("failed to read {}", path.display()))]
     ReadFile {
@@ -78,6 +83,9 @@ type Result<T, E = CliError> = std::result::Result<T, E>;
 struct Cli {
     #[arg(long, env = "RUSTYLINK_STATE")]
     state_path: Option<PathBuf>,
+
+    #[arg(long, env = "RUSTYLINK_OUTBOUND_INTERFACE")]
+    outbound_interface: Option<String>,
 
     #[command(subcommand)]
     command: Command,
@@ -293,7 +301,11 @@ fn print_error_chain(error: &CliError) {
 
 async fn run() -> Result<()> {
     let cli = Cli::parse();
-    let mut ctx = AppContext::load(cli.state_path).context(cli_error::CoreContextSnafu)?;
+    let api_options = ApiClientOptions {
+        outbound_interface: cli.outbound_interface,
+    };
+    let mut ctx = AppContext::load_with_api_options(cli.state_path, api_options)
+        .context(cli_error::CoreContextSnafu)?;
 
     match cli.command {
         Command::Activate(args) => {
@@ -422,6 +434,7 @@ async fn handle_vpn(ctx: &mut AppContext, command: VpnSubcommand) -> Result<()> 
             print_json(&response)?;
         }
         VpnSubcommand::Connect(args) => {
+            let outbound_interface = ensure_outbound_interface(ctx)?;
             let mode = parse_vpn_mode(args.mode.as_deref())?;
             let export_id = resolve_export_id(ctx, args.export_id).await?;
             let local_params = local_params_for_connect(&args)?;
@@ -443,7 +456,7 @@ async fn handle_vpn(ctx: &mut AppContext, command: VpnSubcommand) -> Result<()> 
                 .data
                 .clone()
                 .expect("core checked config data exists");
-            let config = TunnelConfig::from_vpn_conn(
+            let mut config = TunnelConfig::from_vpn_conn(
                 &data,
                 local_params.clone(),
                 config_result.servers.wireguard_endpoint.clone(),
@@ -451,6 +464,7 @@ async fn handle_vpn(ctx: &mut AppContext, command: VpnSubcommand) -> Result<()> 
                 config_result.dot.protocol_detect_enabled(),
             )
             .context(cli_error::TunnelSnafu)?;
+            config.outbound_interface = outbound_interface.map(|interface| interface.name);
             let mut session = TunnelSession::new(config);
             session.start().await.context(cli_error::TunnelSnafu)?;
             let connect_report =
@@ -468,6 +482,7 @@ async fn handle_vpn(ctx: &mut AppContext, command: VpnSubcommand) -> Result<()> 
                 "dot": &config_result.dot,
                 "servers": &config_result.servers,
                 "local_public_key": &local_params.local_public_key,
+                "outbound_interface": ctx.outbound_interface(),
                 "connect_report": connect_report_response,
                 "tunnel_status": session.status,
             }))?;
@@ -483,6 +498,15 @@ async fn handle_vpn(ctx: &mut AppContext, command: VpnSubcommand) -> Result<()> 
         }
     }
     Ok(())
+}
+
+fn ensure_outbound_interface(ctx: &mut AppContext) -> Result<Option<OutboundInterface>> {
+    let outbound_interface = OutboundInterface::resolve(ctx.outbound_interface(), None)
+        .context(cli_error::OutboundInterfaceSnafu)?;
+    if let Some(outbound_interface) = &outbound_interface {
+        ctx.set_outbound_interface(Some(outbound_interface.name.clone()));
+    }
+    Ok(outbound_interface)
 }
 
 async fn handle_security(ctx: &mut AppContext, command: SecuritySubcommand) -> Result<()> {

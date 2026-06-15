@@ -1,9 +1,9 @@
 use std::{fs, path::Path};
 
+use jiff::Timestamp;
 use rustylink_api::{ClientIdentity, SessionCookies, SigningConfig};
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
-use time::OffsetDateTime;
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
@@ -76,7 +76,7 @@ impl RustylinkState {
             knock_token: None,
             signing: SigningConfig::default(),
             oauth: OAuthState::default(),
-            updated_at_unix: OffsetDateTime::now_utc().unix_timestamp(),
+            updated_at_unix: Timestamp::now().as_second(),
         }
     }
 
@@ -93,7 +93,7 @@ impl RustylinkState {
     }
 
     pub fn save(&mut self, path: &Path) -> Result<()> {
-        self.updated_at_unix = OffsetDateTime::now_utc().unix_timestamp();
+        self.updated_at_unix = Timestamp::now().as_second();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).context(CreateStateDirSnafu {
                 path: parent.to_path_buf(),

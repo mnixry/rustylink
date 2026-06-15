@@ -10,17 +10,22 @@ use tokio::{
     sync::{Mutex, mpsc},
 };
 
+use crate::OutboundInterface;
+
 const TCP_DIAL_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_FEILIAN_TCP_FRAME: u32 = 65_535;
 
 #[derive(Clone, Debug, Default)]
-pub struct FeilianTcpTransportFactory;
+pub struct FeilianTcpTransportFactory {
+    outbound_interface: Option<OutboundInterface>,
+}
 
 #[derive(Clone)]
 pub struct FeilianTcpSend {
     local_addr: SocketAddr,
     incoming: mpsc::Sender<(Vec<u8>, SocketAddr)>,
     state: Arc<Mutex<Option<TcpWriterState>>>,
+    outbound_interface: Option<OutboundInterface>,
 }
 
 pub struct FeilianTcpRecv {
@@ -32,6 +37,13 @@ struct TcpWriterState {
     writer: OwnedWriteHalf,
 }
 
+impl FeilianTcpTransportFactory {
+    #[must_use]
+    pub const fn new(outbound_interface: Option<OutboundInterface>) -> Self {
+        Self { outbound_interface }
+    }
+}
+
 impl UdpTransportFactory for FeilianTcpTransportFactory {
     type SendV4 = FeilianTcpSend;
     type SendV6 = FeilianTcpSend;
@@ -41,8 +53,14 @@ impl UdpTransportFactory for FeilianTcpTransportFactory {
     async fn bind(
         &mut self, params: &UdpTransportFactoryParams,
     ) -> io::Result<((Self::SendV4, Self::RecvV4), (Self::SendV6, Self::RecvV6))> {
-        let v4 = tcp_pair(SocketAddr::from((params.addr_v4, params.port)));
-        let v6 = tcp_pair(SocketAddr::from((params.addr_v6, params.port)));
+        let v4 = tcp_pair(
+            SocketAddr::from((params.addr_v4, params.port)),
+            self.outbound_interface.clone(),
+        );
+        let v6 = tcp_pair(
+            SocketAddr::from((params.addr_v6, params.port)),
+            self.outbound_interface.clone(),
+        );
         Ok((v4, v6))
     }
 }
@@ -71,15 +89,20 @@ impl UdpSend for FeilianTcpSend {
                 .as_ref()
                 .is_none_or(|current| current.destination != destination);
             if should_connect {
-                tracing::info!(%destination, "dialing FeiLian TCP WireGuard transport");
-                let stream = tokio::time::timeout(
+                tracing::info!(
+                    %destination,
+                    outbound_interface = self
+                        .outbound_interface
+                        .as_ref()
+                        .map_or("<default>", |interface| interface.name.as_str()),
+                    "dialing FeiLian TCP WireGuard transport"
+                );
+                let stream = crate::outbound::connect_tcp(
+                    destination,
+                    self.outbound_interface.as_ref(),
                     TCP_DIAL_TIMEOUT,
-                    tokio::net::TcpStream::connect(destination),
                 )
-                .await
-                .map_err(|_| {
-                    io::Error::new(io::ErrorKind::TimedOut, "FeiLian TCP dial timed out")
-                })??;
+                .await?;
                 let (reader, writer) = stream.into_split();
                 tokio::spawn(read_feilian_tcp_frames(
                     reader,
@@ -129,13 +152,16 @@ impl UdpRecv for FeilianTcpRecv {
     }
 }
 
-fn tcp_pair(local_addr: SocketAddr) -> (FeilianTcpSend, FeilianTcpRecv) {
+fn tcp_pair(
+    local_addr: SocketAddr, outbound_interface: Option<OutboundInterface>,
+) -> (FeilianTcpSend, FeilianTcpRecv) {
     let (tx, rx) = mpsc::channel(256);
     (
         FeilianTcpSend {
             local_addr,
             incoming: tx,
             state: Arc::new(Mutex::new(None)),
+            outbound_interface,
         },
         FeilianTcpRecv { incoming: rx },
     )

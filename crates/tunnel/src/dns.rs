@@ -20,6 +20,9 @@ use tokio::{
     net::{UdpSocket, lookup_host},
     task::JoinHandle,
 };
+use url::{Host, Url};
+
+use crate::OutboundInterface;
 
 const DNS_PORT: u16 = 53;
 const DNS_PROXY_PORT: u16 = 2913;
@@ -67,6 +70,7 @@ pub struct DnsHijackPlan {
 #[derive(Clone)]
 pub struct DnsHijacker {
     plan: Arc<DnsHijackPlan>,
+    outbound_interface: Option<OutboundInterface>,
 }
 
 pub struct DnsProxyRuntime {
@@ -166,9 +170,10 @@ impl DnsHijackPlan {
     }
 
     #[must_use]
-    pub fn hijacker(&self) -> Option<DnsHijacker> {
+    pub fn hijacker(&self, outbound_interface: Option<OutboundInterface>) -> Option<DnsHijacker> {
         self.enabled().then(|| DnsHijacker {
             plan: Arc::new(self.clone()),
+            outbound_interface,
         })
     }
 
@@ -196,8 +201,10 @@ impl DnsHijackPlan {
 }
 
 impl DnsProxyRuntime {
-    pub async fn start(plan: &DnsHijackPlan) -> Result<Option<Self>> {
-        let Some(hijacker) = plan.hijacker() else {
+    pub async fn start(
+        plan: &DnsHijackPlan, outbound_interface: Option<OutboundInterface>,
+    ) -> Result<Option<Self>> {
+        let Some(hijacker) = plan.hijacker(outbound_interface) else {
             tracing::info!("DNS hijack disabled because no DNS upstream was configured");
             return Ok(None);
         };
@@ -241,10 +248,12 @@ impl DnsProxyRuntime {
 
 impl DnsHijackTun {
     #[must_use]
-    pub fn new(inner: TunDevice, plan: &DnsHijackPlan) -> Self {
+    pub fn new(
+        inner: TunDevice, plan: &DnsHijackPlan, outbound_interface: Option<OutboundInterface>,
+    ) -> Self {
         Self {
             inner,
-            hijacker: plan.hijacker(),
+            hijacker: plan.hijacker(outbound_interface),
         }
     }
 }
@@ -272,6 +281,14 @@ impl IpRecv for DnsHijackTun {
                     forward.push(raw_packet.try_into_ip().map_err(to_io_error)?);
                     continue;
                 };
+                tracing::debug!(
+                    source = %query.source,
+                    destination = %query.destination,
+                    source_port = query.source_port,
+                    destination_port = query.destination_port,
+                    domain = query.domain.as_deref().unwrap_or("<unknown>"),
+                    "DNS hijack triggered for TUN packet"
+                );
                 let mut tun = self.inner.clone();
                 tokio::spawn(async move {
                     match hijacker.resolve_wire_query(query).await {
@@ -330,7 +347,13 @@ impl DnsHijacker {
 
         let mut last_error = None;
         for upstream in upstreams {
-            match query_dns_upstream(&upstream, &request_payload).await {
+            match query_dns_upstream(
+                &upstream,
+                &request_payload,
+                self.outbound_interface.as_ref(),
+            )
+            .await
+            {
                 Ok(response) => {
                     tracing::debug!(
                         domain = domain.as_deref().unwrap_or("<unknown>"),
@@ -422,10 +445,19 @@ async fn run_dns_proxy(socket: Arc<UdpSocket>, hijacker: DnsHijacker) {
             }
         };
         let payload = buf[..len].to_vec();
+        let domain = parse_dns_question_domain(&payload);
+        tracing::debug!(
+            %peer,
+            domain = domain.as_deref().unwrap_or("<unknown>"),
+            "DNS hijack triggered for proxy query"
+        );
         let socket = socket.clone();
         let hijacker = hijacker.clone();
         tokio::spawn(async move {
-            match hijacker.resolve_dns_payload(&payload, None).await {
+            match hijacker
+                .resolve_dns_payload(&payload, domain.as_deref())
+                .await
+            {
                 Ok(Some(response)) => {
                     if let Err(error) = socket.send_to(&response, peer).await {
                         tracing::warn!(%peer, %error, "failed to send DNS proxy response");
@@ -438,7 +470,9 @@ async fn run_dns_proxy(socket: Arc<UdpSocket>, hijacker: DnsHijacker) {
     }
 }
 
-async fn query_dns_upstream(upstream: &str, payload: &[u8]) -> io::Result<Vec<u8>> {
+async fn query_dns_upstream(
+    upstream: &str, payload: &[u8], outbound_interface: Option<&OutboundInterface>,
+) -> io::Result<Vec<u8>> {
     let addrs = lookup_host(upstream).await?;
     let mut last_error = None;
     for addr in addrs {
@@ -447,7 +481,7 @@ async fn query_dns_upstream(upstream: &str, payload: &[u8]) -> io::Result<Vec<u8
         } else {
             SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
         };
-        match query_dns_addr(bind_addr, addr, payload).await {
+        match query_dns_addr(bind_addr, addr, payload, outbound_interface).await {
             Ok(response) => return Ok(response),
             Err(error) => last_error = Some(error),
         }
@@ -462,8 +496,15 @@ async fn query_dns_upstream(upstream: &str, payload: &[u8]) -> io::Result<Vec<u8
 
 async fn query_dns_addr(
     bind_addr: SocketAddr, upstream: SocketAddr, payload: &[u8],
+    outbound_interface: Option<&OutboundInterface>,
 ) -> io::Result<Vec<u8>> {
-    let socket = UdpSocket::bind(bind_addr).await?;
+    let socket = crate::outbound::bind_udp_socket(bind_addr, outbound_interface)?;
+    tracing::trace!(
+        %upstream,
+        outbound_interface = outbound_interface
+            .map_or("<default>", |interface| interface.name.as_str()),
+        "sending DNS hijack query to upstream"
+    );
     socket.send_to(payload, upstream).await?;
     let mut response = vec![0_u8; MAX_DNS_PACKET];
     let (len, _) = tokio::time::timeout(DNS_TIMEOUT, socket.recv_from(&mut response))
@@ -535,32 +576,49 @@ fn push_dns_endpoints(upstreams: &mut Vec<String>, value: &str) {
 
 fn dns_endpoint(value: &str) -> Option<String> {
     let value = value.trim().trim_matches('"').trim_matches('\'');
-    if value.is_empty() || value.contains('/') {
+    if value.is_empty() {
         return None;
     }
-    let value = value
-        .split_once("://")
-        .map_or(value, |(_, rest)| rest)
-        .trim_matches('/');
+    if value.contains("://") {
+        return dns_endpoint_from_url(value);
+    }
+    if value.contains('/') {
+        return None;
+    }
     if value.parse::<SocketAddr>().is_ok() {
         return Some(value.to_string());
     }
     if let Ok(ip) = value.parse::<IpAddr>() {
-        return Some(SocketAddr::from((ip, DNS_PORT)).to_string());
+        let host = match ip {
+            IpAddr::V4(ip) => Host::Ipv4(ip),
+            IpAddr::V6(ip) => Host::Ipv6(ip),
+        };
+        return Some(format_dns_host_port(host, DNS_PORT));
     }
-    let colon_count = value.matches(':').count();
-    if colon_count == 1
-        && value
-            .rsplit_once(':')
-            .and_then(|(_, port)| port.parse::<u16>().ok())
-            .is_some()
-    {
-        return Some(value.to_string());
+    dns_endpoint_from_url(&format!("dns://{value}")).or_else(|| {
+        Host::parse(value)
+            .ok()
+            .map(|host| format_dns_host_port(host, DNS_PORT))
+    })
+}
+
+fn dns_endpoint_from_url(value: &str) -> Option<String> {
+    let url = Url::parse(value).ok()?;
+    if !matches!(url.scheme(), "dns" | "udp") {
+        return None;
     }
-    if colon_count > 1 {
-        Some(format!("[{value}]:{DNS_PORT}"))
-    } else {
-        Some(format!("{value}:{DNS_PORT}"))
+    if !url.path().is_empty() && url.path() != "/" {
+        return None;
+    }
+    let host = url.host()?.to_owned();
+    Some(format_dns_host_port(host, url.port().unwrap_or(DNS_PORT)))
+}
+
+fn format_dns_host_port(host: Host<String>, port: u16) -> String {
+    match host {
+        Host::Domain(domain) => format!("{domain}:{port}"),
+        Host::Ipv4(ip) => SocketAddr::from((ip, port)).to_string(),
+        Host::Ipv6(ip) => SocketAddr::from((ip, port)).to_string(),
     }
 }
 
@@ -663,6 +721,15 @@ mod tests {
             dns_endpoint("dns.example:5353"),
             Some("dns.example:5353".to_string())
         );
+        assert_eq!(
+            dns_endpoint("udp://8.8.8.8:5353"),
+            Some("8.8.8.8:5353".to_string())
+        );
+        assert_eq!(
+            dns_endpoint("dns://[2001:4860:4860::8888]:5353"),
+            Some("[2001:4860:4860::8888]:5353".to_string())
+        );
+        assert_eq!(dns_endpoint("https://dns.example/dns-query"), None);
     }
 
     #[test]

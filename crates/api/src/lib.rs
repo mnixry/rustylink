@@ -10,7 +10,7 @@ pub mod codegen {
 
 pub type JsonObject = serde_json::Map<String, serde_json::Value>;
 
-pub use client::{ApiClient, SessionCookies, VpnDotServers};
+pub use client::{ApiClient, ApiClientOptions, SessionCookies, VpnDotServers};
 pub use codegen::types::{
     ActivateInfo, ActivateRequest, ActivateResponse, GetLoginSettingResponse,
     GetTenantConfigResponse, GetUserInfoResponse, GetVpnExportsResponse, GetVpnLocationsResponse,

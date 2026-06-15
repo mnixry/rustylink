@@ -5,7 +5,6 @@ use gotatun::{
     device::{Device, DeviceBuilder, Peer},
     noise::ProtocolIdentifier,
     tun::tun_async_device::TunDevice,
-    udp::socket::UdpSocketFactory,
     x25519::{PublicKey, StaticSecret},
 };
 use ipnetwork::IpNetwork;
@@ -16,8 +15,8 @@ use strum::{Display, EnumIter, FromRepr};
 use tokio::net::lookup_host;
 
 use crate::{
-    DnsHijackPlan, DnsHijackTun, DnsProxyRuntime, FeilianTcpTransportFactory, RoutePlan,
-    route::AppliedRoutes,
+    BoundUdpSocketFactory, DnsHijackPlan, DnsHijackTun, DnsProxyRuntime,
+    FeilianTcpTransportFactory, OutboundInterface, RoutePlan, route::AppliedRoutes,
 };
 
 const ANDROID_LOCAL_PORT_START: u16 = 12912;
@@ -25,7 +24,7 @@ const WIREGUARD_KEEPALIVE_SECS: u16 = 25;
 const STANDARD_NOISE_CONSTRUCTION: &[u8] = b"Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s";
 const FEILIAN_V2_PROTOCOL_IDENTIFIER: &[u8] = b"CorpLink v1 vpn@feilian-----------";
 
-type UdpTunnelDevice = Device<(UdpSocketFactory, DnsHijackTun, DnsHijackTun)>;
+type UdpTunnelDevice = Device<(BoundUdpSocketFactory, DnsHijackTun, DnsHijackTun)>;
 type TcpTunnelDevice = Device<(FeilianTcpTransportFactory, DnsHijackTun, DnsHijackTun)>;
 
 #[derive(Debug, Snafu)]
@@ -44,6 +43,9 @@ pub enum Error {
 
     #[snafu(display("DNS hijack setup failed"))]
     Dns { source: crate::dns::Error },
+
+    #[snafu(display("outbound interface selection failed"))]
+    Outbound { source: crate::outbound::Error },
 
     #[snafu(display("gotatun device setup failed"))]
     Device { source: gotatun::device::Error },
@@ -96,6 +98,7 @@ pub struct TunnelConfig {
     pub protocol_mode: Option<i32>,
     pub protocol_version: Option<String>,
     pub protocol_detect_enable: bool,
+    pub outbound_interface: Option<String>,
     pub route_plan: RoutePlan,
     pub dns_plan: DnsHijackPlan,
 }
@@ -186,6 +189,7 @@ impl TunnelConfig {
             protocol_mode,
             protocol_version: conn.protocol_version.clone(),
             protocol_detect_enable,
+            outbound_interface: None,
             route_plan: RoutePlan::from_vpn_conn(conn),
             dns_plan,
         })
@@ -239,22 +243,7 @@ impl TunnelSession {
             "local_private_key",
             &self.config.local_private_key,
         )?);
-        let server_public_key = PublicKey::from(decode_key(
-            "server_public_key",
-            &self.config.server_public_key,
-        )?);
-        let mut peer = Peer::new(server_public_key)
-            .with_endpoint(endpoint)
-            .with_allowed_ips(allowed_ips(&self.config.route_plan)?);
-        peer.keepalive = Some(WIREGUARD_KEEPALIVE_SECS);
-        if let Some(preshared_key) = self
-            .config
-            .server_preshared_key
-            .as_deref()
-            .filter(|value| !value.is_empty())
-        {
-            peer = peer.with_preshared_key(decode_key("server_preshared_key", preshared_key)?);
-        }
+        let peer = tunnel_peer(&self.config, endpoint)?;
 
         let tun = TunDevice::from_name(&self.config.interface_name).context(TunDeviceSnafu)?;
         let actual_interface_name = tun.name().context(TunDeviceSnafu)?;
@@ -268,6 +257,24 @@ impl TunnelSession {
                 .interface_name
                 .clone_from(&actual_interface_name);
         }
+        let outbound_interface = OutboundInterface::resolve(
+            self.config.outbound_interface.as_deref(),
+            Some(&actual_interface_name),
+        )
+        .context(OutboundSnafu)?;
+        if let Some(outbound_interface) = &outbound_interface {
+            tracing::info!(
+                outbound_interface = %outbound_interface.name,
+                outbound_interface_index = outbound_interface.index,
+                tunnel_interface = %actual_interface_name,
+                "binding tunnel outbound sockets to physical interface"
+            );
+        } else {
+            tracing::warn!(
+                tunnel_interface = %actual_interface_name,
+                "no outbound interface selected; tunnel sockets will use OS routing"
+            );
+        }
         let routes = self
             .config
             .route_plan
@@ -276,14 +283,14 @@ impl TunnelSession {
             .context(RouteSnafu)?;
         self.routes = Some(routes);
         self.status = TunnelStatus::RoutesApplied;
-        self.dns_proxy = DnsProxyRuntime::start(&self.config.dns_plan)
+        self.dns_proxy = DnsProxyRuntime::start(&self.config.dns_plan, outbound_interface.clone())
             .await
             .context(DnsSnafu)?;
-        let tun = DnsHijackTun::new(tun, &self.config.dns_plan);
+        let tun = DnsHijackTun::new(tun, &self.config.dns_plan, outbound_interface.clone());
         let device = match transport {
             TunnelTransport::Udp => {
                 let builder = DeviceBuilder::new()
-                    .with_default_udp()
+                    .with_udp(BoundUdpSocketFactory::new(outbound_interface.clone()))
                     .with_ip(tun)
                     .with_private_key(private_key)
                     .with_listen_port(self.config.local_port)
@@ -293,7 +300,7 @@ impl TunnelSession {
             }
             TunnelTransport::FeilianTcp => {
                 let builder = DeviceBuilder::new()
-                    .with_udp(FeilianTcpTransportFactory)
+                    .with_udp(FeilianTcpTransportFactory::new(outbound_interface.clone()))
                     .with_ip(tun)
                     .with_private_key(private_key)
                     .with_listen_port(self.config.local_port)
@@ -430,6 +437,23 @@ async fn resolve_endpoint(endpoint: &str) -> Result<std::net::SocketAddr> {
     addrs.next().context(EmptyEndpointResolutionSnafu {
         endpoint: endpoint.to_string(),
     })
+}
+
+fn tunnel_peer(config: &TunnelConfig, endpoint: std::net::SocketAddr) -> Result<Peer> {
+    let server_public_key =
+        PublicKey::from(decode_key("server_public_key", &config.server_public_key)?);
+    let mut peer = Peer::new(server_public_key)
+        .with_endpoint(endpoint)
+        .with_allowed_ips(allowed_ips(&config.route_plan)?);
+    peer.keepalive = Some(WIREGUARD_KEEPALIVE_SECS);
+    if let Some(preshared_key) = config
+        .server_preshared_key
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        peer = peer.with_preshared_key(decode_key("server_preshared_key", preshared_key)?);
+    }
+    Ok(peer)
 }
 
 fn allowed_ips(route_plan: &RoutePlan) -> Result<Vec<IpNetwork>> {

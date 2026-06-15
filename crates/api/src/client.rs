@@ -3,11 +3,11 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+use jiff::Timestamp;
 use reqwest::header::{
     ACCEPT_LANGUAGE, COOKIE, HeaderMap, HeaderName, HeaderValue, SET_COOKIE, USER_AGENT,
 };
 use snafu::prelude::*;
-use time::OffsetDateTime;
 use tracing::instrument;
 use url::Url;
 
@@ -99,6 +99,11 @@ pub struct ApiClient {
     hooks: ApiHooks,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ApiClientOptions {
+    pub outbound_interface: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct VpnDotServers {
     pub api_base_url: String,
@@ -146,16 +151,47 @@ impl_api_envelope!(
     ReportVpnResponse,
 );
 
+macro_rules! send_checked {
+    ($request:expr) => {{
+        let response = $request
+            .send()
+            .await
+            .context(GeneratedClientSnafu)?
+            .into_inner();
+        check_api_status(&response)?;
+        Ok(response)
+    }};
+}
+
 impl ApiClient {
     pub fn new(
         base_url: impl AsRef<str>, identity: ClientIdentity, signer: SigningContext,
         cookies: SessionCookies,
     ) -> Result<Self> {
+        Self::new_with_options(
+            base_url,
+            identity,
+            signer,
+            cookies,
+            &ApiClientOptions::from_env(),
+        )
+    }
+
+    pub fn new_with_options(
+        base_url: impl AsRef<str>, identity: ClientIdentity, signer: SigningContext,
+        cookies: SessionCookies, options: &ApiClientOptions,
+    ) -> Result<Self> {
         let base_url = normalize_base_url(base_url.as_ref())?;
-        let http = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::limited(10))
-            .build()
-            .context(BuildHttpClientSnafu)?;
+        let mut http_builder =
+            reqwest::Client::builder().redirect(reqwest::redirect::Policy::limited(10));
+        if let Some(interface) = options.outbound_interface.as_deref() {
+            tracing::debug!(
+                outbound_interface = interface,
+                "binding API HTTP client to outbound interface"
+            );
+            http_builder = http_builder.interface(interface);
+        }
+        let http = http_builder.build().context(BuildHttpClientSnafu)?;
         let hooks = ApiHooks::new(identity, signer, cookies);
         let generated = codegen::Client::new_with_client(&base_url, http.clone(), hooks.clone());
         tracing::debug!(%base_url, "created API client");
@@ -185,16 +221,7 @@ impl ApiClient {
 
     #[instrument(skip(self))]
     pub async fn activate(&self, code: String) -> Result<ActivateResponse> {
-        let response = self
-            .generated
-            .activate()
-            .body(ActivateRequest { code })
-            .send()
-            .await
-            .context(GeneratedClientSnafu)?
-            .into_inner();
-        check_api_status(&response)?;
-        Ok(response)
+        send_checked!(self.generated.activate().body(ActivateRequest { code }))
     }
 
     #[instrument(skip(self, password))]
@@ -210,16 +237,7 @@ impl ApiClient {
             login_scene,
             password,
         };
-        let response = self
-            .generated
-            .login_by_password()
-            .body(body)
-            .send()
-            .await
-            .context(GeneratedClientSnafu)?
-            .into_inner();
-        check_api_status(&response)?;
-        Ok(response)
+        send_checked!(self.generated.login_by_password().body(body))
     }
 
     pub async fn send_login_code(
@@ -231,16 +249,7 @@ impl ApiClient {
             login_scene,
             login_type,
         };
-        let response = self
-            .generated
-            .send_login_code()
-            .body(body)
-            .send()
-            .await
-            .context(GeneratedClientSnafu)?
-            .into_inner();
-        check_api_status(&response)?;
-        Ok(response)
+        send_checked!(self.generated.send_login_code().body(body))
     }
 
     pub async fn verify_login_code(
@@ -254,16 +263,7 @@ impl ApiClient {
             login_scene,
             login_type,
         };
-        let response = self
-            .generated
-            .verify_login_code()
-            .body(body)
-            .send()
-            .await
-            .context(GeneratedClientSnafu)?
-            .into_inner();
-        check_api_status(&response)?;
-        Ok(response)
+        send_checked!(self.generated.verify_login_code().body(body))
     }
 
     pub async fn verify_mfa(
@@ -284,109 +284,50 @@ impl ApiClient {
             mfa_type,
             password,
         };
-        let response = self
-            .generated
-            .verify_mfa()
-            .body(body)
-            .send()
-            .await
-            .context(GeneratedClientSnafu)?
-            .into_inner();
-        check_api_status(&response)?;
-        Ok(response)
+        send_checked!(self.generated.verify_mfa().body(body))
     }
 
     pub async fn oauth_callback(
         &self, alias_key: String, code: String, state: String, code_verifier: String,
     ) -> Result<OauthCallbackResponse> {
         let _ = code_verifier;
-        let response = self
-            .generated
-            .oauth_callback()
-            .alias(alias_key)
-            .code(code)
-            .state(state)
-            .send()
-            .await
-            .context(GeneratedClientSnafu)?
-            .into_inner();
-        check_api_status(&response)?;
-        Ok(response)
+        send_checked!(
+            self.generated
+                .oauth_callback()
+                .alias(alias_key)
+                .code(code)
+                .state(state)
+        )
     }
 
     pub async fn third_party_login_links(
         &self, code_challenge: String,
     ) -> Result<GetThirdPartyLoginLinksResponse> {
-        let response = self
-            .generated
-            .get_third_party_login_links()
-            .code_challenge(code_challenge)
-            .send()
-            .await
-            .context(GeneratedClientSnafu)?
-            .into_inner();
-        check_api_status(&response)?;
-        Ok(response)
+        send_checked!(
+            self.generated
+                .get_third_party_login_links()
+                .code_challenge(code_challenge)
+        )
     }
 
     pub async fn login_setting(&self) -> Result<GetLoginSettingResponse> {
-        let response = self
-            .generated
-            .get_login_setting()
-            .send()
-            .await
-            .context(GeneratedClientSnafu)?
-            .into_inner();
-        check_api_status(&response)?;
-        Ok(response)
+        send_checked!(self.generated.get_login_setting())
     }
 
     pub async fn user_info(&self) -> Result<GetUserInfoResponse> {
-        let response = self
-            .generated
-            .get_user_info()
-            .send()
-            .await
-            .context(GeneratedClientSnafu)?
-            .into_inner();
-        check_api_status(&response)?;
-        Ok(response)
+        send_checked!(self.generated.get_user_info())
     }
 
     pub async fn tenant_config(&self) -> Result<GetTenantConfigResponse> {
-        let response = self
-            .generated
-            .get_tenant_config()
-            .send()
-            .await
-            .context(GeneratedClientSnafu)?
-            .into_inner();
-        check_api_status(&response)?;
-        Ok(response)
+        send_checked!(self.generated.get_tenant_config())
     }
 
     pub async fn vpn_setting(&self) -> Result<GetVpnSettingResponse> {
-        let response = self
-            .generated
-            .get_vpn_setting()
-            .send()
-            .await
-            .context(GeneratedClientSnafu)?
-            .into_inner();
-        check_api_status(&response)?;
-        Ok(response)
+        send_checked!(self.generated.get_vpn_setting())
     }
 
     pub async fn vpn_locations(&self) -> Result<GetVpnLocationsResponse> {
-        let response = self
-            .generated
-            .get_vpn_locations()
-            .send()
-            .await
-            .context(GeneratedClientSnafu)?
-            .into_inner();
-        check_api_status(&response)?;
-        Ok(response)
+        send_checked!(self.generated.get_vpn_locations())
     }
 
     pub async fn vpn_conn(
@@ -396,15 +337,7 @@ impl ApiClient {
             Some(base_url) => self.generated_client_for(base_url)?,
             None => self.generated.clone(),
         };
-        let response = client
-            .vpn_conn()
-            .body(body.clone())
-            .send()
-            .await
-            .context(GeneratedClientSnafu)?
-            .into_inner();
-        check_api_status(&response)?;
-        Ok(response)
+        send_checked!(client.vpn_conn().body(body.clone()))
     }
 
     pub async fn vpn_conn_for_dot(
@@ -417,27 +350,13 @@ impl ApiClient {
     pub async fn vpn_ping_for_dot(&self, dot: &VpnDot) -> Result<VpnPingResponse> {
         let servers = VpnDotServers::from_dot(dot, false)?;
         let client = self.generated_client_for(&servers.api_base_url)?;
-        let response = client
-            .vpn_ping()
-            .send()
-            .await
-            .context(GeneratedClientSnafu)?
-            .into_inner();
-        check_api_status(&response)?;
-        Ok(response)
+        send_checked!(client.vpn_ping())
     }
 
     pub async fn vpn_exports_for_dot(&self, dot: &VpnDot) -> Result<GetVpnExportsResponse> {
         let servers = VpnDotServers::from_dot(dot, false)?;
         let client = self.generated_client_for(&servers.api_base_url)?;
-        let response = client
-            .get_vpn_exports()
-            .send()
-            .await
-            .context(GeneratedClientSnafu)?
-            .into_inner();
-        check_api_status(&response)?;
-        Ok(response)
+        send_checked!(client.get_vpn_exports())
     }
 
     pub async fn report_vpn_for_dot(
@@ -445,30 +364,13 @@ impl ApiClient {
     ) -> Result<ReportVpnResponse> {
         let servers = VpnDotServers::from_dot(dot, false)?;
         let client = self.generated_client_for(&servers.api_base_url)?;
-        let response = client
-            .report_vpn()
-            .body(body.clone())
-            .send()
-            .await
-            .context(GeneratedClientSnafu)?
-            .into_inner();
-        check_api_status(&response)?;
-        Ok(response)
+        send_checked!(client.report_vpn().body(body.clone()))
     }
 
     pub async fn report_security(
         &self, body: &SecurityReportRequest,
     ) -> Result<ReportSecurityResponse> {
-        let response = self
-            .generated
-            .report_security()
-            .body(body.clone())
-            .send()
-            .await
-            .context(GeneratedClientSnafu)?
-            .into_inner();
-        check_api_status(&response)?;
-        Ok(response)
+        send_checked!(self.generated.report_security().body(body.clone()))
     }
 
     fn generated_client_for(&self, base_url: &str) -> Result<codegen::Client> {
@@ -478,6 +380,18 @@ impl ApiClient {
             self.http.clone(),
             self.hooks.clone(),
         ))
+    }
+}
+
+impl ApiClientOptions {
+    #[must_use]
+    pub fn from_env() -> Self {
+        Self {
+            outbound_interface: std::env::var("RUSTYLINK_OUTBOUND_INTERFACE")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+        }
     }
 }
 
@@ -688,7 +602,7 @@ pub async fn prepare_generated_request(
 ) -> Result<()> {
     {
         let mut query = request.url_mut().query_pairs_mut();
-        for (key, value) in hooks.identity.query_pairs(OffsetDateTime::now_utc()) {
+        for (key, value) in hooks.identity.query_pairs(Timestamp::now()) {
             query.append_pair(key, &value);
         }
     }

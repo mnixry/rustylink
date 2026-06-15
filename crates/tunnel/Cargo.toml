@@ -7,6 +7,7 @@ version.workspace = true
 rustylink-api.path = "../api"
 
 base64.workspace        = true
+default-net.workspace   = true
 etherparse.workspace    = true
 hex.workspace           = true
 hickory-proto.workspace = true
@@ -16,9 +17,11 @@ route_manager.workspace = true
 serde.workspace         = true
 serde_json.workspace    = true
 snafu.workspace         = true
+socket2.workspace       = true
 strum.workspace         = true
 tokio.workspace         = true
 tracing.workspace       = true
+url.workspace           = true
 
 [dependencies.gotatun]
 features = ["device", "tun"]
