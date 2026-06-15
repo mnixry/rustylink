@@ -10,4 +10,4 @@ pub use dns::{DnsHijackPlan, DnsRule};
 pub use error::{Error, Result};
 pub use reconnect::{ReconnectController, ReconnectDecision, ReconnectEvent, ReconnectPolicy};
 pub use route::{RoutePlan, RouteRule};
-pub use session::{TunnelConfig, TunnelSession, TunnelStatus};
+pub use session::{LocalTunnelParams, TunnelConfig, TunnelSession, TunnelStatus};

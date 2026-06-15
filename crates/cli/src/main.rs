@@ -1,9 +1,12 @@
 use std::{fs, path::PathBuf};
 
 use clap::{Args, Parser, Subcommand};
-use rustylink_api::{SecurityReportRequest, VpnConnRequest};
-use rustylink_core::{AppContext, auth, security, vpn};
-use rustylink_tunnel::{TunnelConfig, TunnelSession};
+use rustylink_api::{SecurityReportRequest, VpnConnRequest, VpnReportRequest};
+use rustylink_core::{
+    AppContext, auth, security,
+    vpn::{self, VpnConfigRequest, VpnConnectMode},
+};
+use rustylink_tunnel::{LocalTunnelParams, TunnelConfig, TunnelSession};
 use serde_json::json;
 use snafu::prelude::*;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -34,6 +37,15 @@ enum CliError {
 
     #[snafu(display("failed to render JSON output"))]
     RenderJson { source: serde_json::Error },
+
+    #[snafu(display("invalid VPN mode `{value}`; expected Full, Split, or Relay"))]
+    InvalidVpnMode { value: String },
+
+    #[snafu(display("no export_id was provided and /api/setting did not return one"))]
+    MissingExportId,
+
+    #[snafu(display("failed to wait for Ctrl-C"))]
+    WaitForSignal { source: std::io::Error },
 }
 
 type Result<T, E = CliError> = std::result::Result<T, E>;
@@ -192,9 +204,11 @@ enum VpnSubcommand {
 #[derive(Debug, Args)]
 struct VpnConnArgs {
     #[arg(long)]
-    public_key: String,
+    public_key: Option<String>,
     #[arg(long)]
-    export_id: i32,
+    local_private_key: Option<String>,
+    #[arg(long)]
+    export_id: Option<i32>,
     #[arg(long)]
     mode: Option<String>,
     #[arg(long)]
@@ -205,6 +219,10 @@ struct VpnConnArgs {
     not_auto: Option<bool>,
     #[arg(long)]
     api_base_url: Option<String>,
+    #[arg(long)]
+    dot_id: Option<i32>,
+    #[arg(long)]
+    reconnect: bool,
 }
 
 #[derive(Debug, Args)]
@@ -368,25 +386,71 @@ async fn handle_vpn(ctx: &mut AppContext, command: VpnSubcommand) -> Result<()> 
             print_json(&response)?;
         }
         VpnSubcommand::Conn(args) => {
-            let request = vpn_conn_request(args);
+            let request = vpn_conn_request(ctx, args).await?;
             let response = vpn::vpn_conn(ctx, request.1.as_deref(), &request.0)
                 .await
                 .context(cli_error::Core)?;
             print_json(&response)?;
         }
         VpnSubcommand::Connect(args) => {
-            let request = vpn_conn_request(args);
-            let response = vpn::vpn_conn(ctx, request.1.as_deref(), &request.0)
+            let mode = parse_vpn_mode(args.mode.as_deref())?;
+            let export_id = resolve_export_id(ctx, args.export_id).await?;
+            let local_params = local_params_for_connect(&args)?;
+            let config_request = VpnConfigRequest {
+                mode,
+                public_key: local_params.local_public_key.clone(),
+                export_id,
+                otp: args.otp,
+                sign_token: args.sign_token,
+                not_auto: args.not_auto.unwrap_or(true),
+                reconnect: args.reconnect,
+                preferred_dot_id: args.dot_id,
+            };
+            let config_result = vpn::vpn_config_from_dot_list(ctx, &config_request)
                 .await
                 .context(cli_error::Core)?;
-            let Some(data) = response.data.clone() else {
-                print_json(&json!({ "response": response, "tunnel": null }))?;
-                return Ok(());
-            };
-            let config = TunnelConfig::from_vpn_conn(&data).context(cli_error::Tunnel)?;
+            let data = config_result
+                .response
+                .data
+                .clone()
+                .expect("core checked config data exists");
+            let config = TunnelConfig::from_vpn_conn(
+                &data,
+                local_params.clone(),
+                config_result.servers.wireguard_endpoint.clone(),
+                config_result.dot.protocol_mode,
+                config_result.dot.protocol_detect_enabled(),
+            )
+            .context(cli_error::Tunnel)?;
             let mut session = TunnelSession::new(config);
             session.start().await.context(cli_error::Tunnel)?;
-            print_json(&json!({ "response": response, "tunnel_status": session.status }))?;
+            let connect_report =
+                vpn_report_request(100, &data.ip, &local_params.local_public_key, mode);
+            let connect_report_response =
+                match vpn::report_vpn(ctx, &config_result.dot, &connect_report).await {
+                    Ok(response) => Some(response),
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to report VPN connection");
+                        None
+                    }
+                };
+            print_json(&json!({
+                "response": &config_result.response,
+                "dot": &config_result.dot,
+                "servers": &config_result.servers,
+                "local_public_key": &local_params.local_public_key,
+                "connect_report": connect_report_response,
+                "tunnel_status": session.status,
+            }))?;
+            tokio::signal::ctrl_c()
+                .await
+                .context(cli_error::WaitForSignal)?;
+            let disconnect_report =
+                vpn_report_request(101, &data.ip, &local_params.local_public_key, mode);
+            if let Err(error) = vpn::report_vpn(ctx, &config_result.dot, &disconnect_report).await {
+                tracing::warn!(%error, "failed to report VPN disconnection");
+            }
+            session.stop().await.context(cli_error::Tunnel)?;
         }
     }
     Ok(())
@@ -408,18 +472,69 @@ async fn handle_security(ctx: &mut AppContext, command: SecuritySubcommand) -> R
     Ok(())
 }
 
-fn vpn_conn_request(args: VpnConnArgs) -> (VpnConnRequest, Option<String>) {
-    (
+async fn vpn_conn_request(
+    ctx: &mut AppContext, args: VpnConnArgs,
+) -> Result<(VpnConnRequest, Option<String>)> {
+    let mode = parse_vpn_mode(args.mode.as_deref())?;
+    let export_id = resolve_export_id(ctx, args.export_id).await?;
+    let public_key = args
+        .public_key
+        .unwrap_or_else(|| LocalTunnelParams::generate().local_public_key);
+    Ok((
         VpnConnRequest {
-            mode: args.mode,
-            public_key: args.public_key,
+            mode: Some(mode.android_name().to_string()),
+            public_key,
             otp: args.otp,
-            export_id: args.export_id,
+            export_id,
             sign_token: args.sign_token,
             not_auto: args.not_auto,
         },
         args.api_base_url,
-    )
+    ))
+}
+
+async fn resolve_export_id(ctx: &mut AppContext, export_id: Option<i32>) -> Result<i32> {
+    if let Some(export_id) = export_id {
+        return Ok(export_id);
+    }
+    let setting = vpn::vpn_setting(ctx).await.context(cli_error::Core)?;
+    setting
+        .data
+        .and_then(|data| data.export_id)
+        .context(cli_error::MissingExportId)
+}
+
+fn local_params_for_connect(args: &VpnConnArgs) -> Result<LocalTunnelParams> {
+    if let Some(private_key) = &args.local_private_key {
+        return LocalTunnelParams::from_private_key(private_key).context(cli_error::Tunnel);
+    }
+    Ok(LocalTunnelParams::generate())
+}
+
+fn parse_vpn_mode(value: Option<&str>) -> Result<VpnConnectMode> {
+    let Some(value) = value else {
+        return Ok(VpnConnectMode::Full);
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "full" => Ok(VpnConnectMode::Full),
+        "split" => Ok(VpnConnectMode::Split),
+        "relay" | "relpy" => Ok(VpnConnectMode::Relay),
+        _ => cli_error::InvalidVpnMode {
+            value: value.to_string(),
+        }
+        .fail(),
+    }
+}
+
+fn vpn_report_request(
+    report_type: i32, ip: &str, public_key: &str, mode: VpnConnectMode,
+) -> VpnReportRequest {
+    VpnReportRequest {
+        ip: ip.to_string(),
+        mode: mode.android_name().to_string(),
+        public_key: public_key.to_string(),
+        type_: report_type.to_string(),
+    }
 }
 
 fn read_security_report(path: PathBuf) -> Result<SecurityReportRequest> {

@@ -49,6 +49,15 @@ pub enum Error {
         value: String,
         source: url::ParseError,
     },
+
+    #[snafu(display("no VPN dots were returned by /api/vpn/list"))]
+    NoVpnDots,
+
+    #[snafu(display("no VPN dot supports requested mode `{mode}`"))]
+    NoSupportedVpnDot { mode: String },
+
+    #[snafu(display("VPN config response did not contain data"))]
+    MissingVpnConfigData,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
