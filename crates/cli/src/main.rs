@@ -281,25 +281,10 @@ enum StateSubcommand {
 }
 
 #[tokio::main]
-async fn main() {
+#[snafu::report]
+async fn main() -> Result<()> {
     init_tracing();
-    if let Err(error) = run().await {
-        tracing::error!(%error, "command failed");
-        print_error_chain(&error);
-        std::process::exit(1);
-    }
-}
 
-fn print_error_chain(error: &CliError) {
-    eprintln!("{error}");
-    let mut source = std::error::Error::source(error);
-    while let Some(error) = source {
-        eprintln!("  caused by: {error}");
-        source = error.source();
-    }
-}
-
-async fn run() -> Result<()> {
     let cli = Cli::parse();
     let api_options = ApiClientOptions {
         outbound_interface: cli.outbound_interface,

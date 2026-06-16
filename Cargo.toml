@@ -30,8 +30,8 @@ rand               = "0.10.1"
 reqwest            = { version = "0.13.4", features = ["cookies", "json", "rustls"] }
 route_manager      = { version = "0.2.11", features = ["async"] }
 serde              = { version = "1.0.228", features = ["derive"] }
+serde-saphyr       = "0.0.27"
 serde_json         = "1.0.150"
-serde_yaml         = "0.9.34"
 sha1               = "0.11.0"
 sha2               = "0.11.0"
 snafu              = "0.9.1"

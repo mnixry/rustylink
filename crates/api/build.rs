@@ -4,40 +4,45 @@ use std::{
 };
 
 use progenitor::{GenerationSettings, Generator, InterfaceStyle, TagStyle};
-use serde_yaml::{Mapping, Value};
+use snafu::prelude::*;
 
-fn main() {
-    let spec_dir = Path::new("spec");
-    let root_path = spec_dir.join("openapi.yaml");
-    let paths_path = spec_dir.join("paths.yaml");
-    let components_path = spec_dir.join("components.yaml");
+#[derive(Debug, Snafu)]
+#[snafu(whatever, display("Error was: {message}"))]
+struct Error {
+    message: String,
+    #[snafu(source(from(Box<dyn std::error::Error>, Some)))]
+    source: Option<Box<dyn std::error::Error>>,
+}
 
-    for path in [&root_path, &paths_path, &components_path] {
-        println!("cargo:rerun-if-changed={}", path.display());
-    }
+fn main() -> Result<(), Error> {
+    let root_path = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/spec/openapi.yaml"));
+    println!("cargo:rerun-if-changed={}", root_path.display());
 
-    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR must be set"));
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").whatever_context("OUT_DIR missing")?);
     let generated_path = out_dir.join("progenitor.rs");
 
-    let spec = assemble_openapi(&root_path, &paths_path, &components_path)
-        .expect("assemble checked-in OpenAPI spec");
     let spec: openapiv3::OpenAPI =
-        serde_yaml::from_value(spec).expect("parse checked-in OpenAPI spec");
+        serde_saphyr::from_reader(fs::File::open(root_path).whatever_context("open spec file")?)
+            .whatever_context("parse spec file")?;
 
     let mut settings = GenerationSettings::default();
     settings
         .with_interface(InterfaceStyle::Builder)
         .with_tag(TagStyle::Merged)
-        .with_inner_type("crate::client::ApiHooks".parse().expect("hook type tokens"))
+        .with_inner_type(
+            "crate::client::ApiHooks"
+                .parse()
+                .whatever_context("hook type tokens")?,
+        )
         .with_pre_hook_async(
             "crate::client::prepare_generated_request"
                 .parse()
-                .expect("pre-hook tokens"),
+                .whatever_context("pre-hook tokens")?,
         )
         .with_post_hook_async(
             "crate::client::store_generated_response_cookies"
                 .parse()
-                .expect("post-hook tokens"),
+                .whatever_context("post-hook tokens")?,
         )
         .with_derive("Clone")
         .with_derive("Debug")
@@ -46,30 +51,9 @@ fn main() {
     let mut generator = Generator::new(&settings);
     let tokens = generator
         .generate_tokens(&spec)
-        .expect("generate Progenitor client");
-    let syntax = syn::parse2(tokens).expect("parse generated Rust tokens");
+        .whatever_context("generate Progenitor client")?;
+    let syntax = syn::parse2(tokens).whatever_context("parse generated Rust tokens")?;
     let content = prettyplease::unparse(&syntax);
-    fs::write(generated_path, content).expect("write generated Progenitor client");
-}
-
-fn assemble_openapi(
-    root_path: &Path, paths_path: &Path, components_path: &Path,
-) -> Result<Value, Box<dyn std::error::Error>> {
-    let mut root = read_yaml_mapping(root_path)?;
-    root.insert(
-        Value::String("paths".to_string()),
-        Value::Mapping(read_yaml_mapping(paths_path)?),
-    );
-    root.insert(
-        Value::String("components".to_string()),
-        Value::Mapping(read_yaml_mapping(components_path)?),
-    );
-    Ok(Value::Mapping(root))
-}
-
-fn read_yaml_mapping(path: &Path) -> Result<Mapping, Box<dyn std::error::Error>> {
-    match serde_yaml::from_reader(fs::File::open(path)?)? {
-        Value::Mapping(mapping) => Ok(mapping),
-        _ => Err(format!("{} must contain a YAML mapping", path.display()).into()),
-    }
+    fs::write(generated_path, content).whatever_context("write generated Progenitor client")?;
+    Ok(())
 }
