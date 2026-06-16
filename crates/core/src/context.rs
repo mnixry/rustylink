@@ -57,8 +57,12 @@ impl AppContext {
             .selected_base_url()
             .context(MissingBaseUrlSnafu)?
             .to_string();
+        self.api_client_for_base_url(base_url)
+    }
+
+    pub fn api_client_for_base_url(&self, base_url: impl AsRef<str>) -> Result<ApiClient> {
         let client = ApiClient::new_with_options(
-            base_url,
+            base_url.as_ref(),
             self.state.identity.clone(),
             SigningContext::new(self.state.signing.clone()),
             self.state.cookies.clone(),

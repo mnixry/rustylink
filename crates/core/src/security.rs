@@ -36,28 +36,77 @@ pub async fn report_security(
 #[must_use]
 pub fn all_green_security_report() -> SecurityReportRequest {
     let items = [
-        ("root", 3),
-        ("certificate", 2),
-        ("wifi", 2),
-        ("wifi_wep", 1),
-        ("network", 1),
-        ("password", 3),
-        ("lock_image", 1),
-        ("debug_off", 1),
-        ("debug_on", 2),
+        "root",
+        "certificate",
+        "wifi",
+        "wifi_wep",
+        "network",
+        "password",
+        "lock_image",
+        "debug_off",
+        "debug_on",
     ]
     .into_iter()
-    .map(|(name, level)| SecurityReportItem {
-        name: name.to_string(),
-        level,
-        passed: true,
-        message: Some("configured green default".to_string()),
+    .map(|key| SecurityReportItem {
+        data: JsonObject::new(),
+        key: key.to_string(),
+        level: 0,
     })
     .collect();
 
     SecurityReportRequest {
-        status: "green".to_string(),
         items,
         raw: JsonObject::new(),
+        status: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn green_report_matches_android_all_safe_wire_shape() {
+        let report = all_green_security_report();
+        let items = report
+            .items
+            .iter()
+            .map(|item| (item.key.as_str(), item.level, item.data.is_empty()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(report.status, None);
+        assert!(report.raw.is_empty());
+        assert_eq!(
+            items,
+            [
+                ("root", 0, true),
+                ("certificate", 0, true),
+                ("wifi", 0, true),
+                ("wifi_wep", 0, true),
+                ("network", 0, true),
+                ("password", 0, true),
+                ("lock_image", 0, true),
+                ("debug_off", 0, true),
+                ("debug_on", 0, true),
+            ]
+        );
+
+        let serialized = serde_json::to_value(&report).expect("serialize report");
+        assert_eq!(
+            serialized,
+            serde_json::json!({
+                "items": [
+                    { "key": "root", "level": 0 },
+                    { "key": "certificate", "level": 0 },
+                    { "key": "wifi", "level": 0 },
+                    { "key": "wifi_wep", "level": 0 },
+                    { "key": "network", "level": 0 },
+                    { "key": "password", "level": 0 },
+                    { "key": "lock_image", "level": 0 },
+                    { "key": "debug_off", "level": 0 },
+                    { "key": "debug_on", "level": 0 },
+                ]
+            })
+        );
     }
 }

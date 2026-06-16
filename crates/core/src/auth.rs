@@ -1,7 +1,8 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rustylink_api::{
-    ActivateInfo, ActivateResponse, LoginByPasswordResponse, OauthCallbackResponse,
-    SendLoginCodeResponse, VerifyLoginCodeResponse, VerifyMfaResponse,
+    ActivateInfo, ActivateResponse, DEFAULT_MATCH_BASE_URL, GetThirdPartyLoginLinksResponse,
+    LoginByPasswordResponse, OauthCallbackResponse, SendLoginCodeResponse,
+    ThirdPartyTokenCheckResponse, VerifyLoginCodeResponse, VerifyMfaResponse,
 };
 use sha2::{Digest as _, Sha256};
 use snafu::prelude::*;
@@ -38,7 +39,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub async fn activate(
     ctx: &mut AppContext, code: Option<String>, base_url: Option<String>,
-    backup_url: Option<String>,
+    backup_url: Option<String>, match_base_url: Option<String>,
 ) -> Result<Option<ActivateResponse>> {
     if let Some(value) = base_url {
         ctx.state.tenant.base_url = Some(value);
@@ -55,7 +56,9 @@ pub async fn activate(
     ctx.state.signing.enabled = true;
     ctx.state.signing.activation_code = Some(code.clone());
     ctx.state.signing.device_id = Some(ctx.state.identity.device_id.clone());
-    let client = ctx.api_client().context(ContextSnafu)?;
+    let client = ctx
+        .api_client_for_base_url(match_base_url.as_deref().unwrap_or(DEFAULT_MATCH_BASE_URL))
+        .context(ContextSnafu)?;
     let response = client.activate(code).await.context(ApiSnafu)?;
     ctx.sync_from_client(&client);
     if let Some(data) = &response.data {
@@ -126,8 +129,7 @@ pub fn start_oauth(
     redirect_uri: &str,
 ) -> Result<String> {
     let state_value = state.unwrap_or_else(|| Uuid::new_v4().simple().to_string());
-    let code_verifier = Uuid::new_v4().simple().to_string();
-    let code_challenge = code_challenge(&code_verifier);
+    let (code_verifier, code_challenge) = pkce_pair();
     let mut url = url::Url::parse(auth_url).context(InvalidUrlSnafu {
         value: auth_url.to_string(),
     })?;
@@ -141,6 +143,28 @@ pub fn start_oauth(
     ctx.state.oauth.code_verifier = Some(code_verifier);
     ctx.save().context(ContextSnafu)?;
     Ok(url.to_string())
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ThirdPartyLoginLinks {
+    pub code_challenge: String,
+    pub response: GetThirdPartyLoginLinksResponse,
+}
+
+pub async fn third_party_login_links(ctx: &mut AppContext) -> Result<ThirdPartyLoginLinks> {
+    let (code_verifier, code_challenge) = pkce_pair();
+    let client = ctx.api_client().context(ContextSnafu)?;
+    let response = client
+        .third_party_login_links(code_challenge.clone())
+        .await
+        .context(ApiSnafu)?;
+    ctx.sync_from_client(&client);
+    ctx.state.oauth.code_verifier = Some(code_verifier);
+    ctx.save().context(ContextSnafu)?;
+    Ok(ThirdPartyLoginLinks {
+        code_challenge,
+        response,
+    })
 }
 
 pub async fn oauth_callback(
@@ -169,9 +193,36 @@ pub async fn oauth_callback(
     Ok(response)
 }
 
+pub async fn oauth_query_callback(
+    ctx: &mut AppContext, alias: String, code: String, state: String,
+) -> Result<OauthCallbackResponse> {
+    let client = ctx.api_client().context(ContextSnafu)?;
+    let response = client
+        .oauth_query_callback(alias, code, state)
+        .await
+        .context(ApiSnafu)?;
+    ctx.sync_from_client(&client);
+    ctx.state.oauth = OAuthState::default();
+    ctx.save().context(ContextSnafu)?;
+    Ok(response)
+}
+
+pub async fn check_third_party_login_token(
+    ctx: &mut AppContext, token: String,
+) -> Result<ThirdPartyTokenCheckResponse> {
+    let client = ctx.api_client().context(ContextSnafu)?;
+    let response = client
+        .check_third_party_login_token(token)
+        .await
+        .context(ApiSnafu)?;
+    ctx.sync_from_client(&client);
+    ctx.save().context(ContextSnafu)?;
+    Ok(response)
+}
+
 fn merge_activation(ctx: &mut AppContext, data: &ActivateInfo) {
-    if let Some(host) = &data.activate_host {
-        ctx.state.tenant.base_url = Some(host.clone());
+    if let Some(host) = first_non_empty([data.activate_host.as_deref(), data.domain.as_deref()]) {
+        ctx.state.tenant.base_url = Some(host);
     }
     if let Some(host) = &data.activate_backup_domain {
         ctx.state.tenant.backup_url = Some(host.clone());
@@ -179,11 +230,31 @@ fn merge_activation(ctx: &mut AppContext, data: &ActivateInfo) {
     if let Some(enable) = data.activate_enable_backup_domain {
         ctx.state.tenant.use_backup = enable;
     }
-    if let Some(name) = &data.tenant_name {
-        ctx.state.tenant.name = Some(name.clone());
+    if let Some(name) = first_non_empty([
+        data.tenant_name.as_deref(),
+        data.name.as_deref(),
+        data.zh_name.as_deref(),
+        data.en_name.as_deref(),
+    ]) {
+        ctx.state.tenant.name = Some(name);
     }
+}
+
+fn pkce_pair() -> (String, String) {
+    let verifier = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    let challenge = code_challenge(&verifier);
+    (verifier, challenge)
 }
 
 fn code_challenge(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
+}
+
+fn first_non_empty<'a>(values: impl IntoIterator<Item = Option<&'a str>>) -> Option<String> {
+    values
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }

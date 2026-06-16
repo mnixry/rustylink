@@ -17,14 +17,17 @@ use crate::{
         ActivateRequest, ActivateResponse, GetLoginSettingResponse, GetTenantConfigResponse,
         GetThirdPartyLoginLinksResponse, GetUserInfoResponse, GetVpnExportsResponse,
         GetVpnLocationsResponse, GetVpnSettingResponse, LoginByPasswordResponse,
-        OauthCallbackResponse, PasswordLoginRequest, ReportSecurityResponse, ReportVpnResponse,
-        SecurityReportRequest, SendCodeRequest, SendLoginCodeResponse, VerifyCodeRequest,
+        OAuthCallbackRequest, OauthCallbackResponse, PasswordLoginRequest, ReportSecurityResponse,
+        ReportVpnResponse, SecurityReportRequest, SendCodeRequest, SendLoginCodeResponse,
+        ThirdPartyTokenCheckRequest, ThirdPartyTokenCheckResponse, VerifyCodeRequest,
         VerifyLoginCodeResponse, VerifyMfaRequest, VerifyMfaResponse, VpnConnEnvelope,
         VpnConnRequest, VpnDot, VpnPingResponse, VpnReportRequest,
     },
     identity::ClientIdentity,
     signing::{PasswordCipher, SigningContext},
 };
+
+pub const DEFAULT_MATCH_BASE_URL: &str = "https://corplink.volcengine.cn";
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
@@ -140,6 +143,7 @@ impl_api_envelope!(
     GetVpnSettingResponse,
     LoginByPasswordResponse,
     OauthCallbackResponse,
+    ThirdPartyTokenCheckResponse,
     GetThirdPartyLoginLinksResponse,
     ReportSecurityResponse,
     SendLoginCodeResponse,
@@ -290,11 +294,22 @@ impl ApiClient {
     pub async fn oauth_callback(
         &self, alias_key: String, code: String, state: String, code_verifier: String,
     ) -> Result<OauthCallbackResponse> {
-        let _ = code_verifier;
+        let body = OAuthCallbackRequest {
+            alias_key,
+            code,
+            code_verifier,
+            state,
+        };
+        send_checked!(self.generated.oauth_callback().body(body))
+    }
+
+    pub async fn oauth_query_callback(
+        &self, alias: String, code: String, state: String,
+    ) -> Result<OauthCallbackResponse> {
         send_checked!(
             self.generated
-                .oauth_callback()
-                .alias(alias_key)
+                .oauth_query_callback()
+                .alias(alias)
                 .code(code)
                 .state(state)
         )
@@ -307,6 +322,16 @@ impl ApiClient {
             self.generated
                 .get_third_party_login_links()
                 .code_challenge(code_challenge)
+        )
+    }
+
+    pub async fn check_third_party_login_token(
+        &self, token: String,
+    ) -> Result<ThirdPartyTokenCheckResponse> {
+        send_checked!(
+            self.generated
+                .check_third_party_login_token()
+                .body(ThirdPartyTokenCheckRequest { token })
         )
     }
 

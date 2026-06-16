@@ -10,17 +10,21 @@ pub mod codegen {
 
 pub type JsonObject = serde_json::Map<String, serde_json::Value>;
 
-pub use client::{ApiClient, ApiClientOptions, SessionCookies, VpnDotServers};
+pub use client::{
+    ApiClient, ApiClientOptions, DEFAULT_MATCH_BASE_URL, SessionCookies, VpnDotServers,
+};
 pub use codegen::types::{
     ActivateInfo, ActivateRequest, ActivateResponse, GetLoginSettingResponse,
-    GetTenantConfigResponse, GetUserInfoResponse, GetVpnExportsResponse, GetVpnLocationsResponse,
-    GetVpnSettingResponse, LoginByPasswordResponse, LoginResult, LoginSetting,
-    OAuthCallbackRequest, OauthCallbackResponse, PasswordLoginRequest, ReportSecurityResponse,
-    ReportVpnResponse, SecurityReportItem, SecurityReportRequest, SendCodeRequest,
-    SendLoginCodeResponse, SigningConfig as TenantSigningConfig, SigningRule, TenantConfig,
-    UserInfo, VerifyCodeRequest, VerifyLoginCodeResponse, VerifyMfaRequest, VerifyMfaResponse,
-    VpnConnEnvelope, VpnConnRequest, VpnConnResponse, VpnConnSetting, VpnDot, VpnExportInfo,
-    VpnExportListInfo, VpnLocation, VpnPingResponse, VpnReportRequest, VpnSetting,
+    GetTenantConfigResponse, GetThirdPartyLoginLinksResponse, GetUserInfoResponse,
+    GetVpnExportsResponse, GetVpnLocationsResponse, GetVpnSettingResponse, LoginByPasswordResponse,
+    LoginResult, LoginSetting, OAuthCallbackRequest, OauthCallbackResponse, PasswordLoginRequest,
+    ReportSecurityResponse, ReportVpnResponse, SecurityReportItem, SecurityReportRequest,
+    SendCodeRequest, SendLoginCodeResponse, SigningConfig as TenantSigningConfig, SigningRule,
+    TenantConfig, ThirdPartyLoginInfo, ThirdPartyTokenCheckRequest, ThirdPartyTokenCheckResponse,
+    ThirdPartyTokenCheckResult, UserInfo, VerifyCodeRequest, VerifyLoginCodeResponse,
+    VerifyMfaRequest, VerifyMfaResponse, VpnConnEnvelope, VpnConnRequest, VpnConnResponse,
+    VpnConnSetting, VpnDot, VpnExportInfo, VpnExportListInfo, VpnLocation, VpnPingResponse,
+    VpnReportRequest, VpnSetting,
 };
 pub use error::{Error, Result};
 pub use identity::ClientIdentity;

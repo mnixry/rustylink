@@ -103,9 +103,41 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/GetThirdPartyLoginLinksResponse"
+  /api/tpslogin/token/check:
+    post:
+      operationId: checkThirdPartyLoginToken
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ThirdPartyTokenCheckRequest"
+      responses:
+        "200":
+          description: The request has succeeded.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ThirdPartyTokenCheckResponse"
+  /api/tpslogin/callback:
+    post:
+      operationId: oauthCallback
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OAuthCallbackRequest"
+      responses:
+        "200":
+          description: The request has succeeded.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OauthCallbackResponse"
   /api/tpslogin/callback/{alias}:
     get:
-      operationId: oauthCallback
+      operationId: oauthQueryCallback
       parameters:
         - name: alias
           in: path
@@ -261,6 +293,14 @@ components:
         activate_backup_domain: { type: string }
         activate_enable_backup_domain: { type: boolean }
         tenant_name: { type: string }
+        name: { type: string }
+        zh_name: { type: string }
+        en_name: { type: string }
+        domain: { type: string }
+        enable_self_signed: { type: boolean }
+        self_signed_cert: { type: string }
+        enable_public_key: { type: boolean }
+        public_key: { type: string }
         raw: *json_object
     PasswordLoginRequest:
       type: object
@@ -304,6 +344,11 @@ components:
         code: { type: string }
         state: { type: string }
         code_verifier: { type: string }
+    ThirdPartyTokenCheckRequest:
+      type: object
+      required: [token]
+      properties:
+        token: { type: string }
     LoginResult:
       type: object
       properties:
@@ -324,6 +369,31 @@ components:
         name: { type: string }
         link: { type: string }
         url: { type: string }
+        login_url: { type: string }
+        token: { type: string }
+        state: { type: string }
+        schema: { type: string }
+        appid: { type: string }
+        agentid: { type: string }
+        scope: { type: string }
+        notice: { type: string }
+        is_custom: { type: boolean }
+        full_title: { type: string }
+        icon: { type: string }
+        abbreviation: { type: string }
+        raw: *json_object
+    ThirdPartyTokenCheckResult:
+      type: object
+      properties:
+        url: { type: string }
+        token: { type: string }
+        vpn_token:
+          type: string
+        csrf-token:
+          type: string
+        uid: { type: string }
+        need_mfa: { type: boolean }
+        mfa_token: { type: string }
         raw: *json_object
     LoginSetting:
       type: object
@@ -533,17 +603,16 @@ components:
         ip_nats: { type: string }
     SecurityReportItem:
       type: object
-      required: [name, level, passed]
+      required: [key, level]
       properties:
-        name: { type: string }
+        key: { type: string }
         level:
           type: integer
           format: int32
-        passed: { type: boolean }
-        message: { type: string }
+        data: *json_object
     SecurityReportRequest:
       type: object
-      required: [status, items]
+      required: [items]
       properties:
         status: { type: string }
         items:
@@ -592,6 +661,13 @@ components:
           properties:
             data:
               $ref: "#/components/schemas/LoginResult"
+    ThirdPartyTokenCheckResponse:
+      allOf:
+        - $ref: "#/components/schemas/ResponseBase"
+        - type: object
+          properties:
+            data:
+              $ref: "#/components/schemas/ThirdPartyTokenCheckResult"
     GetThirdPartyLoginLinksResponse:
       allOf:
         - $ref: "#/components/schemas/ResponseBase"

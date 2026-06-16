@@ -109,6 +109,8 @@ struct ActivateArgs {
     base_url: Option<String>,
     #[arg(long)]
     backup_url: Option<String>,
+    #[arg(long, env = "RUSTYLINK_MATCH_BASE_URL")]
+    match_base_url: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -125,6 +127,9 @@ enum LoginSubcommand {
     MfaVerify(MfaVerifyArgs),
     OauthStart(OAuthStartArgs),
     OauthCallback(OAuthCallbackArgs),
+    OauthQueryCallback(OAuthQueryCallbackArgs),
+    QrStart(QrStartArgs),
+    QrCheck(QrCheckArgs),
 }
 
 #[derive(Debug, Args)]
@@ -199,6 +204,25 @@ struct OAuthCallbackArgs {
     code: String,
     #[arg(long)]
     state: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct OAuthQueryCallbackArgs {
+    #[arg(long)]
+    alias: String,
+    #[arg(long)]
+    code: String,
+    #[arg(long)]
+    state: String,
+}
+
+#[derive(Debug, Args)]
+struct QrStartArgs {}
+
+#[derive(Debug, Args)]
+struct QrCheckArgs {
+    #[arg(long)]
+    token: String,
 }
 
 #[derive(Debug, Args)]
@@ -294,9 +318,15 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Activate(args) => {
-            let response = auth::activate(&mut ctx, args.code, args.base_url, args.backup_url)
-                .await
-                .context(cli_error::AuthSnafu)?;
+            let response = auth::activate(
+                &mut ctx,
+                args.code,
+                args.base_url,
+                args.backup_url,
+                args.match_base_url,
+            )
+            .await
+            .context(cli_error::AuthSnafu)?;
             print_json(&json!({ "state": &ctx.state, "response": response }))?;
         }
         Command::Login(command) => handle_login(&mut ctx, command.command).await?,
@@ -375,6 +405,24 @@ async fn handle_login(ctx: &mut AppContext, command: LoginSubcommand) -> Result<
         }
         LoginSubcommand::OauthCallback(args) => {
             let response = auth::oauth_callback(ctx, args.alias_key, args.code, args.state)
+                .await
+                .context(cli_error::AuthSnafu)?;
+            print_json(&response)?;
+        }
+        LoginSubcommand::OauthQueryCallback(args) => {
+            let response = auth::oauth_query_callback(ctx, args.alias, args.code, args.state)
+                .await
+                .context(cli_error::AuthSnafu)?;
+            print_json(&response)?;
+        }
+        LoginSubcommand::QrStart(_args) => {
+            let response = auth::third_party_login_links(ctx)
+                .await
+                .context(cli_error::AuthSnafu)?;
+            print_json(&response)?;
+        }
+        LoginSubcommand::QrCheck(args) => {
+            let response = auth::check_third_party_login_token(ctx, args.token)
                 .await
                 .context(cli_error::AuthSnafu)?;
             print_json(&response)?;
