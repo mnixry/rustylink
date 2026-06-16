@@ -1,19 +1,26 @@
+#![allow(clippy::module_name_repetitions)]
+
+include!(concat!(env!("OUT_DIR"), "/openapi_modules.rs"));
+
+pub mod api;
 pub mod client;
 pub mod error;
 pub mod identity;
 pub mod signing;
 
-#[allow(clippy::all, clippy::cargo, clippy::nursery, clippy::pedantic)]
 pub mod codegen {
-    include!(concat!(env!("OUT_DIR"), "/progenitor.rs"));
+    pub use crate::{apis, models};
 }
 
-pub type JsonObject = serde_json::Map<String, serde_json::Value>;
+pub type JsonObject = std::collections::HashMap<String, serde_json::Value>;
+pub type VpnExportInfo = JsonObject;
 
 pub use client::{
-    ApiClient, ApiClientOptions, DEFAULT_MATCH_BASE_URL, SessionCookies, VpnDotServers,
+    ApiClient, ApiClientOptions, DEFAULT_MATCH_BASE_URL, RawApiError, SessionCookies, VpnDotServers,
 };
-pub use codegen::types::{
+pub use error::{Error, Result};
+pub use identity::ClientIdentity;
+pub use models::{
     ActivateInfo, ActivateRequest, ActivateResponse, GetLoginSettingResponse,
     GetTenantConfigResponse, GetThirdPartyLoginLinksResponse, GetUserInfoResponse,
     GetVpnExportsResponse, GetVpnLocationsResponse, GetVpnSettingResponse, LoginByPasswordResponse,
@@ -23,9 +30,7 @@ pub use codegen::types::{
     TenantConfig, ThirdPartyLoginInfo, ThirdPartyTokenCheckRequest, ThirdPartyTokenCheckResponse,
     ThirdPartyTokenCheckResult, UserInfo, VerifyCodeRequest, VerifyLoginCodeResponse,
     VerifyMfaRequest, VerifyMfaResponse, VpnConnEnvelope, VpnConnRequest, VpnConnResponse,
-    VpnConnSetting, VpnDot, VpnExportInfo, VpnExportListInfo, VpnLocation, VpnPingResponse,
-    VpnReportRequest, VpnSetting,
+    VpnConnSetting, VpnDot, VpnExportListInfo, VpnLocation, VpnPingResponse, VpnReportRequest,
+    VpnSetting,
 };
-pub use error::{Error, Result};
-pub use identity::ClientIdentity;
 pub use signing::{PasswordCipher, SigningConfig, SigningContext, SigningRuleConfig};

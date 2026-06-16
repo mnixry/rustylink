@@ -70,25 +70,25 @@ impl RoutePlan {
         let mut rules = Vec::new();
         add_rules(
             &mut rules,
-            &conn.setting.vpn_route_full,
+            conn.setting.vpn_route_full.as_deref().unwrap_or_default(),
             AddressFamily::V4,
             RouteMode::Full,
         );
         add_rules(
             &mut rules,
-            &conn.setting.vpn_route_split,
+            conn.setting.vpn_route_split.as_deref().unwrap_or_default(),
             AddressFamily::V4,
             RouteMode::Split,
         );
         add_rules(
             &mut rules,
-            &conn.setting.v6_route_full,
+            conn.setting.v6_route_full.as_deref().unwrap_or_default(),
             AddressFamily::V6,
             RouteMode::Full,
         );
         add_rules(
             &mut rules,
-            &conn.setting.v6_route_split,
+            conn.setting.v6_route_split.as_deref().unwrap_or_default(),
             AddressFamily::V6,
             RouteMode::Split,
         );

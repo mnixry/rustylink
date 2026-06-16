@@ -114,7 +114,12 @@ impl DnsHijackPlan {
         let dynamic_domain = clean_string(conn.setting.dynamic_domain.clone());
 
         let mut domains = BTreeSet::new();
-        for domain in &conn.setting.vpn_dns_domain_split {
+        for domain in conn
+            .setting
+            .vpn_dns_domain_split
+            .as_deref()
+            .unwrap_or_default()
+        {
             add_domain_pattern(&mut domains, domain);
         }
         for raw in [

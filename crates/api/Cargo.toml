@@ -9,31 +9,25 @@ path = "src/lib.rs"
 
 [dependencies]
 aes.workspace               = true
+async-trait.workspace       = true
 base64.workspace            = true
 bitflags.workspace          = true
 cbc.workspace               = true
 hex.workspace               = true
 hmac.workspace              = true
+http.workspace              = true
 jiff.workspace              = true
 machine-uid.workspace       = true
-progenitor-client.workspace = true
 prost.workspace             = true
-reqwest.workspace           = true
-serde.workspace             = true
-serde_json.workspace        = true
-sha1.workspace              = true
-sha2.workspace              = true
-snafu.workspace             = true
-tracing.workspace           = true
-url.workspace               = true
-
-[build-dependencies]
-openapiv3.workspace    = true
-prettyplease.workspace = true
-progenitor.workspace   = true
-serde-saphyr.workspace = true
-snafu.workspace        = true
-syn.workspace          = true
+reqwest.workspace            = true
+reqwest-middleware.workspace = true
+serde.workspace              = true
+serde_json.workspace         = true
+sha1.workspace               = true
+sha2.workspace               = true
+snafu.workspace              = true
+tracing.workspace            = true
+url.workspace                = true
 
 [lints]
 workspace = true

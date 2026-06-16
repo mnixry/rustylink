@@ -1,6 +1,4 @@
-use rustylink_api::{
-    JsonObject, ReportSecurityResponse, SecurityReportItem, SecurityReportRequest,
-};
+use rustylink_api::{ReportSecurityResponse, SecurityReportItem, SecurityReportRequest, api};
 use snafu::prelude::*;
 
 use crate::AppContext;
@@ -27,7 +25,9 @@ pub async fn report_security(
     ctx: &mut AppContext, report: &SecurityReportRequest,
 ) -> Result<ReportSecurityResponse> {
     let client = ctx.api_client().context(ContextSnafu)?;
-    let response = client.report_security(report).await.context(ApiSnafu)?;
+    let response = api::report_security(&client, report)
+        .await
+        .context(ApiSnafu)?;
     ctx.sync_from_client(&client);
     ctx.save().context(ContextSnafu)?;
     Ok(response)
@@ -48,7 +48,7 @@ pub fn all_green_security_report() -> SecurityReportRequest {
     ]
     .into_iter()
     .map(|key| SecurityReportItem {
-        data: JsonObject::new(),
+        data: None,
         key: key.to_string(),
         level: 0,
     })
@@ -56,7 +56,7 @@ pub fn all_green_security_report() -> SecurityReportRequest {
 
     SecurityReportRequest {
         items,
-        raw: JsonObject::new(),
+        raw: None,
         status: None,
     }
 }
@@ -71,11 +71,11 @@ mod tests {
         let items = report
             .items
             .iter()
-            .map(|item| (item.key.as_str(), item.level, item.data.is_empty()))
+            .map(|item| (item.key.as_str(), item.level, item.data.is_none()))
             .collect::<Vec<_>>();
 
         assert_eq!(report.status, None);
-        assert!(report.raw.is_empty());
+        assert_eq!(report.raw, None);
         assert_eq!(
             items,
             [

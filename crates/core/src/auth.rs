@@ -2,7 +2,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rustylink_api::{
     ActivateInfo, ActivateResponse, DEFAULT_MATCH_BASE_URL, GetThirdPartyLoginLinksResponse,
     LoginByPasswordResponse, OauthCallbackResponse, SendLoginCodeResponse,
-    ThirdPartyTokenCheckResponse, VerifyLoginCodeResponse, VerifyMfaResponse,
+    ThirdPartyTokenCheckResponse, VerifyLoginCodeResponse, VerifyMfaResponse, api,
 };
 use sha2::{Digest as _, Sha256};
 use snafu::prelude::*;
@@ -59,7 +59,7 @@ pub async fn activate(
     let client = ctx
         .api_client_for_base_url(match_base_url.as_deref().unwrap_or(DEFAULT_MATCH_BASE_URL))
         .context(ContextSnafu)?;
-    let response = client.activate(code).await.context(ApiSnafu)?;
+    let response = api::activate(&client, code).await.context(ApiSnafu)?;
     ctx.sync_from_client(&client);
     if let Some(data) = &response.data {
         merge_activation(ctx, data);
@@ -73,8 +73,7 @@ pub async fn login_password(
     password: String,
 ) -> Result<LoginByPasswordResponse> {
     let client = ctx.api_client().context(ContextSnafu)?;
-    let response = client
-        .login_password(login_scene, account_type, account, password)
+    let response = api::login_password(&client, login_scene, account_type, account, password)
         .await
         .context(ApiSnafu)?;
     ctx.sync_from_client(&client);
@@ -87,8 +86,7 @@ pub async fn send_code(
     account: String,
 ) -> Result<SendLoginCodeResponse> {
     let client = ctx.api_client().context(ContextSnafu)?;
-    let response = client
-        .send_login_code(login_scene, account_type, login_type, account)
+    let response = api::send_login_code(&client, login_scene, account_type, login_type, account)
         .await
         .context(ApiSnafu)?;
     ctx.sync_from_client(&client);
@@ -101,10 +99,16 @@ pub async fn verify_code(
     account: String, code: String,
 ) -> Result<VerifyLoginCodeResponse> {
     let client = ctx.api_client().context(ContextSnafu)?;
-    let response = client
-        .verify_login_code(login_scene, account_type, login_type, account, code)
-        .await
-        .context(ApiSnafu)?;
+    let response = api::verify_login_code(
+        &client,
+        login_scene,
+        account_type,
+        login_type,
+        account,
+        code,
+    )
+    .await
+    .context(ApiSnafu)?;
     ctx.sync_from_client(&client);
     ctx.save().context(ContextSnafu)?;
     Ok(response)
@@ -115,8 +119,7 @@ pub async fn verify_mfa(
     code: Option<String>, password: Option<String>,
 ) -> Result<VerifyMfaResponse> {
     let client = ctx.api_client().context(ContextSnafu)?;
-    let response = client
-        .verify_mfa(login_scene, mfa_type, account, code, password)
+    let response = api::verify_mfa(&client, login_scene, mfa_type, account, code, password)
         .await
         .context(ApiSnafu)?;
     ctx.sync_from_client(&client);
@@ -154,8 +157,7 @@ pub struct ThirdPartyLoginLinks {
 pub async fn third_party_login_links(ctx: &mut AppContext) -> Result<ThirdPartyLoginLinks> {
     let (code_verifier, code_challenge) = pkce_pair();
     let client = ctx.api_client().context(ContextSnafu)?;
-    let response = client
-        .third_party_login_links(code_challenge.clone())
+    let response = api::third_party_login_links(&client, code_challenge.clone())
         .await
         .context(ApiSnafu)?;
     ctx.sync_from_client(&client);
@@ -183,8 +185,7 @@ pub async fn oauth_callback(
         .clone()
         .context(MissingOAuthVerifierSnafu)?;
     let client = ctx.api_client().context(ContextSnafu)?;
-    let response = client
-        .oauth_callback(alias_key, code, state, verifier)
+    let response = api::oauth_callback(&client, alias_key, code, state, verifier)
         .await
         .context(ApiSnafu)?;
     ctx.sync_from_client(&client);
@@ -197,8 +198,7 @@ pub async fn oauth_query_callback(
     ctx: &mut AppContext, alias: String, code: String, state: String,
 ) -> Result<OauthCallbackResponse> {
     let client = ctx.api_client().context(ContextSnafu)?;
-    let response = client
-        .oauth_query_callback(alias, code, state)
+    let response = api::oauth_query_callback(&client, alias, code, state)
         .await
         .context(ApiSnafu)?;
     ctx.sync_from_client(&client);
@@ -211,8 +211,7 @@ pub async fn check_third_party_login_token(
     ctx: &mut AppContext, token: String,
 ) -> Result<ThirdPartyTokenCheckResponse> {
     let client = ctx.api_client().context(ContextSnafu)?;
-    let response = client
-        .check_third_party_login_token(token)
+    let response = api::check_third_party_login_token(&client, token)
         .await
         .context(ApiSnafu)?;
     ctx.sync_from_client(&client);

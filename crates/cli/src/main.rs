@@ -624,7 +624,7 @@ fn vpn_report_request(
         ip: ip.to_string(),
         mode: mode.android_name(),
         public_key: public_key.to_string(),
-        type_: report_type.to_string(),
+        r#type: report_type.to_string(),
     }
 }
 

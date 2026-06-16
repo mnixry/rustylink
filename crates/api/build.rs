@@ -1,59 +1,73 @@
 use std::{
     env, fs,
     path::{Path, PathBuf},
+    process::Command,
 };
 
-use progenitor::{GenerationSettings, Generator, InterfaceStyle, TagStyle};
-use snafu::prelude::*;
+type Error = Box<dyn std::error::Error>;
+type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Debug, Snafu)]
-#[snafu(whatever, display("Error was: {message}"))]
-struct Error {
-    message: String,
-    #[snafu(source(from(Box<dyn std::error::Error>, Some)))]
-    source: Option<Box<dyn std::error::Error>>,
+fn main() -> Result<()> {
+    let spec_path = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/spec/openapi.yaml"));
+    println!("cargo:rerun-if-changed={}", spec_path.display());
+    println!("cargo:rerun-if-env-changed=OPENAPI_GENERATOR_CLI");
+
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").ok_or("OUT_DIR missing")?);
+    let generated_dir = out_dir.join("openapi");
+    if generated_dir.exists() {
+        fs::remove_dir_all(&generated_dir)?;
+    }
+
+    let generator =
+        env::var("OPENAPI_GENERATOR_CLI").unwrap_or_else(|_| "openapi-generator-cli".to_string());
+    let status = Command::new(&generator)
+        .args([
+            "generate",
+            "-g",
+            "rust",
+            "-i",
+            spec_path.to_str().ok_or("spec path is not valid UTF-8")?,
+            "-o",
+            generated_dir
+                .to_str()
+                .ok_or("generated output path is not valid UTF-8")?,
+            "--additional-properties=packageName=rustylink_api_codegen,packageVersion=0.1.0,library=reqwest,supportAsync=true,supportMiddleware=true,avoidBoxedModels=true",
+        ])
+        .status()
+        .map_err(|source| {
+            format!(
+                "failed to execute `{generator}`; install openapi-generator-cli or set OPENAPI_GENERATOR_CLI: {source}"
+            )
+        })?;
+
+    if !status.success() {
+        return Err(format!("openapi-generator-cli exited with status {status}").into());
+    }
+
+    write_module_include(&out_dir, &generated_dir)?;
+    Ok(())
 }
 
-fn main() -> Result<(), Error> {
-    let root_path = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/spec/openapi.yaml"));
-    println!("cargo:rerun-if-changed={}", root_path.display());
+fn write_module_include(out_dir: &Path, generated_dir: &Path) -> Result<()> {
+    let apis_mod = generated_dir.join("src/apis/mod.rs");
+    let models_mod = generated_dir.join("src/models/mod.rs");
+    let content = format!(
+        r#"
+#[allow(clippy::all, clippy::cargo, clippy::nursery, clippy::pedantic, warnings)]
+#[path = "{apis_mod}"]
+pub mod apis;
 
-    let out_dir = PathBuf::from(env::var_os("OUT_DIR").whatever_context("OUT_DIR missing")?);
-    let generated_path = out_dir.join("progenitor.rs");
-
-    let spec: openapiv3::OpenAPI =
-        serde_saphyr::from_reader(fs::File::open(root_path).whatever_context("open spec file")?)
-            .whatever_context("parse spec file")?;
-
-    let mut settings = GenerationSettings::default();
-    settings
-        .with_interface(InterfaceStyle::Builder)
-        .with_tag(TagStyle::Merged)
-        .with_inner_type(
-            "crate::client::ApiHooks"
-                .parse()
-                .whatever_context("hook type tokens")?,
-        )
-        .with_pre_hook_async(
-            "crate::client::prepare_generated_request"
-                .parse()
-                .whatever_context("pre-hook tokens")?,
-        )
-        .with_post_hook_async(
-            "crate::client::store_generated_response_cookies"
-                .parse()
-                .whatever_context("post-hook tokens")?,
-        )
-        .with_derive("Clone")
-        .with_derive("Debug")
-        .with_derive("PartialEq");
-
-    let mut generator = Generator::new(&settings);
-    let tokens = generator
-        .generate_tokens(&spec)
-        .whatever_context("generate Progenitor client")?;
-    let syntax = syn::parse2(tokens).whatever_context("parse generated Rust tokens")?;
-    let content = prettyplease::unparse(&syntax);
-    fs::write(generated_path, content).whatever_context("write generated Progenitor client")?;
+#[allow(clippy::all, clippy::cargo, clippy::nursery, clippy::pedantic, warnings)]
+#[path = "{models_mod}"]
+pub mod models;
+"#,
+        apis_mod = rust_path_literal(&apis_mod),
+        models_mod = rust_path_literal(&models_mod),
+    );
+    fs::write(out_dir.join("openapi_modules.rs"), content)?;
     Ok(())
+}
+
+fn rust_path_literal(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "\\\\")
 }
