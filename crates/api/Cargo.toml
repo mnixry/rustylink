@@ -7,25 +7,25 @@ version.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
-aes.workspace               = true
-async-trait.workspace       = true
-base64.workspace            = true
-bitflags.workspace          = true
-cbc.workspace               = true
-hex.workspace               = true
-hmac.workspace              = true
-http.workspace              = true
-jiff.workspace              = true
-machine-uid.workspace       = true
-prost.workspace             = true
-reqwest.workspace            = true
-serde.workspace              = true
-serde_json.workspace         = true
-sha1.workspace               = true
-sha2.workspace               = true
-snafu.workspace              = true
-tracing.workspace            = true
-url.workspace                = true
+aes.workspace         = true
+async-trait.workspace = true
+base64.workspace      = true
+bitflags.workspace    = true
+cbc.workspace         = true
+hex.workspace         = true
+hmac.workspace        = true
+http.workspace        = true
+jiff.workspace        = true
+machine-uid.workspace = true
+prost.workspace       = true
+reqwest.workspace     = true
+serde.workspace       = true
+serde_json.workspace  = true
+sha1.workspace        = true
+sha2.workspace        = true
+snafu.workspace       = true
+tracing.workspace     = true
+url.workspace         = true
 
 [lints]
 workspace = true
