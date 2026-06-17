@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use qrcode::{QrCode, render::unicode::Dense1x2};
-use rustylink_api::{BaseResponse, ThirdPartyLoginInfo, ThirdPartyTokenCheckResult};
+use rustylink_api::{BaseResponse, LoginResult, ThirdPartyLoginInfo};
 use rustylink_core::{AppContext, auth};
 use snafu::{OptionExt as _, ResultExt as _, ensure};
 
@@ -316,7 +316,7 @@ async fn submit_oauth_callback(
 
 async fn poll_third_party_login_token(
     ctx: &mut AppContext, token: &str, interval: Duration, timeout: Duration,
-) -> Result<BaseResponse<ThirdPartyTokenCheckResult>> {
+) -> Result<BaseResponse<LoginResult>> {
     let started = Instant::now();
     let timeout_seconds = timeout.as_secs();
 

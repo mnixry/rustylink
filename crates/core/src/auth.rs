@@ -1,9 +1,9 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rustylink_api::{
-    ActivateInfo, ActivateRequest, BaseResponse, GetThirdPartyLoginLinksRequest, LoginResult,
-    OAuthCallbackRequest, OAuthQueryCallbackRequest, PasswordLoginRequest, SendCodeRequest,
-    SendableRequest, ThirdPartyLoginInfo, ThirdPartyTokenCheckRequest, ThirdPartyTokenCheckResult,
-    VerifyCodeRequest, VerifyMfaRequest,
+    ActivateInfo, ActivateRequest, BaseResponse, CommonStringResult,
+    GetThirdPartyLoginLinksRequest, LoginResult, LoginV2Result, OAuthCallbackRequest,
+    OAuthQueryCallbackRequest, PasswordLoginRequest, SendCodeRequest, SendableRequest,
+    ThirdPartyLoginInfo, ThirdPartyTokenCheckRequest, VerifyCodeRequest, VerifyMfaRequest,
 };
 use sha2::{Digest as _, Sha256};
 use snafu::prelude::*;
@@ -78,7 +78,7 @@ pub async fn activate(
 pub async fn login_password(
     ctx: &mut AppContext, login_scene: String, account_type: String, account: String,
     password: String,
-) -> Result<BaseResponse<LoginResult>> {
+) -> Result<BaseResponse<LoginV2Result>> {
     let client = ctx.api_client().context(ContextSnafu)?;
     let response = PasswordLoginRequest::encrypted(login_scene, account_type, account, &password)
         .context(ApiSnafu)?
@@ -93,7 +93,7 @@ pub async fn login_password(
 pub async fn send_code(
     ctx: &mut AppContext, login_scene: String, account_type: String, login_type: String,
     account: String,
-) -> Result<BaseResponse<String>> {
+) -> Result<BaseResponse<CommonStringResult>> {
     let client = ctx.api_client().context(ContextSnafu)?;
     let response = SendCodeRequest {
         login_scene,
@@ -112,7 +112,7 @@ pub async fn send_code(
 pub async fn verify_code(
     ctx: &mut AppContext, login_scene: String, account_type: String, login_type: String,
     account: String, code: String,
-) -> Result<BaseResponse<LoginResult>> {
+) -> Result<BaseResponse<LoginV2Result>> {
     let client = ctx.api_client().context(ContextSnafu)?;
     let response = VerifyCodeRequest {
         login_scene,
@@ -132,7 +132,7 @@ pub async fn verify_code(
 pub async fn verify_mfa(
     ctx: &mut AppContext, login_scene: String, mfa_type: String, account: String,
     code: Option<String>, password: Option<String>,
-) -> Result<BaseResponse<LoginResult>> {
+) -> Result<BaseResponse<LoginV2Result>> {
     let client = ctx.api_client().context(ContextSnafu)?;
     let response = VerifyMfaRequest::encrypted(login_scene, mfa_type, account, code, password)
         .context(ApiSnafu)?
@@ -236,7 +236,7 @@ pub async fn oauth_query_callback(
 
 pub async fn check_third_party_login_token(
     ctx: &mut AppContext, token: String,
-) -> Result<BaseResponse<ThirdPartyTokenCheckResult>> {
+) -> Result<BaseResponse<LoginResult>> {
     let client = ctx.api_client().context(ContextSnafu)?;
     let response = ThirdPartyTokenCheckRequest { token }
         .send(&client)
