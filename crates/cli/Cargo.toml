@@ -13,6 +13,7 @@ rustylink-core.path   = "../core"
 rustylink-tunnel.path = "../tunnel"
 
 clap.workspace               = true
+qrcode.workspace             = true
 serde.workspace              = true
 serde_json.workspace         = true
 snafu.workspace              = true
@@ -20,6 +21,7 @@ strum.workspace              = true
 tokio.workspace              = true
 tracing.workspace            = true
 tracing-subscriber.workspace = true
+url.workspace                = true
 
 [lints]
 workspace = true

@@ -24,6 +24,7 @@ ipnetwork          = "0.21.1"
 jiff               = "0.2.28"
 machine-uid        = "0.6.0"
 prost              = "0.14.4"
+qrcode             = { version = "0.14.1", default-features = false }
 rand               = "0.10.1"
 reqwest            = { version = "0.13.4", features = ["cookies", "json", "rustls"] }
 route_manager      = { version = "0.2.11", features = ["async"] }
