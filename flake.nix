@@ -46,7 +46,7 @@
           craneCommonArgs = rec {
             src = ./.;
             inherit (craneLib.crateNameFromCargoToml { inherit src; }) version;
-            nativeBuildInputs = [ pkgs.openapi-generator-cli ];
+            nativeBuildInputs = [ ];
             strictDeps = true;
             cargoVendorDir = craneLib.vendorMultipleCargoDeps {
               inherit (craneLib.findCargoFiles src) cargoConfigs;
@@ -84,7 +84,6 @@
               [
                 cargo-edit
                 cargo-nextest
-                openapi-generator-cli
               ]
               ++ lib.optionals stdenv.isLinux [
                 llvmPackages.bolt

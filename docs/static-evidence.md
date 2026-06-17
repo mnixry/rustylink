@@ -181,8 +181,8 @@ Evidenced Android behavior:
 
 Rust implementation boundary:
 
-- `crates/api/src/client.rs` injects the common query and signing headers in Progenitor pre-hooks, rather than declaring always-sent query parameters on every OpenAPI operation.
-- `crates/core/src/vpn.rs` selects dots and requests `/vpn/conn` through generated Progenitor operations using a per-dot generated client base URL.
+- `crates/api/src/client.rs` injects the common query and signing headers while sending hand-written endpoint request structs, rather than declaring always-sent query parameters on every operation.
+- `crates/core/src/vpn.rs` selects dots and requests `/vpn/conn` by sending the hand-written VPN request model with a per-dot client base URL override.
 - `crates/tunnel/src/session.rs` uses `gotatun::device::DeviceBuilder`, `Peer`, and a `DnsHijackTun` wrapper to start a real WireGuard device.
 - `protocol_mode=1` uses `crates/tunnel/src/transport.rs` FeiLian TCP framing over gotatun's custom UDP transport hook. `protocol_mode=0` and `protocol_mode=2` start UDP first, matching Android's UDP-capable condition.
 - `protocol_version == "v2"` maps gotatun's `ProtocolIdentifier` to the recovered FeiLian CorpLink identifier; other protocol versions use standard WireGuard and log the evidence boundary.

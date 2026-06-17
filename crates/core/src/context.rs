@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
-use rustylink_api::{ApiClient, ApiClientOptions, SigningContext};
+use rustylink_api::{
+    ApiClient, ApiClientOptions, ApiEndpoint, MatchEndpoint, SigningContext, TenantEndpoint,
+};
 use snafu::prelude::*;
 
 use crate::state::RustylinkState;
@@ -52,23 +54,34 @@ impl AppContext {
     }
 
     pub fn api_client(&self) -> Result<ApiClient> {
+        let endpoint = self.tenant_endpoint()?;
+        self.api_client_for_endpoint(&endpoint)
+    }
+
+    pub fn tenant_endpoint(&self) -> Result<TenantEndpoint> {
         let base_url = self
             .state
             .selected_base_url()
-            .context(MissingBaseUrlSnafu)?
-            .to_string();
-        self.api_client_for_base_url(base_url)
+            .context(MissingBaseUrlSnafu)?;
+        TenantEndpoint::new(base_url).context(ApiSnafu)
     }
 
-    pub fn api_client_for_base_url(&self, base_url: impl AsRef<str>) -> Result<ApiClient> {
-        let client = ApiClient::new_with_options(
-            base_url.as_ref(),
-            self.state.identity.clone(),
-            SigningContext::new(self.state.signing.clone()),
-            self.state.cookies.clone(),
-            &self.api_options,
+    pub fn match_endpoint(&self, base_url: Option<&str>) -> Result<MatchEndpoint> {
+        base_url.map_or_else(
+            || Ok(MatchEndpoint::default()),
+            |base_url| MatchEndpoint::new(base_url).context(ApiSnafu),
         )
-        .context(ApiSnafu)?;
+    }
+
+    pub fn api_client_for_endpoint<E: ApiEndpoint>(&self, endpoint: &E) -> Result<ApiClient> {
+        let client = endpoint
+            .client_with_options(
+                self.state.identity.clone(),
+                SigningContext::new(self.state.signing.clone()),
+                self.state.cookies.clone(),
+                &self.api_options,
+            )
+            .context(ApiSnafu)?;
         client.set_csrf_token(self.state.csrf_token.clone());
         client.set_knock_token(self.state.knock_token.clone());
         Ok(client)

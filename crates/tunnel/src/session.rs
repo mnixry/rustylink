@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use strum::{Display, EnumIter, FromRepr};
 use tokio::net::lookup_host;
+use url::{Host, Url};
 
 use crate::{
     BoundUdpSocketFactory, DnsHijackPlan, DnsHijackTun, DnsProxyRuntime,
@@ -94,7 +95,7 @@ pub struct TunnelConfig {
     pub local_port: u16,
     pub server_public_key: String,
     pub server_preshared_key: Option<String>,
-    pub endpoint: String,
+    pub endpoint: Url,
     pub protocol_mode: Option<i32>,
     pub protocol_version: Option<String>,
     pub protocol_detect_enable: bool,
@@ -163,7 +164,7 @@ impl LocalTunnelParams {
 
 impl TunnelConfig {
     pub fn from_vpn_conn(
-        conn: &VpnConnResponse, local_params: LocalTunnelParams, endpoint: String,
+        conn: &VpnConnResponse, local_params: LocalTunnelParams, endpoint: Url,
         protocol_mode: Option<i32>, protocol_detect_enable: bool,
     ) -> Result<Self> {
         if conn.setting.vpn_mtu <= 0 {
@@ -430,10 +431,36 @@ fn feilian_protocol_identifier(config: &TunnelConfig) -> Option<ProtocolIdentifi
     }
 }
 
-async fn resolve_endpoint(endpoint: &str) -> Result<std::net::SocketAddr> {
-    let mut addrs = lookup_host(endpoint).await.context(ResolveEndpointSnafu {
-        endpoint: endpoint.to_string(),
+async fn resolve_endpoint(endpoint: &Url) -> Result<std::net::SocketAddr> {
+    let host = endpoint.host().context(InvalidConfigSnafu {
+        reason: "WireGuard endpoint URL must include a host".to_string(),
     })?;
+    let port = endpoint
+        .port_or_known_default()
+        .context(InvalidConfigSnafu {
+            reason: "WireGuard endpoint URL must include a port".to_string(),
+        })?;
+    let addrs = match host {
+        Host::Domain(domain) => lookup_host((domain, port))
+            .await
+            .context(ResolveEndpointSnafu {
+                endpoint: endpoint.to_string(),
+            })?
+            .collect::<Vec<_>>(),
+        Host::Ipv4(address) => lookup_host((address, port))
+            .await
+            .context(ResolveEndpointSnafu {
+                endpoint: endpoint.to_string(),
+            })?
+            .collect::<Vec<_>>(),
+        Host::Ipv6(address) => lookup_host((address, port))
+            .await
+            .context(ResolveEndpointSnafu {
+                endpoint: endpoint.to_string(),
+            })?
+            .collect::<Vec<_>>(),
+    };
+    let mut addrs = addrs.into_iter();
     addrs.next().context(EmptyEndpointResolutionSnafu {
         endpoint: endpoint.to_string(),
     })

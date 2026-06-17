@@ -492,7 +492,7 @@ async fn handle_vpn(ctx: &mut AppContext, command: VpnSubcommand) -> Result<()> 
             let mut config = TunnelConfig::from_vpn_conn(
                 &data,
                 local_params.clone(),
-                config_result.servers.wireguard_endpoint.clone(),
+                config_result.endpoint.wireguard_endpoint.clone(),
                 config_result.dot.protocol_mode,
                 config_result.dot.protocol_detect_enabled(),
             )
@@ -513,7 +513,7 @@ async fn handle_vpn(ctx: &mut AppContext, command: VpnSubcommand) -> Result<()> 
             print_json(&json!({
                 "response": &config_result.response,
                 "dot": &config_result.dot,
-                "servers": &config_result.servers,
+                "endpoint": &config_result.endpoint,
                 "local_public_key": &local_params.local_public_key,
                 "outbound_interface": ctx.outbound_interface(),
                 "connect_report": connect_report_response,

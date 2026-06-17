@@ -1,5 +1,4 @@
 [package]
-build             = "build.rs"
 edition.workspace = true
 name              = "rustylink-api"
 version.workspace = true
@@ -20,7 +19,6 @@ jiff.workspace              = true
 machine-uid.workspace       = true
 prost.workspace             = true
 reqwest.workspace            = true
-reqwest-middleware.workspace = true
 serde.workspace              = true
 serde_json.workspace         = true
 sha1.workspace               = true

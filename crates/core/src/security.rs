@@ -1,4 +1,4 @@
-use rustylink_api::{ReportSecurityResponse, SecurityReportItem, SecurityReportRequest, api};
+use rustylink_api::{BaseResponse, SecurityReportItem, SecurityReportRequest, SendableRequest};
 use snafu::prelude::*;
 
 use crate::AppContext;
@@ -23,11 +23,9 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub async fn report_security(
     ctx: &mut AppContext, report: &SecurityReportRequest,
-) -> Result<ReportSecurityResponse> {
+) -> Result<BaseResponse<String>> {
     let client = ctx.api_client().context(ContextSnafu)?;
-    let response = api::report_security(&client, report)
-        .await
-        .context(ApiSnafu)?;
+    let response = report.clone().send(&client).await.context(ApiSnafu)?;
     ctx.sync_from_client(&client);
     ctx.save().context(ContextSnafu)?;
     Ok(response)

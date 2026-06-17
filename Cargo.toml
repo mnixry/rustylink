@@ -26,7 +26,6 @@ machine-uid        = "0.6.0"
 prost              = "0.14.4"
 rand               = "0.10.1"
 reqwest            = { version = "0.13.4", features = ["cookies", "json", "rustls"] }
-reqwest-middleware = { version = "0.5.0", features = ["json", "multipart", "query", "form"] }
 route_manager      = { version = "0.2.11", features = ["async"] }
 serde              = { version = "1.0.228", features = ["derive"] }
 serde_json         = "1.0.150"

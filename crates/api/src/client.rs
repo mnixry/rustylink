@@ -1,49 +1,26 @@
 use std::{
     collections::BTreeMap,
-    fmt,
     sync::{Arc, RwLock},
 };
 
 use jiff::Timestamp;
 use reqwest::{
-    Request, Response,
-    header::{ACCEPT_LANGUAGE, COOKIE, HeaderMap, HeaderName, HeaderValue, SET_COOKIE, USER_AGENT},
+    Request,
+    header::{
+        ACCEPT, ACCEPT_LANGUAGE, CONTENT_TYPE, COOKIE, HeaderMap, HeaderName, HeaderValue,
+        SET_COOKIE, USER_AGENT,
+    },
 };
-use reqwest_middleware::{ClientBuilder, Middleware, Next};
 use snafu::prelude::*;
 use url::Url;
 
 use crate::{
-    apis::{self, configuration::Configuration},
     identity::ClientIdentity,
-    models::VpnDot,
+    models::{ApiResponse, BaseResponse, SendableRequest, VpnDot},
     signing::SigningContext,
 };
 
 pub const DEFAULT_MATCH_BASE_URL: &str = "https://corplink.volcengine.cn";
-
-#[derive(Debug, Snafu)]
-#[snafu(visibility(pub(crate)))]
-pub enum RawApiError {
-    #[snafu(display("request builder failed: {source}"))]
-    Reqwest { source: reqwest::Error },
-
-    #[snafu(display("request middleware failed: {source}"))]
-    Middleware { source: reqwest_middleware::Error },
-
-    #[snafu(display("response decode failed: {source}"))]
-    Decode { source: serde_json::Error },
-
-    #[snafu(display("response IO failed: {source}"))]
-    Io { source: std::io::Error },
-
-    #[snafu(display("HTTP API status {status}: {content}"))]
-    Response {
-        status: reqwest::StatusCode,
-        content: String,
-        entity: Option<String>,
-    },
-}
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
@@ -57,8 +34,26 @@ pub enum Error {
     #[snafu(display("failed to build HTTP client"))]
     BuildHttpClient { source: reqwest::Error },
 
-    #[snafu(display("generated API request failed: {source}"))]
-    RawApi { source: RawApiError },
+    #[snafu(display("failed to encode API request body"))]
+    Encode { source: serde_json::Error },
+
+    #[snafu(display("failed to build API request"))]
+    BuildRequest { source: reqwest::Error },
+
+    #[snafu(display("API request failed"))]
+    Request { source: reqwest::Error },
+
+    #[snafu(display("response decode failed: {source}; content: {content}"))]
+    Decode {
+        source: serde_json::Error,
+        content: String,
+    },
+
+    #[snafu(display("HTTP API status {status}: {content}"))]
+    HttpStatus {
+        status: reqwest::StatusCode,
+        content: String,
+    },
 
     #[snafu(display("failed to build header `{name}`"))]
     HeaderValue {
@@ -89,7 +84,11 @@ pub enum Error {
     InvalidPort { port: i32 },
 
     #[snafu(display("API returned code {code}: {message}"))]
-    ApiStatus { code: i32, message: String },
+    ApiStatus {
+        code: i32,
+        message: String,
+        response: Box<BaseResponse<serde_json::Value>>,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -110,7 +109,7 @@ pub(crate) struct ApiHooks {
 
 #[derive(Clone)]
 pub struct ApiClient {
-    base_url: String,
+    base_url: Url,
     http: reqwest::Client,
     hooks: ApiHooks,
 }
@@ -120,36 +119,110 @@ pub struct ApiClientOptions {
     pub outbound_interface: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
-pub struct VpnDotServers {
-    pub api_base_url: String,
-    pub wireguard_endpoint: String,
+pub trait ApiEndpoint: Clone + Send + Sync {
+    fn base_url(&self) -> &Url;
+
+    fn client(
+        &self, identity: ClientIdentity, signer: SigningContext, cookies: SessionCookies,
+    ) -> Result<ApiClient> {
+        self.client_with_options(identity, signer, cookies, &ApiClientOptions::from_env())
+    }
+
+    fn client_with_options(
+        &self, identity: ClientIdentity, signer: SigningContext, cookies: SessionCookies,
+        options: &ApiClientOptions,
+    ) -> Result<ApiClient> {
+        ApiClient::from_endpoint(self, identity, signer, cookies, options)
+    }
 }
 
-#[derive(Clone, Debug)]
-struct ApiMiddleware {
-    hooks: ApiHooks,
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct MatchEndpoint {
+    pub base_url: Url,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct TenantEndpoint {
+    pub base_url: Url,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub struct DotEndpoint {
+    pub api_base_url: Url,
+    pub wireguard_endpoint: Url,
+}
+
+impl ApiEndpoint for MatchEndpoint {
+    fn base_url(&self) -> &Url {
+        &self.base_url
+    }
+}
+
+impl ApiEndpoint for TenantEndpoint {
+    fn base_url(&self) -> &Url {
+        &self.base_url
+    }
+}
+
+impl ApiEndpoint for DotEndpoint {
+    fn base_url(&self) -> &Url {
+        &self.api_base_url
+    }
+}
+
+impl Default for MatchEndpoint {
+    fn default() -> Self {
+        Self {
+            base_url: Url::parse(DEFAULT_MATCH_BASE_URL).expect("default match URL is valid"),
+        }
+    }
+}
+
+impl MatchEndpoint {
+    pub fn new(base_url: impl AsRef<str>) -> Result<Self> {
+        Ok(Self {
+            base_url: parse_base_url(base_url.as_ref())?,
+        })
+    }
+}
+
+impl TenantEndpoint {
+    pub fn new(base_url: impl AsRef<str>) -> Result<Self> {
+        Ok(Self {
+            base_url: parse_base_url(base_url.as_ref())?,
+        })
+    }
+}
+
+impl DotEndpoint {
+    pub fn from_dot(dot: &VpnDot, use_vpn_ip_for_api: bool) -> Result<Self> {
+        let api_host = dot.api_host().context(MissingVpnDotFieldSnafu {
+            field: "apiIp/ip4Domain/fastIp",
+        })?;
+        let api_host_for_conn =
+            dot.config_api_host(use_vpn_ip_for_api)
+                .context(MissingVpnDotFieldSnafu {
+                    field: "apiIp/ip4Domain/fastIp",
+                })?;
+        let api_port = dot
+            .api_port
+            .context(MissingVpnDotFieldSnafu { field: "api_port" })?;
+        let vpn_port = dot
+            .vpn_port
+            .context(MissingVpnDotFieldSnafu { field: "vpn_port" })?;
+        Ok(Self {
+            api_base_url: url_from_host_port("https", api_host_for_conn, api_port)?,
+            wireguard_endpoint: url_from_host_port("udp", api_host, vpn_port)?,
+        })
+    }
 }
 
 impl ApiClient {
-    pub fn new(
-        base_url: impl AsRef<str>, identity: ClientIdentity, signer: SigningContext,
-        cookies: SessionCookies,
+    pub fn from_endpoint<E: ApiEndpoint>(
+        endpoint: &E, identity: ClientIdentity, signer: SigningContext, cookies: SessionCookies,
+        options: &ApiClientOptions,
     ) -> Result<Self> {
-        Self::new_with_options(
-            base_url,
-            identity,
-            signer,
-            cookies,
-            &ApiClientOptions::from_env(),
-        )
-    }
-
-    pub fn new_with_options(
-        base_url: impl AsRef<str>, identity: ClientIdentity, signer: SigningContext,
-        cookies: SessionCookies, options: &ApiClientOptions,
-    ) -> Result<Self> {
-        let base_url = normalize_base_url(base_url.as_ref())?;
+        let base_url = endpoint.base_url().clone();
         let mut http_builder =
             reqwest::Client::builder().redirect(reqwest::redirect::Policy::limited(10));
         if let Some(interface) = options.outbound_interface.as_deref() {
@@ -186,29 +259,52 @@ impl ApiClient {
         }
     }
 
-    pub(crate) fn configuration(&self) -> Configuration {
-        self.configuration_for_normalized_base_url(self.base_url.clone())
+    pub async fn send<R>(&self, request: R) -> Result<R::Response>
+    where
+        R: SendableRequest, {
+        let response_body = self.execute(request).await?;
+        let decoded = decode_response::<R::Response>(&response_body)?;
+        check_api_status(&decoded, &response_body)?;
+        Ok(decoded)
     }
 
-    pub(crate) fn configuration_for_base_url(&self, base_url: &str) -> Result<Configuration> {
-        let base_url = normalize_base_url(base_url)?;
-        Ok(self.configuration_for_normalized_base_url(base_url))
-    }
-
-    fn configuration_for_normalized_base_url(&self, base_url: String) -> Configuration {
-        Configuration {
-            base_path: base_url,
-            user_agent: None,
-            client: ClientBuilder::new(self.http.clone())
-                .with(ApiMiddleware {
-                    hooks: self.hooks.clone(),
-                })
-                .build(),
-            basic_auth: None,
-            oauth_access_token: None,
-            bearer_access_token: None,
-            api_key: None,
+    async fn execute<R>(&self, request: R) -> Result<Vec<u8>>
+    where
+        R: SendableRequest, {
+        let url = endpoint_url(&self.base_url, request.path().as_ref())?;
+        let endpoint_query = request.query_pairs();
+        let body = request.body().context(EncodeSnafu)?;
+        let mut builder = self
+            .http
+            .request(R::METHOD, url)
+            .header(ACCEPT, "application/json");
+        if let Some(body) = body {
+            builder = builder.header(CONTENT_TYPE, "application/json").body(body);
         }
+        let mut http_request = builder.build().context(BuildRequestSnafu)?;
+        {
+            let mut query = http_request.url_mut().query_pairs_mut();
+            for (key, value) in endpoint_query {
+                query.append_pair(key, &value);
+            }
+        }
+        prepare_api_request(&self.hooks, &mut http_request)?;
+        let response = self
+            .http
+            .execute(http_request)
+            .await
+            .context(RequestSnafu)?;
+        self.hooks.store_response_cookies(response.headers());
+        let status = response.status();
+        let bytes = response.bytes().await.context(RequestSnafu)?.to_vec();
+        if !status.is_success() {
+            return HttpStatusSnafu {
+                status,
+                content: response_content(&bytes),
+            }
+            .fail();
+        }
+        Ok(bytes)
     }
 }
 
@@ -348,21 +444,6 @@ impl ApiHooks {
     }
 }
 
-#[async_trait::async_trait]
-impl Middleware for ApiMiddleware {
-    async fn handle(
-        &self, mut request: Request, extensions: &mut http::Extensions, next: Next<'_>,
-    ) -> reqwest_middleware::Result<Response> {
-        prepare_openapi_request(&self.hooks, &mut request)
-            .map_err(reqwest_middleware::Error::middleware)?;
-        let response = next.run(request, extensions).await;
-        if let Ok(response) = &response {
-            self.hooks.store_response_cookies(response.headers());
-        }
-        response
-    }
-}
-
 impl VpnDot {
     #[must_use]
     pub fn api_host(&self) -> Option<&str> {
@@ -416,54 +497,50 @@ impl VpnDot {
     }
 }
 
-impl VpnDotServers {
-    pub fn from_dot(dot: &VpnDot, use_vpn_ip_for_api: bool) -> Result<Self> {
-        let api_host = dot.api_host().context(MissingVpnDotFieldSnafu {
-            field: "apiIp/ip4Domain/fastIp",
-        })?;
-        let api_host_for_conn =
-            dot.config_api_host(use_vpn_ip_for_api)
-                .context(MissingVpnDotFieldSnafu {
-                    field: "apiIp/ip4Domain/fastIp",
-                })?;
-        let api_port = dot
-            .api_port
-            .context(MissingVpnDotFieldSnafu { field: "api_port" })?;
-        let vpn_port = dot
-            .vpn_port
-            .context(MissingVpnDotFieldSnafu { field: "vpn_port" })?;
-        let api_base_url = format_https_host_port(api_host_for_conn, api_port)?;
-        let wireguard_endpoint = format_host_port(api_host, vpn_port)?;
-        Ok(Self {
-            api_base_url,
-            wireguard_endpoint,
-        })
-    }
+fn parse_base_url(value: &str) -> Result<Url> {
+    Url::parse(value).context(InvalidBaseUrlSnafu {
+        value: value.to_string(),
+    })
 }
 
-impl RawApiError {
-    pub(crate) fn from_openapi<T: fmt::Debug>(source: apis::Error<T>) -> Self {
-        match source {
-            apis::Error::Reqwest(source) => Self::Reqwest { source },
-            apis::Error::ReqwestMiddleware(source) => Self::Middleware { source },
-            apis::Error::Serde(source) => Self::Decode { source },
-            apis::Error::Io(source) => Self::Io { source },
-            apis::Error::ResponseError(response) => Self::Response {
-                status: response.status,
-                content: response.content,
-                entity: response.entity.map(|entity| format!("{entity:?}")),
-            },
-        }
-    }
+fn endpoint_url(base_url: &Url, path: &str) -> Result<Url> {
+    base_url.join(path).context(InvalidBaseUrlSnafu {
+        value: path.to_string(),
+    })
 }
 
-pub(crate) fn openapi_error<T: fmt::Debug>(source: apis::Error<T>) -> Error {
-    Error::RawApi {
-        source: RawApiError::from_openapi(source),
-    }
+fn decode_response<T>(bytes: &[u8]) -> Result<T>
+where
+    T: serde::de::DeserializeOwned, {
+    serde_json::from_slice(bytes).context(DecodeSnafu {
+        content: response_content(bytes),
+    })
 }
 
-fn prepare_openapi_request(hooks: &ApiHooks, request: &mut Request) -> Result<()> {
+fn check_api_status(response: &impl ApiResponse, body: &[u8]) -> Result<()> {
+    if response.code() == 0 {
+        return Ok(());
+    }
+
+    let message = response
+        .message()
+        .unwrap_or("unknown API error")
+        .to_string();
+    let response = serde_json::from_slice(body).unwrap_or_else(|_| BaseResponse {
+        code: response.code(),
+        message: Some(message.clone()),
+        data: None,
+        extra: None,
+    });
+    ApiStatusSnafu {
+        code: response.code,
+        message,
+        response: Box::new(response),
+    }
+    .fail()
+}
+
+fn prepare_api_request(hooks: &ApiHooks, request: &mut Request) -> Result<()> {
     {
         let mut query = request.url_mut().query_pairs_mut();
         for (key, value) in hooks.identity.query_pairs(Timestamp::now()) {
@@ -498,23 +575,24 @@ fn prepare_openapi_request(hooks: &ApiHooks, request: &mut Request) -> Result<()
         host = request.url().host_str().unwrap_or("<none>"),
         path = request.url().path(),
         signed_header_count,
-        "prepared generated API request"
+        "prepared API request"
     );
     Ok(())
 }
 
-fn normalize_base_url(value: &str) -> Result<String> {
-    Url::parse(value).context(InvalidBaseUrlSnafu {
-        value: value.to_string(),
-    })?;
-    Ok(value.trim_end_matches('/').to_string())
+fn response_content(bytes: &[u8]) -> String {
+    const MAX_ERROR_CONTENT_BYTES: usize = 4096;
+    if bytes.len() <= MAX_ERROR_CONTENT_BYTES {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    format!(
+        "{} ... [truncated {} bytes]",
+        String::from_utf8_lossy(&bytes[..MAX_ERROR_CONTENT_BYTES]),
+        bytes.len() - MAX_ERROR_CONTENT_BYTES
+    )
 }
 
-fn format_https_host_port(host: &str, port: i32) -> Result<String> {
-    Ok(format!("https://{}", format_host_port(host, port)?))
-}
-
-fn format_host_port(host: &str, port: i32) -> Result<String> {
+fn url_from_host_port(scheme: &str, host: &str, port: i32) -> Result<Url> {
     if port <= 0 || port > i32::from(u16::MAX) {
         return InvalidPortSnafu { port }.fail();
     }
@@ -522,9 +600,57 @@ fn format_host_port(host: &str, port: i32) -> Result<String> {
     if host.is_empty() {
         return MissingVpnDotFieldSnafu { field: "host" }.fail();
     }
-    if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
-        Ok(format!("[{host}]:{port}"))
-    } else {
-        Ok(format!("{host}:{port}"))
+    let mut url = match scheme {
+        "https" => Url::parse("https://placeholder.invalid/"),
+        "udp" => Url::parse("udp://placeholder.invalid/"),
+        _ => {
+            return Err(Error::InvalidBaseUrl {
+                value: scheme.to_string(),
+                source: url::ParseError::RelativeUrlWithoutBase,
+            });
+        }
+    }
+    .context(InvalidBaseUrlSnafu {
+        value: scheme.to_string(),
+    })?;
+    url.set_host(Some(host)).context(InvalidBaseUrlSnafu {
+        value: host.to_string(),
+    })?;
+    url.set_port(Some(u16::try_from(port).expect("port range checked")))
+        .map_err(|()| Error::InvalidPort { port })?;
+    Ok(url)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn endpoint_url_joins_absolute_request_paths() {
+        let endpoint = TenantEndpoint::new("https://tenant.example/base").expect("endpoint");
+        let url = endpoint_url(&endpoint.base_url, "/api/vpn/list").expect("url");
+
+        assert_eq!(url.as_str(), "https://tenant.example/api/vpn/list");
+    }
+
+    #[test]
+    fn dot_endpoint_builds_api_and_wireguard_urls() {
+        let dot = serde_json::from_value::<VpnDot>(json!({
+            "apiIp": "api.example",
+            "api_port": 8443,
+            "ip": "10.0.0.12",
+            "vpn_port": 51820
+        }))
+        .expect("dot");
+
+        let endpoint = DotEndpoint::from_dot(&dot, true).expect("endpoint");
+
+        assert_eq!(endpoint.api_base_url.as_str(), "https://10.0.0.12:8443/");
+        assert_eq!(
+            endpoint.wireguard_endpoint.as_str(),
+            "udp://api.example:51820/"
+        );
     }
 }
