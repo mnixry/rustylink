@@ -64,6 +64,75 @@ pub async fn handle(ctx: &mut AppContext, command: LoginSubcommand) -> Result<()
             print_json(&response)?;
         }
         LoginSubcommand::QrAuth(args) => handle_qr_auth(ctx, args).await?,
+        // V1 login flow
+        LoginSubcommand::V1Password(args) => {
+            let response = auth::v1_login_password(
+                ctx,
+                args.scene,
+                args.account_type,
+                args.account,
+                args.password,
+            )
+            .await
+            .context(cli_error::AuthSnafu)?;
+            print_json(&response)?;
+        }
+        LoginSubcommand::V1OtpSend(args) => {
+            let response = auth::v1_send_code(
+                ctx,
+                args.scene,
+                args.account_type,
+                args.login_type,
+                args.account,
+            )
+            .await
+            .context(cli_error::AuthSnafu)?;
+            print_json(&response)?;
+        }
+        LoginSubcommand::V1OtpVerify(args) => {
+            let response = auth::v1_verify_code(
+                ctx,
+                args.scene,
+                args.account_type,
+                args.login_type,
+                args.account,
+                args.code,
+            )
+            .await
+            .context(cli_error::AuthSnafu)?;
+            print_json(&response)?;
+        }
+        LoginSubcommand::V1MfaSend(args) => {
+            let response = auth::v1_mfa_send(ctx, args.scene, args.mfa_type, args.account)
+                .await
+                .context(cli_error::AuthSnafu)?;
+            print_json(&response)?;
+        }
+        LoginSubcommand::V1MfaVerify(args) => {
+            let response = auth::v1_mfa_verify(
+                ctx,
+                args.scene,
+                args.mfa_type,
+                args.account,
+                args.code,
+                args.password,
+            )
+            .await
+            .context(cli_error::AuthSnafu)?;
+            print_json(&response)?;
+        }
+        LoginSubcommand::V1Skip(args) => {
+            let response = auth::v1_login_skip(ctx, args.scene, args.account)
+                .await
+                .context(cli_error::AuthSnafu)?;
+            print_json(&response)?;
+        }
+        LoginSubcommand::Logout(args) => {
+            let response = auth::logout(ctx, args.all)
+                .await
+                .context(cli_error::AuthSnafu)?;
+            print_json(&response)?;
+        }
     }
     Ok(())
 }

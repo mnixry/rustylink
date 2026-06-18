@@ -1,9 +1,11 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rustylink_api::{
     ActivateInfo, ActivateRequest, BaseResponse, CommonStringResult,
-    GetThirdPartyLoginLinksRequest, LoginResult, LoginV2Result, OAuthCallbackRequest,
-    OAuthQueryCallbackRequest, PasswordLoginRequest, SendCodeRequest, SendableRequest,
-    ThirdPartyLoginInfo, ThirdPartyTokenCheckRequest, VerifyCodeRequest, VerifyMfaRequest,
+    GetThirdPartyLoginLinksRequest, LoginResult, LoginV2Result, LogoutRequest,
+    OAuthCallbackRequest, OAuthQueryCallbackRequest, PasswordLoginRequest, SendCodeRequest,
+    SendableRequest, ThirdPartyLoginInfo, ThirdPartyTokenCheckRequest, V1LoginRequest,
+    V1LoginSkipRequest, V1MfaSendRequest, V1MfaVerifyRequest, V1SendCodeRequest,
+    V1VerifyCodeRequest, VerifyCodeRequest, VerifyMfaRequest,
 };
 use sha2::{Digest as _, Sha256};
 use snafu::prelude::*;
@@ -243,6 +245,135 @@ pub async fn check_third_party_login_token(
         .await
         .context(ApiSnafu)?;
     ctx.sync_from_client(&client);
+    ctx.save().context(ContextSnafu)?;
+    Ok(response)
+}
+
+// ---------------------------------------------------------------------------
+// V1 login flow
+// ---------------------------------------------------------------------------
+
+pub async fn v1_login_password(
+    ctx: &mut AppContext, login_scene: String, account_type: String, account: String,
+    password: String,
+) -> Result<BaseResponse<LoginV2Result>> {
+    let client = ctx.api_client().context(ContextSnafu)?;
+    let response = V1LoginRequest::encrypted(login_scene, account_type, account, &password)
+        .context(ApiSnafu)?
+        .send(&client)
+        .await
+        .context(ApiSnafu)?;
+    ctx.sync_from_client(&client);
+    ctx.save().context(ContextSnafu)?;
+    Ok(response)
+}
+
+pub async fn v1_send_code(
+    ctx: &mut AppContext, login_scene: String, account_type: String, login_type: String,
+    account: String,
+) -> Result<BaseResponse<CommonStringResult>> {
+    let client = ctx.api_client().context(ContextSnafu)?;
+    let response = V1SendCodeRequest {
+        login_scene,
+        account_type,
+        login_type,
+        account,
+    }
+    .send(&client)
+    .await
+    .context(ApiSnafu)?;
+    ctx.sync_from_client(&client);
+    ctx.save().context(ContextSnafu)?;
+    Ok(response)
+}
+
+pub async fn v1_verify_code(
+    ctx: &mut AppContext, login_scene: String, account_type: String, login_type: String,
+    account: String, code: String,
+) -> Result<BaseResponse<LoginV2Result>> {
+    let client = ctx.api_client().context(ContextSnafu)?;
+    let response = V1VerifyCodeRequest {
+        login_scene,
+        account_type,
+        login_type,
+        account,
+        code,
+    }
+    .send(&client)
+    .await
+    .context(ApiSnafu)?;
+    ctx.sync_from_client(&client);
+    ctx.save().context(ContextSnafu)?;
+    Ok(response)
+}
+
+pub async fn v1_mfa_send(
+    ctx: &mut AppContext, login_scene: String, mfa_type: String, account: String,
+) -> Result<BaseResponse<CommonStringResult>> {
+    let client = ctx.api_client().context(ContextSnafu)?;
+    let response = V1MfaSendRequest {
+        login_scene,
+        mfa_type,
+        account,
+    }
+    .send(&client)
+    .await
+    .context(ApiSnafu)?;
+    ctx.sync_from_client(&client);
+    ctx.save().context(ContextSnafu)?;
+    Ok(response)
+}
+
+pub async fn v1_mfa_verify(
+    ctx: &mut AppContext, login_scene: String, mfa_type: String, account: String,
+    code: Option<String>, password: Option<String>,
+) -> Result<BaseResponse<LoginV2Result>> {
+    let client = ctx.api_client().context(ContextSnafu)?;
+    let response =
+        V1MfaVerifyRequest::encrypted(login_scene, mfa_type, account, code, password)
+            .context(ApiSnafu)?
+            .send(&client)
+            .await
+            .context(ApiSnafu)?;
+    ctx.sync_from_client(&client);
+    ctx.save().context(ContextSnafu)?;
+    Ok(response)
+}
+
+pub async fn v1_login_skip(
+    ctx: &mut AppContext, login_scene: String, account: String,
+) -> Result<BaseResponse<LoginV2Result>> {
+    let client = ctx.api_client().context(ContextSnafu)?;
+    let response = V1LoginSkipRequest {
+        login_scene,
+        account,
+    }
+    .send(&client)
+    .await
+    .context(ApiSnafu)?;
+    ctx.sync_from_client(&client);
+    ctx.save().context(ContextSnafu)?;
+    Ok(response)
+}
+
+// ---------------------------------------------------------------------------
+// Logout
+// ---------------------------------------------------------------------------
+
+pub async fn logout(
+    ctx: &mut AppContext, logout_all: bool,
+) -> Result<BaseResponse<CommonStringResult>> {
+    let client = ctx.api_client().context(ContextSnafu)?;
+    let response = LogoutRequest { logout_all }
+        .send(&client)
+        .await
+        .context(ApiSnafu)?;
+    ctx.sync_from_client(&client);
+    // Clear session state after logout
+    ctx.state.cookies = Default::default();
+    ctx.state.csrf_token = None;
+    ctx.state.knock_token = None;
+    ctx.state.oauth = OAuthState::default();
     ctx.save().context(ContextSnafu)?;
     Ok(response)
 }

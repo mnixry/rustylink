@@ -2,18 +2,29 @@ use std::{borrow::Cow, collections::HashMap};
 
 use reqwest::Method;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_with::skip_serializing_none;
 
 pub type JsonObject = HashMap<String, serde_json::Value>;
 
+#[skip_serializing_none]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BaseResponse<T> {
     pub code: i32,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<T>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
+    pub action: Option<String>,
+    #[serde(default)]
+    pub logout_reason: Option<LogoutReason>,
     pub extra: Option<JsonObject>,
+}
+
+#[skip_serializing_none]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LogoutReason {
+    pub reason: Option<String>,
+    pub message: Option<String>,
 }
 
 impl<T> Default for BaseResponse<T> {
@@ -22,8 +33,18 @@ impl<T> Default for BaseResponse<T> {
             code: 0,
             message: None,
             data: None,
+            action: None,
+            logout_reason: None,
             extra: None,
         }
+    }
+}
+
+impl<T> BaseResponse<T> {
+    /// Returns `true` if the server signalled a forced logout via `action`.
+    #[must_use]
+    pub fn is_force_logout(&self) -> bool {
+        self.action.as_deref() == Some("logout")
     }
 }
 

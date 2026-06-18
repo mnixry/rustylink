@@ -39,7 +39,7 @@ pub mod security;
 pub mod vpn;
 
 pub use auth::*;
-pub use common::{ApiResponse, BaseResponse, JsonObject, SendableRequest};
+pub use common::{ApiResponse, BaseResponse, JsonObject, LogoutReason, SendableRequest};
 pub use profile::*;
 pub use security::*;
 pub use vpn::*;

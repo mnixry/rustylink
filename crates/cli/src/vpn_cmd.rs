@@ -5,7 +5,10 @@ use rustylink_core::{
     AppContext,
     vpn::{self, VpnConfigRequest, VpnConnectMode},
 };
-use rustylink_tunnel::{LocalTunnelParams, OutboundInterface, TunnelConfig, TunnelSession};
+use rustylink_tunnel::{
+    LocalTunnelParams, OutboundInterface, ReconnectController, ReconnectDecision, ReconnectEvent,
+    ReconnectPolicy, TunnelConfig, TunnelSession,
+};
 use serde_json::json;
 use snafu::prelude::*;
 use strum::IntoEnumIterator;
@@ -38,6 +41,9 @@ pub async fn handle(ctx: &mut AppContext, command: VpnSubcommand) -> Result<()> 
             let mode = parse_vpn_mode(args.mode.as_deref())?;
             let export_id = resolve_export_id(ctx, args.export_id).await?;
             let local_params = local_params_for_connect(&args)?;
+            let reconnect_enabled = args.reconnect;
+            let mut reconnect_controller =
+                ReconnectController::new(ReconnectPolicy::android_compatible_default());
             let config_request = VpnConfigRequest {
                 mode,
                 public_key: local_params.local_public_key.clone(),
@@ -45,56 +51,102 @@ pub async fn handle(ctx: &mut AppContext, command: VpnSubcommand) -> Result<()> 
                 otp: args.otp,
                 sign_token: args.sign_token,
                 not_auto: args.not_auto.unwrap_or(true),
-                reconnect: args.reconnect,
+                reconnect: reconnect_enabled,
                 preferred_dot_id: args.dot_id,
             };
-            let config_result = vpn::vpn_config_from_dot_list(ctx, &config_request)
-                .await
-                .context(cli_error::VpnSnafu)?;
-            let data = config_result
-                .response
-                .data
-                .clone()
-                .expect("core checked config data exists");
-            let mut config = TunnelConfig::from_vpn_conn(
-                &data,
-                local_params.clone(),
-                config_result.endpoint.wireguard_endpoint.clone(),
-                config_result.dot.protocol_mode,
-                config_result.dot.protocol_detect_enabled(),
-            )
-            .context(cli_error::TunnelSnafu)?;
-            config.outbound_interface = outbound_interface.map(|interface| interface.name);
-            let mut session = TunnelSession::new(config);
-            session.start().await.context(cli_error::TunnelSnafu)?;
-            let connect_report =
-                vpn_report_request(100, &data.ip, &local_params.local_public_key, mode);
-            let connect_report_response =
-                match vpn::report_vpn(ctx, &config_result.dot, &connect_report).await {
-                    Ok(response) => Some(response),
-                    Err(error) => {
-                        tracing::warn!(%error, "failed to report VPN connection");
-                        None
+
+            'connect_loop: loop {
+                let config_result = vpn::vpn_config_from_dot_list(ctx, &config_request)
+                    .await
+                    .context(cli_error::VpnSnafu)?;
+                let data = config_result
+                    .response
+                    .data
+                    .clone()
+                    .expect("core checked config data exists");
+                let mut config = TunnelConfig::from_vpn_conn(
+                    &data,
+                    local_params.clone(),
+                    config_result.endpoint.wireguard_endpoint.clone(),
+                    config_result.dot.protocol_mode,
+                    config_result.dot.protocol_detect_enabled(),
+                )
+                .context(cli_error::TunnelSnafu)?;
+                config.outbound_interface =
+                    outbound_interface.as_ref().map(|iface| iface.name.clone());
+                let mut session = TunnelSession::new(config);
+                session.start().await.context(cli_error::TunnelSnafu)?;
+                reconnect_controller.reset();
+
+                let connect_report =
+                    vpn_report_request(100, &data.ip, &local_params.local_public_key, mode);
+                let connect_report_response =
+                    match vpn::report_vpn(ctx, &config_result.dot, &connect_report).await {
+                        Ok(response) => {
+                            // Check for server-side force logout
+                            if response.is_force_logout() {
+                                tracing::warn!(
+                                    "server signalled force logout via connect report response"
+                                );
+                                session.stop().await.context(cli_error::TunnelSnafu)?;
+                                break 'connect_loop;
+                            }
+                            Some(response)
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "failed to report VPN connection");
+                            None
+                        }
+                    };
+                print_json(&json!({
+                    "response": &config_result.response,
+                    "dot": &config_result.dot,
+                    "endpoint": &config_result.endpoint,
+                    "local_public_key": &local_params.local_public_key,
+                    "outbound_interface": ctx.outbound_interface(),
+                    "connect_report": connect_report_response,
+                    "tunnel_status": session.status,
+                    "reconnect_enabled": reconnect_enabled,
+                }))?;
+
+                // Wait for Ctrl-C or tunnel failure
+                tokio::signal::ctrl_c()
+                    .await
+                    .context(cli_error::WaitForSignalSnafu)?;
+
+                let disconnect_report =
+                    vpn_report_request(101, &data.ip, &local_params.local_public_key, mode);
+                if let Err(error) =
+                    vpn::report_vpn(ctx, &config_result.dot, &disconnect_report).await
+                {
+                    tracing::warn!(%error, "failed to report VPN disconnection");
+                }
+                session.stop().await.context(cli_error::TunnelSnafu)?;
+
+                if !reconnect_enabled {
+                    break 'connect_loop;
+                }
+
+                let decision = reconnect_controller.record(ReconnectEvent::NetworkChanged);
+                match decision {
+                    ReconnectDecision::Retry { after, attempt } => {
+                        tracing::info!(attempt, delay_ms = after.as_millis(), "reconnecting...");
+                        tokio::time::sleep(after).await;
                     }
-                };
-            print_json(&json!({
-                "response": &config_result.response,
-                "dot": &config_result.dot,
-                "endpoint": &config_result.endpoint,
-                "local_public_key": &local_params.local_public_key,
-                "outbound_interface": ctx.outbound_interface(),
-                "connect_report": connect_report_response,
-                "tunnel_status": session.status,
-            }))?;
-            tokio::signal::ctrl_c()
-                .await
-                .context(cli_error::WaitForSignalSnafu)?;
-            let disconnect_report =
-                vpn_report_request(101, &data.ip, &local_params.local_public_key, mode);
-            if let Err(error) = vpn::report_vpn(ctx, &config_result.dot, &disconnect_report).await {
-                tracing::warn!(%error, "failed to report VPN disconnection");
+                    ReconnectDecision::SwitchNode { after, attempt } => {
+                        tracing::info!(
+                            attempt,
+                            delay_ms = after.as_millis(),
+                            "switching node and reconnecting..."
+                        );
+                        tokio::time::sleep(after).await;
+                    }
+                    ReconnectDecision::Stop => {
+                        tracing::warn!("max reconnect attempts reached, stopping");
+                        break 'connect_loop;
+                    }
+                }
             }
-            session.stop().await.context(cli_error::TunnelSnafu)?;
         }
     }
     Ok(())

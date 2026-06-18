@@ -1,10 +1,15 @@
 use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
+use serde_with::skip_serializing_none;
 use snafu::ResultExt as _;
 
 use super::{BaseResponse, JsonObject, SendableRequest};
 use crate::signing::PasswordCipher;
+
+// ---------------------------------------------------------------------------
+// Activate
+// ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActivateRequest {
@@ -18,35 +23,28 @@ impl_json_request!(
     BaseResponse<ActivateInfo>
 );
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[skip_serializing_none]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ActivateInfo {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activate_host: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activate_backup_domain: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activate_enable_backup_domain: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zh_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub en_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub domain: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enable_self_signed: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub self_signed_cert: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enable_public_key: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_key: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw: Option<JsonObject>,
 }
+
+// ---------------------------------------------------------------------------
+// Legacy login (pre-v1)
+// ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PasswordLoginRequest {
@@ -110,14 +108,15 @@ impl_json_request!(
     BaseResponse<LoginV2Result>
 );
 
+#[skip_serializing_none]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerifyMfaRequest {
     pub login_scene: String,
     pub mfa_type: String,
     pub account: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub code: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub password: Option<String>,
 }
 
@@ -149,6 +148,175 @@ impl_json_request!(
     "/api/mfa/code/verify",
     BaseResponse<LoginV2Result>
 );
+
+// ---------------------------------------------------------------------------
+// V1 login (newer flow)
+// ---------------------------------------------------------------------------
+
+/// `POST /api/v1/login`
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct V1LoginRequest {
+    pub login_scene: String,
+    pub account_type: String,
+    pub account: String,
+    pub password: String,
+}
+
+impl V1LoginRequest {
+    pub fn encrypted(
+        login_scene: String, account_type: String, account: String, password: &str,
+    ) -> crate::client::Result<Self> {
+        let password = PasswordCipher::generated()
+            .encrypt_aes_cbc(password)
+            .context(crate::client::EncryptPasswordSnafu)?;
+        Ok(Self {
+            login_scene,
+            account_type,
+            account,
+            password,
+        })
+    }
+}
+
+impl_json_request!(
+    V1LoginRequest,
+    POST,
+    "/api/v1/login",
+    BaseResponse<LoginV2Result>
+);
+
+/// `POST /api/v1/login/send`
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct V1SendCodeRequest {
+    pub login_scene: String,
+    pub account_type: String,
+    pub login_type: String,
+    pub account: String,
+}
+
+impl_json_request!(
+    V1SendCodeRequest,
+    POST,
+    "/api/v1/login/send",
+    BaseResponse<CommonStringResult>
+);
+
+/// `POST /api/v1/login/verify`
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct V1VerifyCodeRequest {
+    pub login_scene: String,
+    pub account_type: String,
+    pub login_type: String,
+    pub account: String,
+    pub code: String,
+}
+
+impl_json_request!(
+    V1VerifyCodeRequest,
+    POST,
+    "/api/v1/login/verify",
+    BaseResponse<LoginV2Result>
+);
+
+/// `POST /api/v1/login/mfa/send`
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct V1MfaSendRequest {
+    pub login_scene: String,
+    pub mfa_type: String,
+    pub account: String,
+}
+
+impl_json_request!(
+    V1MfaSendRequest,
+    POST,
+    "/api/v1/login/mfa/send",
+    BaseResponse<CommonStringResult>
+);
+
+/// `POST /api/v1/login/mfa/verify`
+#[skip_serializing_none]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct V1MfaVerifyRequest {
+    pub login_scene: String,
+    pub mfa_type: String,
+    pub account: String,
+    #[serde(default)]
+    pub code: Option<String>,
+    #[serde(default)]
+    pub password: Option<String>,
+}
+
+impl V1MfaVerifyRequest {
+    pub fn encrypted(
+        login_scene: String, mfa_type: String, account: String, code: Option<String>,
+        password: Option<String>,
+    ) -> crate::client::Result<Self> {
+        let password = password
+            .map(|value| {
+                PasswordCipher::generated()
+                    .encrypt_aes_cbc(&value)
+                    .context(crate::client::EncryptPasswordSnafu)
+            })
+            .transpose()?;
+        Ok(Self {
+            login_scene,
+            mfa_type,
+            account,
+            code,
+            password,
+        })
+    }
+}
+
+impl_json_request!(
+    V1MfaVerifyRequest,
+    POST,
+    "/api/v1/login/mfa/verify",
+    BaseResponse<LoginV2Result>
+);
+
+/// `POST /api/v1/login/skip`
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct V1LoginSkipRequest {
+    pub login_scene: String,
+    pub account: String,
+}
+
+impl_json_request!(
+    V1LoginSkipRequest,
+    POST,
+    "/api/v1/login/skip",
+    BaseResponse<LoginV2Result>
+);
+
+// ---------------------------------------------------------------------------
+// Logout
+// ---------------------------------------------------------------------------
+
+/// `GET /api/logout`
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LogoutRequest {
+    pub logout_all: bool,
+}
+
+#[async_trait::async_trait]
+impl SendableRequest for LogoutRequest {
+    type Response = BaseResponse<CommonStringResult>;
+
+    const METHOD: reqwest::Method = reqwest::Method::GET;
+
+    fn path(&self) -> Cow<'static, str> {
+        Cow::Borrowed("/api/logout")
+    }
+
+    fn query_pairs(&self) -> Vec<(&'static str, String)> {
+        vec![("logout_all", self.logout_all.to_string())]
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Third-party / OAuth login
+// ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OAuthCallbackRequest {
@@ -190,6 +358,24 @@ impl SendableRequest for OAuthQueryCallbackRequest {
     }
 }
 
+/// `POST /api/tpslogin/device/callback`
+#[skip_serializing_none]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceOAuthCallbackRequest {
+    pub alias_key: String,
+    pub code: String,
+    pub state: String,
+    #[serde(default)]
+    pub code_verifier: Option<String>,
+}
+
+impl_json_request!(
+    DeviceOAuthCallbackRequest,
+    POST,
+    "/api/tpslogin/device/callback",
+    BaseResponse<LoginV2Result>
+);
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GetThirdPartyLoginLinksRequest {
     pub code_challenge: String,
@@ -222,160 +408,89 @@ impl_json_request!(
     BaseResponse<LoginResult>
 );
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+// ---------------------------------------------------------------------------
+// Response / result types
+// ---------------------------------------------------------------------------
+
+#[skip_serializing_none]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CommonStringResult {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[skip_serializing_none]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LoginV2Result {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next: Option<LoginV2Next>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[skip_serializing_none]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LoginV2Next {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
-    #[serde(
-        default,
-        rename = "canSkip",
-        alias = "can_skip",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "canSkip", alias = "can_skip")]
     pub can_skip: Option<bool>,
-    #[serde(
-        default,
-        rename = "authList",
-        alias = "auth_list",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "authList", alias = "auth_list")]
     pub auth_list: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mobile: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
-    #[serde(
-        default,
-        rename = "passwordRule",
-        alias = "password_rule",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "passwordRule", alias = "password_rule")]
     pub password_rule: Option<JsonObject>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link: Option<String>,
-    #[serde(
-        default,
-        rename = "passkeyUid",
-        alias = "passkey_uid",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "passkeyUid", alias = "passkey_uid")]
     pub passkey_uid: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[skip_serializing_none]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LoginResult {
-    #[serde(
-        default,
-        rename = "loginResult",
-        alias = "login_result",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "loginResult", alias = "login_result")]
     pub login_result: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth: Option<serde_json::Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<i64>,
-    #[serde(
-        default,
-        rename = "needVerify",
-        alias = "need_verify",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "needVerify", alias = "need_verify")]
     pub need_verify: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vpn_token: Option<String>,
-    #[serde(
-        default,
-        rename = "csrf-token",
-        alias = "csrf_token",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "csrf-token", alias = "csrf_token")]
     pub csrf_token: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uid: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub need_mfa: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mfa_token: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw: Option<JsonObject>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[skip_serializing_none]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ThirdPartyLoginInfo {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alias: Option<String>,
-    #[serde(
-        default,
-        rename = "aliasKey",
-        alias = "alias_key",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "aliasKey", alias = "alias_key")]
     pub alias_key: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
-    #[serde(
-        default,
-        rename = "loginUrl",
-        alias = "login_url",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "loginUrl", alias = "login_url")]
     pub login_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub appid: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agentid: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notice: Option<String>,
-    #[serde(
-        default,
-        rename = "isCustom",
-        alias = "is_custom",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "isCustom", alias = "is_custom")]
     pub is_custom: Option<bool>,
-    #[serde(
-        default,
-        rename = "fullTitle",
-        alias = "full_title",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "fullTitle", alias = "full_title")]
     pub full_title: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub abbreviation: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw: Option<JsonObject>,
 }
 

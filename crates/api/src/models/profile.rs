@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_with::skip_serializing_none;
 
 use super::{BaseResponse, JsonObject};
 
@@ -32,86 +33,55 @@ impl_empty_request!(
     BaseResponse<TenantConfig>
 );
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[skip_serializing_none]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LoginSetting {
-    #[serde(
-        default,
-        rename = "v1Login",
-        alias = "v1_login",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "v1Login", alias = "v1_login")]
     pub v1_login: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw: Option<JsonObject>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[skip_serializing_none]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct UserInfo {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uid: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mobile: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw: Option<JsonObject>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[skip_serializing_none]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TenantConfig {
-    #[serde(
-        default,
-        rename = "signingConfig",
-        alias = "signing_config",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "signingConfig", alias = "signing_config")]
     pub signing_config: Option<TenantSigningConfig>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw: Option<JsonObject>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[skip_serializing_none]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TenantSigningConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enable: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub algorithms: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rules: Option<Vec<SigningRule>>,
-    #[serde(
-        default,
-        rename = "rulesMap",
-        alias = "rules_map",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "rulesMap", alias = "rules_map")]
     pub rules_map: Option<JsonObject>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[skip_serializing_none]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SigningRule {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub urls: Option<Vec<String>>,
-    #[serde(
-        default,
-        rename = "enable_signing",
-        alias = "enableSigning",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "enable_signing", alias = "enableSigning")]
     pub enable_signing: Option<bool>,
-    #[serde(
-        default,
-        rename = "signing_input_params",
-        alias = "signingInputParams",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "signing_input_params", alias = "signingInputParams")]
     pub signing_input_params: Option<i32>,
-    #[serde(
-        default,
-        rename = "max_time_desync",
-        alias = "maxTimeDesync",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "max_time_desync", alias = "maxTimeDesync")]
     pub max_time_desync: Option<i32>,
 }

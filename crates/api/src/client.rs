@@ -530,6 +530,8 @@ fn check_api_status(response: &impl ApiResponse, body: &[u8]) -> Result<()> {
         code: response.code(),
         message: Some(message.clone()),
         data: None,
+        action: None,
+        logout_reason: None,
         extra: None,
     });
     ApiStatusSnafu {

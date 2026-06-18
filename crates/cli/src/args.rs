@@ -54,6 +54,20 @@ pub enum LoginSubcommand {
     OtpVerify(CodeVerifyArgs),
     MfaVerify(MfaVerifyArgs),
     QrAuth(QrAuthArgs),
+    /// V1 login with password (newer flow)
+    V1Password(PasswordArgs),
+    /// V1 send OTP code
+    V1OtpSend(CodeSendArgs),
+    /// V1 verify OTP code
+    V1OtpVerify(CodeVerifyArgs),
+    /// V1 send MFA code
+    V1MfaSend(V1MfaSendArgs),
+    /// V1 verify MFA code
+    V1MfaVerify(MfaVerifyArgs),
+    /// V1 skip optional login step
+    V1Skip(V1SkipArgs),
+    /// Logout (terminate session)
+    Logout(LogoutArgs),
 }
 
 #[derive(Debug, Args)]
@@ -128,6 +142,30 @@ pub struct QrAuthArgs {
     pub poll_timeout_seconds: u64,
     #[arg(long)]
     pub no_qr: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct V1MfaSendArgs {
+    #[arg(long, default_value = "login")]
+    pub scene: String,
+    #[arg(long)]
+    pub mfa_type: String,
+    #[arg(long)]
+    pub account: String,
+}
+
+#[derive(Debug, Args)]
+pub struct V1SkipArgs {
+    #[arg(long, default_value = "login")]
+    pub scene: String,
+    #[arg(long)]
+    pub account: String,
+}
+
+#[derive(Debug, Args)]
+pub struct LogoutArgs {
+    #[arg(long, default_value_t = false)]
+    pub all: bool,
 }
 
 #[derive(Debug, Args)]
