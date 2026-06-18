@@ -5,4 +5,4 @@ pub mod state;
 pub mod vpn;
 
 pub use context::AppContext;
-pub use state::{OAuthState, RustylinkState, TenantState};
+pub use state::{OAuthState, RustylinkState, StateChange, TenantState, TotpConfig};

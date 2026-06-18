@@ -341,6 +341,26 @@ impl TunnelSession {
             self.status = TunnelStatus::Stopped;
         }
     }
+
+    /// Elapsed time since the most recent successful `WireGuard` handshake with
+    /// the configured peer, or `None` if no handshake has completed yet (or the
+    /// device is not running).  Used by the daemon supervisor to detect a
+    /// stalled tunnel (`HandshakeTimeout`).
+    pub async fn last_handshake(&self) -> Option<std::time::Duration> {
+        match self.device.as_ref()? {
+            TunnelDevice::Udp(device) => peer_last_handshake(device.peers().await),
+            TunnelDevice::FeilianTcp(device) => peer_last_handshake(device.peers().await),
+        }
+    }
+}
+
+fn peer_last_handshake(
+    peers: Vec<gotatun::device::configure::PeerStats>,
+) -> Option<std::time::Duration> {
+    peers
+        .into_iter()
+        .filter_map(|peer| peer.stats.last_handshake)
+        .min()
 }
 
 impl TunnelDevice {

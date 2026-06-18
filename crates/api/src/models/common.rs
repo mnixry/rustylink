@@ -51,6 +51,10 @@ impl<T> BaseResponse<T> {
 pub trait ApiResponse {
     fn code(&self) -> i32;
     fn message(&self) -> Option<&str>;
+
+    fn is_force_logout(&self) -> bool {
+        false
+    }
 }
 
 impl<T> ApiResponse for BaseResponse<T> {
@@ -60,6 +64,10 @@ impl<T> ApiResponse for BaseResponse<T> {
 
     fn message(&self) -> Option<&str> {
         self.message.as_deref()
+    }
+
+    fn is_force_logout(&self) -> bool {
+        self.action.as_deref() == Some("logout")
     }
 }
 
@@ -83,6 +91,12 @@ pub trait SendableRequest: Sized + Send + Sync {
         self, client: &crate::client::ApiClient,
     ) -> crate::client::Result<Self::Response> {
         client.send(self).await
+    }
+
+    async fn send_with_meta(
+        self, client: &crate::client::ApiClient,
+    ) -> crate::client::Result<(Self::Response, crate::client::ResponseMeta)> {
+        client.send_with_meta(self).await
     }
 }
 

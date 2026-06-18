@@ -1,7 +1,7 @@
 use std::{fs, path::Path};
 
 use jiff::Timestamp;
-use rustylink_api::{ClientIdentity, SessionCookies, SigningConfig};
+use rustylink_api::{ClientIdentity, SessionCookies, SigningConfig, UserInfo};
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 
@@ -38,6 +38,10 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+// ---------------------------------------------------------------------------
+// Tenant / OAuth state
+// ---------------------------------------------------------------------------
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct TenantState {
     pub base_url: Option<String>,
@@ -53,6 +57,22 @@ pub struct OAuthState {
     pub code_verifier: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// TOTP config — persisted secret for auto-reconnect
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct TotpConfig {
+    pub secret: String,
+    pub algorithm: String,
+    pub digits: u32,
+    pub period: u32,
+}
+
+// ---------------------------------------------------------------------------
+// RustylinkState — the auth/session state snapshot
+// ---------------------------------------------------------------------------
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RustylinkState {
     pub tenant: TenantState,
@@ -62,6 +82,8 @@ pub struct RustylinkState {
     pub knock_token: Option<String>,
     pub signing: SigningConfig,
     pub oauth: OAuthState,
+    #[serde(default)]
+    pub totp: Option<TotpConfig>,
     pub updated_at_unix: i64,
 }
 
@@ -76,10 +98,12 @@ impl RustylinkState {
             knock_token: None,
             signing: SigningConfig::default(),
             oauth: OAuthState::default(),
+            totp: None,
             updated_at_unix: Timestamp::now().as_second(),
         }
     }
 
+    /// Load state from disk, or return a fresh default if the file does not exist.
     pub fn load_or_default(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::new());
@@ -92,6 +116,7 @@ impl RustylinkState {
         })
     }
 
+    /// Persist state to disk (used by the daemon actor).
     pub fn save(&mut self, path: &Path) -> Result<()> {
         self.updated_at_unix = Timestamp::now().as_second();
         if let Some(parent) = path.parent() {
@@ -122,4 +147,56 @@ impl Default for RustylinkState {
     fn default() -> Self {
         Self::new()
     }
+}
+
+// ---------------------------------------------------------------------------
+// StateChange — returned by core functions, applied by the daemon actor
+// ---------------------------------------------------------------------------
+
+/// A state mutation produced by a core function.  The daemon actor applies
+/// these to `DaemonState`, persists, and broadcasts.
+#[derive(Clone, Debug)]
+pub enum StateChange {
+    /// Tenant configured after activation.
+    TenantConfigured {
+        tenant: TenantState,
+        signing: SigningConfig,
+    },
+    /// Cookies updated from an HTTP response `Set-Cookie` header.
+    CookiesUpdated { cookies: SessionCookies },
+    /// CSRF token updated.
+    CsrfTokenUpdated { token: Option<String> },
+    /// Knock token updated.
+    KnockTokenUpdated { token: Option<String> },
+    /// Signing config updated (from tenant config).
+    SigningConfigUpdated { config: SigningConfig },
+    /// Login API version detected from `LoginSetting.v1_login`.
+    LoginApiDetected { v1_login: bool },
+    /// Login succeeded; user info available.
+    LoginSuccess { user_info: UserInfo },
+    /// OTP challenge pending (SMS/email code required).
+    OtpChallengePending {
+        masked_target: String,
+        login_type: String,
+    },
+    /// MFA challenge pending.
+    MfaChallengePending {
+        mfa_type: String,
+        auth_list: Vec<String>,
+        can_skip: bool,
+    },
+    /// OAuth state set (starting third-party login flow).
+    OAuthStateSet {
+        alias_key: String,
+        state: String,
+        code_verifier: String,
+    },
+    /// OAuth state cleared (after callback or logout).
+    OAuthCleared,
+    /// Session expired (401 or force-logout from server).
+    SessionExpired,
+    /// Logged out (session cleared).
+    LoggedOut,
+    /// TOTP config fetched after login.
+    TotpConfigFetched { config: TotpConfig },
 }

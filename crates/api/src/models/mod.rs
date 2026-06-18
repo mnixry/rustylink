@@ -34,12 +34,14 @@ macro_rules! impl_empty_request {
 
 pub mod auth;
 pub mod common;
+pub mod otp;
 pub mod profile;
 pub mod security;
 pub mod vpn;
 
 pub use auth::*;
 pub use common::{ApiResponse, BaseResponse, JsonObject, LogoutReason, SendableRequest};
+pub use otp::*;
 pub use profile::*;
 pub use security::*;
 pub use vpn::*;

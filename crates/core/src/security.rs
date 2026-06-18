@@ -1,7 +1,7 @@
 use rustylink_api::{BaseResponse, SecurityReportItem, SecurityReportRequest, SendableRequest};
 use snafu::prelude::*;
 
-use crate::AppContext;
+use crate::{AppContext, state::StateChange};
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
@@ -22,13 +22,26 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub async fn report_security(
-    ctx: &mut AppContext, report: &SecurityReportRequest,
-) -> Result<BaseResponse<String>> {
-    let client = ctx.api_client().context(ContextSnafu)?;
-    let response = report.clone().send(&client).await.context(ApiSnafu)?;
-    ctx.sync_from_client(&client);
-    ctx.save().context(ContextSnafu)?;
-    Ok(response)
+    ctx: &AppContext, report: &SecurityReportRequest,
+) -> Result<(BaseResponse<String>, Vec<StateChange>)> {
+    let client = ctx.tenant_client().context(ContextSnafu)?;
+    let (response, meta) = report
+        .clone()
+        .send_with_meta(client)
+        .await
+        .context(ApiSnafu)?;
+    let mut changes = Vec::new();
+    if let Some(cookies) = &meta.cookies {
+        changes.push(StateChange::CookiesUpdated {
+            cookies: cookies.clone(),
+        });
+    }
+    if let Some(csrf) = &meta.csrf_token {
+        changes.push(StateChange::CsrfTokenUpdated {
+            token: Some(csrf.clone()),
+        });
+    }
+    Ok((response, changes))
 }
 
 #[must_use]

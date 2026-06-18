@@ -2,16 +2,16 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rustylink_api::{
     ActivateInfo, ActivateRequest, BaseResponse, CommonStringResult,
     GetThirdPartyLoginLinksRequest, LoginResult, LoginV2Result, LogoutRequest,
-    OAuthCallbackRequest, OAuthQueryCallbackRequest, PasswordLoginRequest, SendCodeRequest,
-    SendableRequest, ThirdPartyLoginInfo, ThirdPartyTokenCheckRequest, V1LoginRequest,
-    V1LoginSkipRequest, V1MfaSendRequest, V1MfaVerifyRequest, V1SendCodeRequest,
+    OAuthCallbackRequest, OAuthQueryCallbackRequest, PasswordLoginRequest, ResponseMeta,
+    SendCodeRequest, SendableRequest, ThirdPartyLoginInfo, ThirdPartyTokenCheckRequest,
+    V1LoginRequest, V1LoginSkipRequest, V1MfaSendRequest, V1MfaVerifyRequest, V1SendCodeRequest,
     V1VerifyCodeRequest, VerifyCodeRequest, VerifyMfaRequest,
 };
 use sha2::{Digest as _, Sha256};
 use snafu::prelude::*;
 use uuid::Uuid;
 
-use crate::{AppContext, state::OAuthState};
+use crate::{AppContext, state::StateChange};
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
@@ -40,116 +40,149 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+// ---------------------------------------------------------------------------
+// Helpers for collecting state changes from response metadata
+// ---------------------------------------------------------------------------
+
+fn collect_meta_changes(meta: &ResponseMeta) -> Vec<StateChange> {
+    let mut changes = Vec::new();
+    if let Some(cookies) = &meta.cookies {
+        changes.push(StateChange::CookiesUpdated {
+            cookies: cookies.clone(),
+        });
+    }
+    if let Some(csrf) = &meta.csrf_token {
+        changes.push(StateChange::CsrfTokenUpdated {
+            token: Some(csrf.clone()),
+        });
+    }
+    if meta.is_force_logout {
+        changes.push(StateChange::SessionExpired);
+    }
+    changes
+}
+
+// ---------------------------------------------------------------------------
+// Activate
+// ---------------------------------------------------------------------------
+
 pub async fn activate(
-    ctx: &mut AppContext, code: Option<String>, base_url: Option<String>,
+    ctx: &AppContext, code: Option<String>, base_url: Option<String>,
     backup_url: Option<String>, match_base_url: Option<String>,
-) -> Result<Option<BaseResponse<ActivateInfo>>> {
+) -> Result<(Option<BaseResponse<ActivateInfo>>, Vec<StateChange>)> {
+    let mut changes = Vec::new();
+
+    // Apply URL overrides to a copy of tenant state
+    let mut tenant = ctx.state.tenant.clone();
     if let Some(value) = base_url {
-        ctx.state.tenant.base_url = Some(value);
+        tenant.base_url = Some(value);
     }
     if let Some(value) = backup_url {
-        ctx.state.tenant.backup_url = Some(value);
+        tenant.backup_url = Some(value);
     }
 
     let Some(code) = code else {
-        ctx.save().context(ContextSnafu)?;
-        return Ok(None);
+        // URL-only activation — just persist the tenant URLs
+        let mut signing = ctx.state.signing.clone();
+        signing.enabled = true;
+        changes.push(StateChange::TenantConfigured { tenant, signing });
+        return Ok((None, changes));
     };
 
-    ctx.state.signing.enabled = true;
-    ctx.state.signing.activation_code = Some(code.clone());
-    ctx.state.signing.device_id = Some(ctx.state.identity.device_id.clone());
-    let endpoint = ctx
-        .match_endpoint(match_base_url.as_deref())
-        .context(ContextSnafu)?;
-    let client = ctx
-        .api_client_for_endpoint(&endpoint)
-        .context(ContextSnafu)?;
-    let response = ActivateRequest { code }
-        .send(&client)
+    let mut signing = ctx.state.signing.clone();
+    signing.enabled = true;
+    signing.activation_code = Some(code.clone());
+    signing.device_id = Some(ctx.state.identity.device_id.clone());
+
+    let client = match match_base_url {
+        Some(url) => ctx.match_client_with_url(&url).context(ContextSnafu)?,
+        None => ctx.match_client().clone(),
+    };
+    let (response, meta) = ActivateRequest { code }
+        .send_with_meta(&client)
         .await
         .context(ApiSnafu)?;
-    ctx.sync_from_client(&client);
+    changes.extend(collect_meta_changes(&meta));
+
     if let Some(data) = &response.data {
-        merge_activation(ctx, data);
+        merge_activation(&mut tenant, data);
     }
-    ctx.save().context(ContextSnafu)?;
-    Ok(Some(response))
+    changes.push(StateChange::TenantConfigured { tenant, signing });
+
+    Ok((Some(response), changes))
 }
 
+// ---------------------------------------------------------------------------
+// Legacy login flow
+// ---------------------------------------------------------------------------
+
 pub async fn login_password(
-    ctx: &mut AppContext, login_scene: String, account_type: String, account: String,
+    ctx: &AppContext, login_scene: String, account_type: String, account: String,
     password: String,
-) -> Result<BaseResponse<LoginV2Result>> {
-    let client = ctx.api_client().context(ContextSnafu)?;
-    let response = PasswordLoginRequest::encrypted(login_scene, account_type, account, &password)
-        .context(ApiSnafu)?
-        .send(&client)
-        .await
-        .context(ApiSnafu)?;
-    ctx.sync_from_client(&client);
-    ctx.save().context(ContextSnafu)?;
-    Ok(response)
+) -> Result<(BaseResponse<LoginV2Result>, Vec<StateChange>)> {
+    let client = ctx.tenant_client().context(ContextSnafu)?;
+    let (response, meta) =
+        PasswordLoginRequest::encrypted(login_scene, account_type, account, &password)
+            .context(ApiSnafu)?
+            .send_with_meta(client)
+            .await
+            .context(ApiSnafu)?;
+    Ok((response, collect_meta_changes(&meta)))
 }
 
 pub async fn send_code(
-    ctx: &mut AppContext, login_scene: String, account_type: String, login_type: String,
+    ctx: &AppContext, login_scene: String, account_type: String, login_type: String,
     account: String,
-) -> Result<BaseResponse<CommonStringResult>> {
-    let client = ctx.api_client().context(ContextSnafu)?;
-    let response = SendCodeRequest {
+) -> Result<(BaseResponse<CommonStringResult>, Vec<StateChange>)> {
+    let client = ctx.tenant_client().context(ContextSnafu)?;
+    let (response, meta) = SendCodeRequest {
         login_scene,
         account_type,
         login_type,
         account,
     }
-    .send(&client)
+    .send_with_meta(client)
     .await
     .context(ApiSnafu)?;
-    ctx.sync_from_client(&client);
-    ctx.save().context(ContextSnafu)?;
-    Ok(response)
+    Ok((response, collect_meta_changes(&meta)))
 }
 
 pub async fn verify_code(
-    ctx: &mut AppContext, login_scene: String, account_type: String, login_type: String,
+    ctx: &AppContext, login_scene: String, account_type: String, login_type: String,
     account: String, code: String,
-) -> Result<BaseResponse<LoginV2Result>> {
-    let client = ctx.api_client().context(ContextSnafu)?;
-    let response = VerifyCodeRequest {
+) -> Result<(BaseResponse<LoginV2Result>, Vec<StateChange>)> {
+    let client = ctx.tenant_client().context(ContextSnafu)?;
+    let (response, meta) = VerifyCodeRequest {
         login_scene,
         account_type,
         login_type,
         account,
         code,
     }
-    .send(&client)
+    .send_with_meta(client)
     .await
     .context(ApiSnafu)?;
-    ctx.sync_from_client(&client);
-    ctx.save().context(ContextSnafu)?;
-    Ok(response)
+    Ok((response, collect_meta_changes(&meta)))
 }
 
 pub async fn verify_mfa(
-    ctx: &mut AppContext, login_scene: String, mfa_type: String, account: String,
+    ctx: &AppContext, login_scene: String, mfa_type: String, account: String,
     code: Option<String>, password: Option<String>,
-) -> Result<BaseResponse<LoginV2Result>> {
-    let client = ctx.api_client().context(ContextSnafu)?;
-    let response = VerifyMfaRequest::encrypted(login_scene, mfa_type, account, code, password)
-        .context(ApiSnafu)?
-        .send(&client)
-        .await
-        .context(ApiSnafu)?;
-    ctx.sync_from_client(&client);
-    ctx.save().context(ContextSnafu)?;
-    Ok(response)
+) -> Result<(BaseResponse<LoginV2Result>, Vec<StateChange>)> {
+    let client = ctx.tenant_client().context(ContextSnafu)?;
+    let (response, meta) =
+        VerifyMfaRequest::encrypted(login_scene, mfa_type, account, code, password)
+            .context(ApiSnafu)?
+            .send_with_meta(client)
+            .await
+            .context(ApiSnafu)?;
+    Ok((response, collect_meta_changes(&meta)))
 }
 
 pub fn start_oauth(
-    ctx: &mut AppContext, auth_url: &str, alias_key: String, state: Option<String>,
+    _ctx: &AppContext, auth_url: &str, alias_key: String, state: Option<String>,
     redirect_uri: &str,
-) -> Result<String> {
+) -> Result<(String, Vec<StateChange>)> {
     let state_value = state.unwrap_or_else(|| Uuid::new_v4().simple().to_string());
     let (code_verifier, code_challenge) = pkce_pair();
     let mut url = url::Url::parse(auth_url).context(InvalidUrlSnafu {
@@ -160,11 +193,12 @@ pub fn start_oauth(
         .append_pair("redirect_uri", redirect_uri)
         .append_pair("state", &state_value);
 
-    ctx.state.oauth.alias_key = Some(alias_key);
-    ctx.state.oauth.state = Some(state_value);
-    ctx.state.oauth.code_verifier = Some(code_verifier);
-    ctx.save().context(ContextSnafu)?;
-    Ok(url.to_string())
+    let changes = vec![StateChange::OAuthStateSet {
+        alias_key,
+        state: state_value,
+        code_verifier,
+    }];
+    Ok((url.to_string(), changes))
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -173,27 +207,35 @@ pub struct ThirdPartyLoginLinks {
     pub response: BaseResponse<Vec<ThirdPartyLoginInfo>>,
 }
 
-pub async fn third_party_login_links(ctx: &mut AppContext) -> Result<ThirdPartyLoginLinks> {
+pub async fn third_party_login_links(
+    ctx: &AppContext,
+) -> Result<(ThirdPartyLoginLinks, Vec<StateChange>)> {
     let (code_verifier, code_challenge) = pkce_pair();
-    let client = ctx.api_client().context(ContextSnafu)?;
-    let response = GetThirdPartyLoginLinksRequest {
+    let client = ctx.tenant_client().context(ContextSnafu)?;
+    let (response, meta) = GetThirdPartyLoginLinksRequest {
         code_challenge: code_challenge.clone(),
     }
-    .send(&client)
+    .send_with_meta(client)
     .await
     .context(ApiSnafu)?;
-    ctx.sync_from_client(&client);
-    ctx.state.oauth.code_verifier = Some(code_verifier);
-    ctx.save().context(ContextSnafu)?;
-    Ok(ThirdPartyLoginLinks {
-        code_challenge,
-        response,
-    })
+    let mut changes = collect_meta_changes(&meta);
+    changes.push(StateChange::OAuthStateSet {
+        alias_key: String::new(),
+        state: String::new(),
+        code_verifier,
+    });
+    Ok((
+        ThirdPartyLoginLinks {
+            code_challenge,
+            response,
+        },
+        changes,
+    ))
 }
 
 pub async fn oauth_callback(
-    ctx: &mut AppContext, alias_key: Option<String>, code: String, state: Option<String>,
-) -> Result<BaseResponse<LoginResult>> {
+    ctx: &AppContext, alias_key: Option<String>, code: String, state: Option<String>,
+) -> Result<(BaseResponse<LoginResult>, Vec<StateChange>)> {
     let alias_key = alias_key
         .or_else(|| ctx.state.oauth.alias_key.clone())
         .context(MissingOAuthVerifierSnafu)?;
@@ -206,47 +248,43 @@ pub async fn oauth_callback(
         .code_verifier
         .clone()
         .context(MissingOAuthVerifierSnafu)?;
-    let client = ctx.api_client().context(ContextSnafu)?;
-    let response = OAuthCallbackRequest {
+    let client = ctx.tenant_client().context(ContextSnafu)?;
+    let (response, meta) = OAuthCallbackRequest {
         alias_key,
         code,
         state,
         code_verifier: verifier,
     }
-    .send(&client)
+    .send_with_meta(client)
     .await
     .context(ApiSnafu)?;
-    ctx.sync_from_client(&client);
-    ctx.state.oauth = OAuthState::default();
-    ctx.save().context(ContextSnafu)?;
-    Ok(response)
+    let mut changes = collect_meta_changes(&meta);
+    changes.push(StateChange::OAuthCleared);
+    Ok((response, changes))
 }
 
 pub async fn oauth_query_callback(
-    ctx: &mut AppContext, alias: String, code: String, state: String,
-) -> Result<BaseResponse<LoginResult>> {
-    let client = ctx.api_client().context(ContextSnafu)?;
-    let response = OAuthQueryCallbackRequest { alias, code, state }
-        .send(&client)
+    ctx: &AppContext, alias: String, code: String, state: String,
+) -> Result<(BaseResponse<LoginResult>, Vec<StateChange>)> {
+    let client = ctx.tenant_client().context(ContextSnafu)?;
+    let (response, meta) = OAuthQueryCallbackRequest { alias, code, state }
+        .send_with_meta(client)
         .await
         .context(ApiSnafu)?;
-    ctx.sync_from_client(&client);
-    ctx.state.oauth = OAuthState::default();
-    ctx.save().context(ContextSnafu)?;
-    Ok(response)
+    let mut changes = collect_meta_changes(&meta);
+    changes.push(StateChange::OAuthCleared);
+    Ok((response, changes))
 }
 
 pub async fn check_third_party_login_token(
-    ctx: &mut AppContext, token: String,
-) -> Result<BaseResponse<LoginResult>> {
-    let client = ctx.api_client().context(ContextSnafu)?;
-    let response = ThirdPartyTokenCheckRequest { token }
-        .send(&client)
+    ctx: &AppContext, token: String,
+) -> Result<(BaseResponse<LoginResult>, Vec<StateChange>)> {
+    let client = ctx.tenant_client().context(ContextSnafu)?;
+    let (response, meta) = ThirdPartyTokenCheckRequest { token }
+        .send_with_meta(client)
         .await
         .context(ApiSnafu)?;
-    ctx.sync_from_client(&client);
-    ctx.save().context(ContextSnafu)?;
-    Ok(response)
+    Ok((response, collect_meta_changes(&meta)))
 }
 
 // ---------------------------------------------------------------------------
@@ -254,106 +292,95 @@ pub async fn check_third_party_login_token(
 // ---------------------------------------------------------------------------
 
 pub async fn v1_login_password(
-    ctx: &mut AppContext, login_scene: String, account_type: String, account: String,
+    ctx: &AppContext, login_scene: String, account_type: String, account: String,
     password: String,
-) -> Result<BaseResponse<LoginV2Result>> {
-    let client = ctx.api_client().context(ContextSnafu)?;
-    let response = V1LoginRequest::encrypted(login_scene, account_type, account, &password)
-        .context(ApiSnafu)?
-        .send(&client)
-        .await
-        .context(ApiSnafu)?;
-    ctx.sync_from_client(&client);
-    ctx.save().context(ContextSnafu)?;
-    Ok(response)
+) -> Result<(BaseResponse<LoginV2Result>, Vec<StateChange>)> {
+    let client = ctx.tenant_client().context(ContextSnafu)?;
+    let (response, meta) =
+        V1LoginRequest::encrypted(login_scene, account_type, account, &password)
+            .context(ApiSnafu)?
+            .send_with_meta(client)
+            .await
+            .context(ApiSnafu)?;
+    Ok((response, collect_meta_changes(&meta)))
 }
 
 pub async fn v1_send_code(
-    ctx: &mut AppContext, login_scene: String, account_type: String, login_type: String,
+    ctx: &AppContext, login_scene: String, account_type: String, login_type: String,
     account: String,
-) -> Result<BaseResponse<CommonStringResult>> {
-    let client = ctx.api_client().context(ContextSnafu)?;
-    let response = V1SendCodeRequest {
+) -> Result<(BaseResponse<CommonStringResult>, Vec<StateChange>)> {
+    let client = ctx.tenant_client().context(ContextSnafu)?;
+    let (response, meta) = V1SendCodeRequest {
         login_scene,
         account_type,
         login_type,
         account,
     }
-    .send(&client)
+    .send_with_meta(client)
     .await
     .context(ApiSnafu)?;
-    ctx.sync_from_client(&client);
-    ctx.save().context(ContextSnafu)?;
-    Ok(response)
+    Ok((response, collect_meta_changes(&meta)))
 }
 
 pub async fn v1_verify_code(
-    ctx: &mut AppContext, login_scene: String, account_type: String, login_type: String,
+    ctx: &AppContext, login_scene: String, account_type: String, login_type: String,
     account: String, code: String,
-) -> Result<BaseResponse<LoginV2Result>> {
-    let client = ctx.api_client().context(ContextSnafu)?;
-    let response = V1VerifyCodeRequest {
+) -> Result<(BaseResponse<LoginV2Result>, Vec<StateChange>)> {
+    let client = ctx.tenant_client().context(ContextSnafu)?;
+    let (response, meta) = V1VerifyCodeRequest {
         login_scene,
         account_type,
         login_type,
         account,
         code,
     }
-    .send(&client)
+    .send_with_meta(client)
     .await
     .context(ApiSnafu)?;
-    ctx.sync_from_client(&client);
-    ctx.save().context(ContextSnafu)?;
-    Ok(response)
+    Ok((response, collect_meta_changes(&meta)))
 }
 
 pub async fn v1_mfa_send(
-    ctx: &mut AppContext, login_scene: String, mfa_type: String, account: String,
-) -> Result<BaseResponse<CommonStringResult>> {
-    let client = ctx.api_client().context(ContextSnafu)?;
-    let response = V1MfaSendRequest {
+    ctx: &AppContext, login_scene: String, mfa_type: String, account: String,
+) -> Result<(BaseResponse<CommonStringResult>, Vec<StateChange>)> {
+    let client = ctx.tenant_client().context(ContextSnafu)?;
+    let (response, meta) = V1MfaSendRequest {
         login_scene,
         mfa_type,
         account,
     }
-    .send(&client)
+    .send_with_meta(client)
     .await
     .context(ApiSnafu)?;
-    ctx.sync_from_client(&client);
-    ctx.save().context(ContextSnafu)?;
-    Ok(response)
+    Ok((response, collect_meta_changes(&meta)))
 }
 
 pub async fn v1_mfa_verify(
-    ctx: &mut AppContext, login_scene: String, mfa_type: String, account: String,
+    ctx: &AppContext, login_scene: String, mfa_type: String, account: String,
     code: Option<String>, password: Option<String>,
-) -> Result<BaseResponse<LoginV2Result>> {
-    let client = ctx.api_client().context(ContextSnafu)?;
-    let response =
+) -> Result<(BaseResponse<LoginV2Result>, Vec<StateChange>)> {
+    let client = ctx.tenant_client().context(ContextSnafu)?;
+    let (response, meta) =
         V1MfaVerifyRequest::encrypted(login_scene, mfa_type, account, code, password)
             .context(ApiSnafu)?
-            .send(&client)
+            .send_with_meta(client)
             .await
             .context(ApiSnafu)?;
-    ctx.sync_from_client(&client);
-    ctx.save().context(ContextSnafu)?;
-    Ok(response)
+    Ok((response, collect_meta_changes(&meta)))
 }
 
 pub async fn v1_login_skip(
-    ctx: &mut AppContext, login_scene: String, account: String,
-) -> Result<BaseResponse<LoginV2Result>> {
-    let client = ctx.api_client().context(ContextSnafu)?;
-    let response = V1LoginSkipRequest {
+    ctx: &AppContext, login_scene: String, account: String,
+) -> Result<(BaseResponse<LoginV2Result>, Vec<StateChange>)> {
+    let client = ctx.tenant_client().context(ContextSnafu)?;
+    let (response, meta) = V1LoginSkipRequest {
         login_scene,
         account,
     }
-    .send(&client)
+    .send_with_meta(client)
     .await
     .context(ApiSnafu)?;
-    ctx.sync_from_client(&client);
-    ctx.save().context(ContextSnafu)?;
-    Ok(response)
+    Ok((response, collect_meta_changes(&meta)))
 }
 
 // ---------------------------------------------------------------------------
@@ -361,32 +388,31 @@ pub async fn v1_login_skip(
 // ---------------------------------------------------------------------------
 
 pub async fn logout(
-    ctx: &mut AppContext, logout_all: bool,
-) -> Result<BaseResponse<CommonStringResult>> {
-    let client = ctx.api_client().context(ContextSnafu)?;
-    let response = LogoutRequest { logout_all }
-        .send(&client)
+    ctx: &AppContext, logout_all: bool,
+) -> Result<(BaseResponse<CommonStringResult>, Vec<StateChange>)> {
+    let client = ctx.tenant_client().context(ContextSnafu)?;
+    let (response, meta) = LogoutRequest { logout_all }
+        .send_with_meta(client)
         .await
         .context(ApiSnafu)?;
-    ctx.sync_from_client(&client);
-    // Clear session state after logout
-    ctx.state.cookies = Default::default();
-    ctx.state.csrf_token = None;
-    ctx.state.knock_token = None;
-    ctx.state.oauth = OAuthState::default();
-    ctx.save().context(ContextSnafu)?;
-    Ok(response)
+    let mut changes = collect_meta_changes(&meta);
+    changes.push(StateChange::LoggedOut);
+    Ok((response, changes))
 }
 
-fn merge_activation(ctx: &mut AppContext, data: &ActivateInfo) {
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+fn merge_activation(tenant: &mut crate::state::TenantState, data: &ActivateInfo) {
     if let Some(host) = first_non_empty([data.activate_host.as_deref(), data.domain.as_deref()]) {
-        ctx.state.tenant.base_url = Some(host);
+        tenant.base_url = Some(host);
     }
     if let Some(host) = &data.activate_backup_domain {
-        ctx.state.tenant.backup_url = Some(host.clone());
+        tenant.backup_url = Some(host.clone());
     }
     if let Some(enable) = data.activate_enable_backup_domain {
-        ctx.state.tenant.use_backup = enable;
+        tenant.use_backup = enable;
     }
     if let Some(name) = first_non_empty([
         data.tenant_name.as_deref(),
@@ -394,7 +420,7 @@ fn merge_activation(ctx: &mut AppContext, data: &ActivateInfo) {
         data.zh_name.as_deref(),
         data.en_name.as_deref(),
     ]) {
-        ctx.state.tenant.name = Some(name);
+        tenant.name = Some(name);
     }
 }
 

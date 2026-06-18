@@ -1,0 +1,42 @@
+[package]
+edition.workspace = true
+name              = "rustylinkd"
+version.workspace = true
+
+[[bin]]
+name = "rustylinkd"
+path = "src/main.rs"
+
+[dependencies]
+rustylink-api.path    = "../api"
+rustylink-core.path   = "../core"
+rustylink-proto.path  = "../proto"
+rustylink-tunnel.path = "../tunnel"
+
+argon2.workspace                = true
+axum.workspace                  = true
+buffa.workspace                 = true
+buffa-types.workspace           = true
+clap.workspace                  = true
+connectrpc            = { workspace = true, features = ["axum"] }
+connectrpc-reflection.workspace = true
+default-net.workspace           = true
+dirs.workspace                  = true
+http.workspace                  = true
+jiff.workspace                  = true
+rand.workspace                  = true
+serde.workspace                 = true
+serde_json.workspace            = true
+snafu.workspace                 = true
+tokio.workspace                 = true
+tokio-stream.workspace          = true
+tokio-util.workspace            = true
+totp-rs.workspace               = true
+tower.workspace                 = true
+tower-http.workspace            = true
+tracing.workspace               = true
+tracing-subscriber.workspace    = true
+url.workspace                   = true
+
+[lints]
+workspace = true

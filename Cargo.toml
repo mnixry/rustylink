@@ -8,7 +8,9 @@ version = "0.1.0"
 
 [workspace.dependencies]
 aes                = "0.9.1"
+argon2             = "0.5.3"
 async-trait        = "0.1.89"
+axum               = "0.8.0"
 base64             = "0.22.1"
 bitflags           = "2.13.0"
 buffa              = { version = "0.7.1", features = ["json"] }
@@ -17,6 +19,7 @@ cbc                = "0.2.1"
 clap               = { version = "4.6.1", features = ["derive", "env"] }
 connectrpc         = "0.7.0"
 connectrpc-build   = "0.7.0"
+connectrpc-reflection = "0.7.0"
 default-net        = "0.22.0"
 dirs               = "6.0.0"
 etherparse         = "0.20.2"
@@ -31,6 +34,7 @@ machine-uid        = "0.6.0"
 qrcode             = { version = "0.14.1", default-features = false }
 rand               = "0.10.1"
 reqwest            = { version = "0.13.4", features = ["cookies", "json", "rustls"] }
+reqwest-middleware = "0.5.2"
 route_manager      = { version = "0.2.11", features = ["async"] }
 serde              = { version = "1.0.228", features = ["derive"] }
 serde_json         = "1.0.150"
@@ -41,6 +45,11 @@ snafu              = "0.9.1"
 socket2            = { version = "0.6.4", features = ["all"] }
 strum              = { version = "0.28.0", features = ["derive"] }
 tokio              = { version = "1.52.3", features = ["full"] }
+tokio-stream       = { version = "0.1.18", features = ["sync"] }
+tokio-util         = { version = "0.7.18", features = ["rt"] }
+totp-rs            = { version = "5.7.1", features = ["otpauth"] }
+tower              = "0.5.3"
+tower-http         = { version = "0.6.11", features = ["trace"] }
 tracing            = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 url                = { version = "2.5.8", features = ["serde"] }

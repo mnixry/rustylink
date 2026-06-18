@@ -14,10 +14,6 @@ message PingResponse {
   int64 uptime_seconds = 2;
 }
 
-message ShutdownRequest {
-  bool stop_vpn = 1;
-}
-
 message WatchStateRequest {}
 
 message WatchStateResponse {
