@@ -1,0 +1,173 @@
+syntax = "proto3";
+
+package rustylink.daemon.v1;
+
+import "rustylink/daemon/v1/configuration.proto";
+
+message Session {
+  enum State {
+    STATE_UNSPECIFIED = 0;
+    STATE_UNCONFIGURED = 1;
+    STATE_CONFIGURED = 2;
+    STATE_AUTHENTICATING = 3;
+    STATE_AUTHENTICATED = 4;
+    STATE_EXPIRED = 5;
+  }
+
+  State state = 1;
+  string tenant_name = 2;
+  string base_url = 3;
+  PendingChallenge pending_challenge = 4;
+  UserInfo user = 5;
+}
+
+message PendingChallenge {
+  oneof challenge {
+    OtpChallenge otp = 1;
+    MfaChallenge mfa = 2;
+    OauthChallenge oauth = 3;
+  }
+}
+
+message OtpChallenge {
+  string masked_target = 1;
+  string login_type = 2;
+}
+
+message MfaChallenge {
+  string mfa_type = 1;
+  repeated string auth_list = 2;
+  bool can_skip = 3;
+  string masked_mobile = 4;
+  string masked_email = 5;
+}
+
+message OauthChallenge {
+  string alias_key = 1;
+  string state = 2;
+  string poll_token = 3;
+}
+
+message GetSessionRequest {}
+
+message GetSessionResponse {
+  Session session = 1;
+}
+
+message ActivateRequest {
+  string code = 1;
+  string base_url = 2;
+  string backup_url = 3;
+  string match_base_url = 4;
+}
+
+message ActivateResponse {
+  Session session = 1;
+}
+
+message LoginRequest {
+  string account = 1;
+  string password = 2;
+  string login_scene = 3;
+  string account_type = 4;
+}
+
+message LoginResponse {
+  Session session = 1;
+}
+
+message RequestLoginCodeRequest {
+  string account = 1;
+  string login_type = 2;
+  string login_scene = 3;
+  string account_type = 4;
+}
+
+message RequestLoginCodeResponse {
+  string code = 1;
+}
+
+message VerifyLoginCodeRequest {
+  string account = 1;
+  string code = 2;
+  string login_type = 3;
+  string login_scene = 4;
+  string account_type = 5;
+}
+
+message VerifyLoginCodeResponse {
+  Session session = 1;
+}
+
+message RequestMfaCodeRequest {
+  string mfa_type = 1;
+  string account = 2;
+  string login_scene = 3;
+}
+
+message RequestMfaCodeResponse {
+  string code = 1;
+}
+
+message VerifyMfaRequest {
+  string mfa_type = 1;
+  string account = 2;
+  string code = 3;
+  string password = 4;
+  string login_scene = 5;
+}
+
+message VerifyMfaResponse {
+  Session session = 1;
+}
+
+message SkipPendingChallengeRequest {
+  string login_scene = 1;
+}
+
+message SkipPendingChallengeResponse {
+  Session session = 1;
+}
+
+message ListThirdPartyProvidersRequest {}
+
+message ListThirdPartyProvidersResponse {
+  repeated ThirdPartyProvider providers = 1;
+}
+
+message ThirdPartyProvider {
+  string alias_key = 1;
+  string name = 2;
+  string login_url = 3;
+  bool is_custom = 4;
+  bool supports_poll = 5;
+}
+
+message StartThirdPartyLoginRequest {
+  string alias_key = 1;
+  string redirect_uri = 2;
+}
+
+message StartThirdPartyLoginResponse {
+  string auth_url = 1;
+  string state = 2;
+  bool polling = 3;
+}
+
+message CompleteThirdPartyLoginRequest {
+  string alias_key = 1;
+  string code = 2;
+  string state = 3;
+}
+
+message CompleteThirdPartyLoginResponse {
+  Session session = 1;
+}
+
+message LogoutRequest {
+  bool logout_all = 1;
+}
+
+message LogoutResponse {
+  Session session = 1;
+}

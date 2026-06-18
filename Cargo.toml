@@ -11,8 +11,12 @@ aes                = "0.9.1"
 async-trait        = "0.1.89"
 base64             = "0.22.1"
 bitflags           = "2.13.0"
+buffa              = { version = "0.7.1", features = ["json"] }
+buffa-types        = { version = "0.7.1", features = ["json"] }
 cbc                = "0.2.1"
 clap               = { version = "4.6.1", features = ["derive", "env"] }
+connectrpc         = "0.7.0"
+connectrpc-build   = "0.7.0"
 default-net        = "0.22.0"
 dirs               = "6.0.0"
 etherparse         = "0.20.2"
@@ -20,10 +24,10 @@ hex                = "0.4.3"
 hickory-proto      = "0.26.1"
 hmac               = "0.13.0"
 http               = "1.4.2"
+http-body          = "1.0.1"
 ipnetwork          = "0.21.1"
 jiff               = "0.2.28"
 machine-uid        = "0.6.0"
-prost              = "0.14.4"
 qrcode             = { version = "0.14.1", default-features = false }
 rand               = "0.10.1"
 reqwest            = { version = "0.13.4", features = ["cookies", "json", "rustls"] }

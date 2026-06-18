@@ -6,8 +6,8 @@ use cbc::{
     cipher::{BlockModeEncrypt, KeyIvInit, block_padding::Pkcs7},
 };
 use hmac::{Hmac, KeyInit, Mac};
-use prost::Message;
 use reqwest::header::HeaderMap;
+use rustylink_proto::{buffa::Message, proto::rustylink::signing::v1::HttpSignHeader};
 use serde::{Deserialize, Serialize};
 use sha1::Sha1;
 use sha2::{Digest as _, Sha256};
@@ -20,16 +20,6 @@ const AES_CBC_BLOCK_SIZE: usize = 16;
 const DEFAULT_ROOT_KEY_VERSION: u64 = 1;
 const FIXED_PASSWORD_KEY: &str = "8bfa9ad090fbbf87e518f1ce24a93eee";
 const HTTP_SIGN_HKDF_SECRET: &[u8] = b"ygicehnydny4fj";
-
-#[derive(Clone, Deserialize, Serialize, prost::Message)]
-struct HttpSignHeader {
-    #[prost(uint64, tag = "1")]
-    pub root_key_version: u64,
-    #[prost(uint64, tag = "3")]
-    pub signing_input_params: u64,
-    #[prost(bytes, tag = "4")]
-    pub signing_result: Vec<u8>,
-}
 
 bitflags! {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -359,6 +349,7 @@ fn encode_http_sign_header(
         root_key_version,
         signing_input_params: signing_input_flags.bits(),
         signing_result: signing_result.to_vec(),
+        ..HttpSignHeader::default()
     }
     .encode_to_vec()
 }
@@ -366,8 +357,8 @@ fn encode_http_sign_header(
 #[cfg(test)]
 mod tests {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
-    use prost::Message;
     use reqwest::header::{HeaderMap, HeaderValue};
+    use rustylink_proto::buffa::Message;
     use sha2::{Digest as _, Sha256};
     use url::Url;
 
@@ -397,7 +388,7 @@ mod tests {
     fn http_sign_header_uses_evidenced_proto_fields() {
         let signature = Sha256::digest(b"signing result").to_vec();
         let encoded = encode_http_sign_header(1, default_signing_input_flags(), &signature);
-        let decoded = HttpSignHeader::decode(encoded.as_slice()).unwrap();
+        let decoded = HttpSignHeader::decode_from_slice(&encoded).unwrap();
         assert_eq!(decoded.root_key_version, 1);
         assert_eq!(
             decoded.signing_input_params,

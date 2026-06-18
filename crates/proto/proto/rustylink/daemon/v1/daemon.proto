@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+package rustylink.daemon.v1;
+
+import "rustylink/daemon/v1/configuration.proto";
+import "rustylink/daemon/v1/meta.proto";
+import "rustylink/daemon/v1/session.proto";
+import "rustylink/daemon/v1/tunnel.proto";
+
+service RustylinkService {
+  rpc Ping(PingRequest) returns (PingResponse);
+  rpc WatchState(WatchStateRequest) returns (stream WatchStateResponse);
+
+  rpc GetSession(GetSessionRequest) returns (GetSessionResponse);
+  rpc Activate(ActivateRequest) returns (ActivateResponse);
+  rpc Login(LoginRequest) returns (LoginResponse);
+  rpc RequestLoginCode(RequestLoginCodeRequest) returns (RequestLoginCodeResponse);
+  rpc VerifyLoginCode(VerifyLoginCodeRequest) returns (VerifyLoginCodeResponse);
+  rpc RequestMfaCode(RequestMfaCodeRequest) returns (RequestMfaCodeResponse);
+  rpc VerifyMfa(VerifyMfaRequest) returns (VerifyMfaResponse);
+  rpc SkipPendingChallenge(SkipPendingChallengeRequest) returns (SkipPendingChallengeResponse);
+  rpc ListThirdPartyProviders(ListThirdPartyProvidersRequest) returns (ListThirdPartyProvidersResponse);
+  rpc StartThirdPartyLogin(StartThirdPartyLoginRequest) returns (StartThirdPartyLoginResponse);
+  rpc CompleteThirdPartyLogin(CompleteThirdPartyLoginRequest) returns (CompleteThirdPartyLoginResponse);
+  rpc Logout(LogoutRequest) returns (LogoutResponse);
+
+  rpc GetTunnel(GetTunnelRequest) returns (GetTunnelResponse);
+  rpc ConnectTunnel(ConnectTunnelRequest) returns (ConnectTunnelResponse);
+  rpc DisconnectTunnel(DisconnectTunnelRequest) returns (DisconnectTunnelResponse);
+  rpc ListVpnLocations(ListVpnLocationsRequest) returns (ListVpnLocationsResponse);
+
+  rpc GetUserInfo(GetUserInfoRequest) returns (GetUserInfoResponse);
+  rpc GetConfiguration(GetConfigurationRequest) returns (GetConfigurationResponse);
+  rpc UpdateConfiguration(UpdateConfigurationRequest) returns (UpdateConfigurationResponse);
+}

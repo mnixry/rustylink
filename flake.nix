@@ -84,6 +84,9 @@
               [
                 cargo-edit
                 cargo-nextest
+
+                buf
+                protobuf
               ]
               ++ lib.optionals stdenv.isLinux [
                 llvmPackages.bolt

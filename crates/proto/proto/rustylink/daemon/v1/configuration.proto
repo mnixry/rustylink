@@ -1,0 +1,73 @@
+syntax = "proto3";
+
+package rustylink.daemon.v1;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/field_mask.proto";
+
+message UserInfo {
+  string uid = 1;
+  string name = 2;
+  string email = 3;
+  string mobile = 4;
+}
+
+message GetUserInfoRequest {}
+
+message GetUserInfoResponse {
+  UserInfo user_info = 1;
+}
+
+message Configuration {
+  OutboundInterface outbound_interface = 1;
+  DeviceIdentity device_identity = 2;
+  SecurityReport security_report = 3;
+  bool auto_reconnect_on_start = 4;
+}
+
+message OutboundInterface {
+  oneof selector {
+    google.protobuf.Empty auto = 1;
+    string name = 2;
+  }
+}
+
+message DeviceIdentity {
+  optional string os = 1;
+  optional string os_version = 2;
+  optional string app_version = 3;
+  optional string brand = 4;
+  optional string model = 5;
+  optional string device_id = 6;
+  optional string build_number = 7;
+  optional string os_version_patch = 8;
+  optional string client_source = 9;
+  optional string language = 10;
+  optional string user_agent = 11;
+}
+
+message SecurityReport {
+  repeated SecurityReportItem items = 1;
+  optional string status = 2;
+}
+
+message SecurityReportItem {
+  string key = 1;
+  int32 level = 2;
+  optional string data = 3;
+}
+
+message GetConfigurationRequest {}
+
+message GetConfigurationResponse {
+  Configuration configuration = 1;
+}
+
+message UpdateConfigurationRequest {
+  Configuration configuration = 1;
+  google.protobuf.FieldMask update_mask = 2;
+}
+
+message UpdateConfigurationResponse {
+  Configuration configuration = 1;
+}
