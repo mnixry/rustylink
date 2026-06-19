@@ -1,8 +1,8 @@
 //! `rustylinkd` — the Rustylink Connect RPC daemon.
 //!
 //! Owns auth state (statig), VPN state, and config; persists them as JSON.
-//! Binds a Connect + gRPC + gRPC-Web endpoint on loopback (enforced at bind
-//! time), guarded by a bearer token and a restrictive CORS layer.
+//! Serves a Connect + gRPC + gRPC-Web endpoint under the `/api` path prefix,
+//! guarded by a bearer token and a restrictive CORS layer.
 //!
 //! Three RPC services are registered:
 //!   - `AuthService`  — authentication & session management
@@ -73,15 +73,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_writer(std::io::stderr)
         .init();
 
-    // Network isolation: only ever bind loopback.
-    if !args.listen.ip().is_loopback() {
-        return Err(format!(
-            "refusing to bind non-loopback address {}; rustylinkd only listens on loopback",
-            args.listen
-        )
-        .into());
-    }
-
     let config_path = args.config_path.unwrap_or_else(default_config_path);
     let credential_path = args.credential_path.unwrap_or_else(default_credential_path);
 
@@ -114,33 +105,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let auth = AuthState::new(token_hash);
 
-    // Layer stack (outermost first): stamp a request id, open a tracing span
-    // carrying it, reject cross-origin browser requests (CORS), verify the
-    // bearer token, then echo the id on the way out.
-    let app = axum::Router::new()
-        .fallback_service(router.into_axum_service())
-        .layer(
-            ServiceBuilder::new()
-                .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
-                .layer(TraceLayer::new_for_http().make_span_with(
-                    |request: &axum::extract::Request| {
-                        let request_id = request
-                            .headers()
-                            .get("x-request-id")
-                            .and_then(|value| value.to_str().ok())
-                            .unwrap_or_default();
-                        tracing::info_span!(
-                            "request",
-                            method = %request.method(),
-                            uri = %request.uri(),
-                            request_id,
-                        )
-                    },
-                ))
-                .layer(CorsLayer::new())
-                .layer(ValidateRequestHeaderLayer::custom(auth))
-                .layer(PropagateRequestIdLayer::x_request_id()),
-        );
+    // The Connect RPC surface, guarded by CORS + bearer auth, mounted under
+    // `/api` (the prefix is stripped before the Connect service, so wire paths
+    // stay `/rustylink.daemon.v1.<Service>/<Method>`). Auth applies ONLY here —
+    // static UI assets must load without a token so the user can enter it.
+    let api = router.into_axum_router().layer(
+        ServiceBuilder::new()
+            .layer(CorsLayer::new())
+            .layer(ValidateRequestHeaderLayer::custom(auth)),
+    );
+
+    let app = axum::Router::new().nest("/api", api);
+
+    // Outer layers wrap everything: stamp a request id, open a tracing span
+    // carrying it, then echo the id on the way out.
+    let app = app.layer(
+        ServiceBuilder::new()
+            .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
+            .layer(
+                TraceLayer::new_for_http().make_span_with(|request: &axum::extract::Request| {
+                    let request_id = request
+                        .headers()
+                        .get("x-request-id")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default();
+                    tracing::info_span!(
+                        "request",
+                        method = %request.method(),
+                        uri = %request.uri(),
+                        request_id,
+                    )
+                }),
+            )
+            .layer(PropagateRequestIdLayer::x_request_id()),
+    );
 
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     tracing::info!(addr = %args.listen, "rustylinkd listening");

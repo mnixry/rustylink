@@ -2,12 +2,11 @@
 //! [`ValidateRequest`] so it composes as a standard
 //! `ValidateRequestHeaderLayer`.
 //!
-//! Network isolation is provided by binding the listener to loopback (see
-//! `main`), and browser-based cross-origin / DNS-rebinding attacks are blocked
-//! by a restrictive CORS layer.  This layer's sole job is to verify the
-//! `Authorization: Bearer` token against the stored argon2 hash, with a
-//! verified-token cache to avoid paying the argon2 cost on every request
-//! (verify-once-per-token, per D11).
+//! Browser-based cross-origin / DNS-rebinding attacks are blocked by a
+//! restrictive CORS layer, and this layer is mounted only under `/api`. Its
+//! sole job is to verify the `Authorization: Bearer` token against the stored
+//! argon2 hash, with a verified-token cache to avoid paying the argon2 cost on
+//! every request (verify-once-per-token, per D11).
 
 use std::sync::{Arc, Mutex};
 
