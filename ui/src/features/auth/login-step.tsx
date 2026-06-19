@@ -1,5 +1,4 @@
 import { useMutation, useQuery } from "@connectrpc/connect-query"
-import { QrCodeIcon } from "@phosphor-icons/react"
 import { useState } from "react"
 import { toast } from "sonner"
 import { Button } from "@/components/ui/button"
@@ -18,52 +17,55 @@ import {
   listThirdPartyProviders,
   login,
   requestLoginCode,
-  startDeviceLogin,
   startThirdPartyLogin,
+  verifyLoginCode,
 } from "@/gen/rustylink/daemon/v1/daemon-AuthService_connectquery"
 import type { Session } from "@/gen/rustylink/daemon/v1/session_pb"
-import { useApplySession } from "@/hooks/use-session"
+import { useApplySession, useRefreshSession } from "@/hooks/use-session"
 import { errorMessage } from "@/lib/errors"
 import { useAuthScratch } from "./auth-context"
 import { AuthShell } from "./auth-shell"
 
+// The daemon builds OAuth authorize URLs whose redirect targets the app's
+// custom scheme (corplink://). Browsers can't follow that, so the user copies
+// the code from the redirected URL and pastes it on the OAuth step.
+const REDIRECT_URI = "corplink://login/callback"
+
 export function LoginStep({ session }: { session: Session }) {
   const applySession = useApplySession()
+  const refreshSession = useRefreshSession()
   const { account, password, setAccount, setPassword } = useAuthScratch()
-  const [codeType, setCodeType] = useState("sms")
+  const [codeType, setCodeType] = useState("mobile")
+  const [code, setCode] = useState("")
 
-  const onSession = (s?: Session) => {
-    if (s) {
-      applySession(s)
-    }
-  }
   const onError = (err: unknown) => toast.error(errorMessage(err))
+  const onSession = (s?: Session) => s && applySession(s)
 
   const loginMut = useMutation(login, {
     onSuccess: (res) => onSession(res.session),
     onError,
   })
-  const codeMut = useMutation(requestLoginCode, {
-    onSuccess: () => toast.success("Verification code requested"),
+  const sendCodeMut = useMutation(requestLoginCode, {
+    onSuccess: () => toast.success("Verification code sent"),
+    onError,
+  })
+  const verifyCodeMut = useMutation(verifyLoginCode, {
+    onSuccess: (res) => onSession(res.session),
     onError,
   })
   const oauthMut = useMutation(startThirdPartyLogin, {
-    onSuccess: (res) => {
+    onSuccess: async (res) => {
       if (res.authUrl) {
         window.open(res.authUrl, "_blank", "noopener")
       }
+      // StartThirdPartyLogin returns no session; refetch to reach AWAITING_OAUTH.
+      await refreshSession()
     },
-    onError,
-  })
-  const deviceMut = useMutation(startDeviceLogin, {
-    onSuccess: (res) => onSession(res.session),
     onError,
   })
 
   const providers = useQuery(listThirdPartyProviders, {})
-
-  const pollProvider = providers.data?.providers.find((p) => p.supportsPoll)
-  const pending = loginMut.isPending || codeMut.isPending
+  const providerList = providers.data?.providers ?? []
 
   return (
     <AuthShell
@@ -108,7 +110,7 @@ export function LoginStep({ session }: { session: Session }) {
             <Button
               type="submit"
               className="w-full"
-              disabled={pending || !account || !password}
+              disabled={loginMut.isPending || !account || !password}
             >
               {loginMut.isPending ? "Signing in…" : "Sign in"}
             </Button>
@@ -116,49 +118,75 @@ export function LoginStep({ session }: { session: Session }) {
         </TabsContent>
 
         <TabsContent value="code" className="space-y-4 pt-4">
-          <form
-            className="space-y-4"
-            onSubmit={(e) => {
-              e.preventDefault()
-              codeMut.mutate({ account, loginType: codeType })
-            }}
-          >
-            <div className="space-y-2">
-              <Label htmlFor="code-account">Account</Label>
-              <Input
-                id="code-account"
-                placeholder="email or phone"
-                value={account}
-                onChange={(e) => setAccount(e.target.value)}
-              />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="code-type">Delivery</Label>
-              <Select
-                value={codeType}
-                onValueChange={(v) => setCodeType(v ?? "sms")}
-              >
-                <SelectTrigger id="code-type" className="w-full">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="sms">Text message (SMS)</SelectItem>
-                  <SelectItem value="email">Email</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-            <Button
-              type="submit"
-              className="w-full"
-              disabled={pending || !account}
+          <div className="space-y-2">
+            <Label htmlFor="code-account">Account</Label>
+            <Input
+              id="code-account"
+              placeholder="email or phone"
+              value={account}
+              onChange={(e) => setAccount(e.target.value)}
+            />
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="code-type">Delivery</Label>
+            <Select
+              value={codeType}
+              onValueChange={(v) => setCodeType(v ?? "mobile")}
             >
-              {codeMut.isPending ? "Sending…" : "Send code"}
-            </Button>
-          </form>
+              <SelectTrigger id="code-type" className="w-full">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="mobile">Text message (SMS)</SelectItem>
+                <SelectItem value="email">Email</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="space-y-2">
+            <Label htmlFor="code-input">Verification code</Label>
+            <div className="flex gap-2">
+              <Input
+                id="code-input"
+                inputMode="numeric"
+                autoComplete="one-time-code"
+                value={code}
+                onChange={(e) => setCode(e.target.value)}
+              />
+              <Button
+                type="button"
+                variant="outline"
+                disabled={sendCodeMut.isPending || !account}
+                onClick={() =>
+                  sendCodeMut.mutate({
+                    account,
+                    loginType: codeType,
+                    accountType: codeType,
+                  })
+                }
+              >
+                {sendCodeMut.isPending ? "Sending…" : "Send code"}
+              </Button>
+            </div>
+          </div>
+          <Button
+            type="button"
+            className="w-full"
+            disabled={verifyCodeMut.isPending || !account || !code}
+            onClick={() =>
+              verifyCodeMut.mutate({
+                account,
+                code,
+                loginType: codeType,
+                accountType: codeType,
+              })
+            }
+          >
+            {verifyCodeMut.isPending ? "Signing in…" : "Sign in"}
+          </Button>
         </TabsContent>
       </Tabs>
 
-      {providers.data && providers.data.providers.length > 0 ? (
+      {providerList.length > 0 ? (
         <div className="mt-6 space-y-3">
           <div className="flex items-center gap-3">
             <Separator className="flex-1" />
@@ -168,7 +196,7 @@ export function LoginStep({ session }: { session: Session }) {
             <Separator className="flex-1" />
           </div>
           <div className="grid gap-2">
-            {providers.data.providers.map((provider) => (
+            {providerList.map((provider) => (
               <Button
                 key={provider.aliasKey}
                 variant="outline"
@@ -176,7 +204,7 @@ export function LoginStep({ session }: { session: Session }) {
                 onClick={() =>
                   oauthMut.mutate({
                     aliasKey: provider.aliasKey,
-                    redirectUri: `${window.location.origin}/auth`,
+                    redirectUri: REDIRECT_URI,
                   })
                 }
               >
@@ -184,19 +212,6 @@ export function LoginStep({ session }: { session: Session }) {
               </Button>
             ))}
           </div>
-          {pollProvider ? (
-            <Button
-              variant="ghost"
-              className="w-full"
-              disabled={deviceMut.isPending}
-              onClick={() =>
-                deviceMut.mutate({ aliasKey: pollProvider.aliasKey })
-              }
-            >
-              <QrCodeIcon className="size-4" weight="duotone" />
-              Sign in with a QR code
-            </Button>
-          ) : null}
         </div>
       ) : null}
     </AuthShell>

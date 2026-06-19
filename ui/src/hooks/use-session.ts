@@ -51,4 +51,17 @@ export function useApplySession() {
   }
 }
 
+// Force a re-fetch of the session. Used after RPCs that change daemon auth
+// state without returning a session (e.g. StartThirdPartyLogin).
+export function useRefreshSession() {
+  const queryClient = useQueryClient()
+  return () =>
+    queryClient.invalidateQueries({
+      queryKey: createConnectQueryKey({
+        schema: getSession,
+        cardinality: "finite",
+      }),
+    })
+}
+
 export { Session_State }

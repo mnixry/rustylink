@@ -1,11 +1,10 @@
 import { useMutation } from "@connectrpc/connect-query"
-import { ArrowSquareOutIcon, SpinnerIcon } from "@phosphor-icons/react"
+import { ArrowSquareOutIcon } from "@phosphor-icons/react"
 import { type FormEvent, useState } from "react"
 import { toast } from "sonner"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { Separator } from "@/components/ui/separator"
 import {
   completeThirdPartyLogin,
   logout,
@@ -15,10 +14,31 @@ import { useApplySession } from "@/hooks/use-session"
 import { errorMessage } from "@/lib/errors"
 import { AuthShell } from "./auth-shell"
 
+// Accept either the full redirect URL (corplink://login/callback?code=…&state=…)
+// or a bare code. Returns the extracted code and state (falling back to the
+// challenge's state when the pasted value has none).
+function parseRedirect(
+  input: string,
+  fallbackState: string
+): { code: string; state: string } {
+  const trimmed = input.trim()
+  if (trimmed.includes("code=")) {
+    const query = trimmed.includes("?")
+      ? trimmed.slice(trimmed.indexOf("?") + 1)
+      : trimmed
+    const params = new URLSearchParams(query)
+    const code = params.get("code")
+    if (code) {
+      return { code, state: params.get("state") ?? fallbackState }
+    }
+  }
+  return { code: trimmed, state: fallbackState }
+}
+
 export function OauthStep({ session }: { session: Session }) {
   const challenge = session.oauthChallenge
   const applySession = useApplySession()
-  const [code, setCode] = useState("")
+  const [value, setValue] = useState("")
 
   const onError = (err: unknown) => toast.error(errorMessage(err))
   const complete = useMutation(completeThirdPartyLogin, {
@@ -32,50 +52,40 @@ export function OauthStep({ session }: { session: Session }) {
 
   const onSubmit = (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault()
+    const { code, state } = parseRedirect(value, challenge?.state ?? "")
     complete.mutate({
       aliasKey: challenge?.aliasKey ?? "",
       code,
-      state: challenge?.state ?? "",
+      state,
     })
   }
 
   return (
     <AuthShell
       tenant={session.tenantName}
-      title="Waiting for sign-in"
-      description="Complete authentication in the browser window that opened. This page updates automatically."
+      title="Finish single sign-on"
+      description="Complete authentication in the window that opened. You'll be redirected to a corplink:// link that the browser can't follow — copy that link (or the code in it) and paste it below."
     >
-      <div className="flex items-center justify-center py-6 text-muted-foreground">
-        <SpinnerIcon className="size-8 animate-spin" weight="duotone" />
-      </div>
-
-      <div className="flex items-center gap-3 py-2">
-        <Separator className="flex-1" />
-        <span className="text-muted-foreground text-xs">
-          or paste the authorization code
-        </span>
-        <Separator className="flex-1" />
-      </div>
-
-      <form className="space-y-3" onSubmit={onSubmit}>
+      <form className="space-y-4" onSubmit={onSubmit}>
         <div className="space-y-2">
-          <Label htmlFor="oauth-code">Authorization code</Label>
+          <Label htmlFor="oauth-redirect">Redirect URL or code</Label>
           <Input
-            id="oauth-code"
-            value={code}
-            onChange={(e) => setCode(e.target.value)}
+            id="oauth-redirect"
+            autoFocus
+            placeholder="corplink://login/callback?code=…&state=…"
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
           />
         </div>
         <Button
           type="submit"
           className="w-full"
-          disabled={complete.isPending || !code}
+          disabled={complete.isPending || !value.trim()}
         >
           <ArrowSquareOutIcon className="size-4" weight="duotone" />
           {complete.isPending ? "Completing…" : "Complete sign-in"}
         </Button>
       </form>
-
       <Button
         type="button"
         variant="ghost"
