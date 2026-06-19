@@ -103,6 +103,25 @@ pub struct SessionCookies {
     pub values: BTreeMap<String, String>,
 }
 
+impl SessionCookies {
+    /// Build from a proto `map<string, string>` (`HashMap`).
+    #[must_use]
+    pub fn from_map(map: &std::collections::HashMap<String, String>) -> Self {
+        Self {
+            values: map.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+        }
+    }
+
+    /// Convert to a proto-compatible `HashMap`.
+    #[must_use]
+    pub fn to_map(&self) -> std::collections::HashMap<String, String> {
+        self.values
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Response metadata — extracted from HTTP response headers
 // ---------------------------------------------------------------------------
@@ -128,7 +147,7 @@ pub struct ResponseMeta {
 // ---------------------------------------------------------------------------
 
 /// Request-decoration hooks (snapshot). All fields are plain owned values.
-/// A new `ApiHooks` is built from the current `RustylinkState` each time the
+/// A new `ApiHooks` is built from the current `PersistedState` each time the
 /// actor refreshes the `AppContext`.
 #[derive(Clone, Debug)]
 pub struct ApiHooks {
@@ -390,8 +409,7 @@ impl DotEndpoint {
 /// The returned client is the shared connection pool — clone it (cheap; it is
 /// `Arc`-backed) into each [`ApiClient`] for connection/TLS reuse.
 pub fn build_http_client(options: &ApiClientOptions) -> Result<reqwest::Client> {
-    let mut builder =
-        reqwest::Client::builder().redirect(reqwest::redirect::Policy::limited(10));
+    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::limited(10));
     if let Some(interface) = options.outbound_interface.as_deref() {
         tracing::debug!(
             outbound_interface = interface,
@@ -411,7 +429,9 @@ impl ApiClient {
     /// shared connection `pool` with a [`SigningMiddleware`] carrying the
     /// given auth hooks snapshot.  This is the canonical constructor.
     #[must_use]
-    pub fn for_endpoint(endpoint: &impl ApiEndpoint, pool: reqwest::Client, hooks: ApiHooks) -> Self {
+    pub fn for_endpoint(
+        endpoint: &impl ApiEndpoint, pool: reqwest::Client, hooks: ApiHooks,
+    ) -> Self {
         let base_url = endpoint.base_url().clone();
         let request_cookies = hooks.cookies.clone();
         let http = ClientBuilder::new(pool)
@@ -428,8 +448,7 @@ impl ApiClient {
     /// Send a typed request and return only the decoded response body.
     pub async fn send<R>(&self, request: R) -> Result<R::Response>
     where
-        R: SendableRequest,
-    {
+        R: SendableRequest, {
         let (response, _meta) = self.send_with_meta(request).await?;
         Ok(response)
     }
@@ -438,8 +457,7 @@ impl ApiClient {
     /// [`ResponseMeta`] (cookies, CSRF, Date header, force-logout flag).
     pub async fn send_with_meta<R>(&self, request: R) -> Result<(R::Response, ResponseMeta)>
     where
-        R: SendableRequest,
-    {
+        R: SendableRequest, {
         let (response_body, meta) = self.execute(request).await?;
         let decoded = decode_response::<R::Response>(&response_body)?;
         check_api_status(&decoded, &response_body)?;
@@ -452,8 +470,7 @@ impl ApiClient {
 
     async fn execute<R>(&self, request: R) -> Result<(Vec<u8>, ResponseMeta)>
     where
-        R: SendableRequest,
-    {
+        R: SendableRequest, {
         let url = endpoint_url(&self.base_url, request.path().as_ref())?;
         let endpoint_query = request.query_pairs();
         let body = request.body().context(EncodeSnafu)?;
@@ -490,18 +507,6 @@ impl ApiClient {
             .fail();
         }
         Ok((bytes, meta))
-    }
-}
-
-impl ApiClientOptions {
-    #[must_use]
-    pub fn from_env() -> Self {
-        Self {
-            outbound_interface: std::env::var("RUSTYLINK_OUTBOUND_INTERFACE")
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty()),
-        }
     }
 }
 
@@ -580,8 +585,7 @@ fn endpoint_url(base_url: &Url, path: &str) -> Result<Url> {
 
 fn decode_response<T>(bytes: &[u8]) -> Result<T>
 where
-    T: serde::de::DeserializeOwned,
-{
+    T: serde::de::DeserializeOwned, {
     serde_json::from_slice(bytes).context(DecodeSnafu {
         content: response_content(bytes),
     })
@@ -617,11 +621,12 @@ fn check_api_status(response: &impl ApiResponse, body: &[u8]) -> Result<()> {
 fn map_middleware_error(error: reqwest_middleware::Error) -> Error {
     match error {
         reqwest_middleware::Error::Reqwest(source) => Error::Request { source },
-        reqwest_middleware::Error::Middleware(err) => err
-            .downcast::<Error>()
-            .unwrap_or_else(|err| Error::MiddlewareFailed {
-                message: err.to_string(),
-            }),
+        reqwest_middleware::Error::Middleware(err) => {
+            err.downcast::<Error>()
+                .unwrap_or_else(|err| Error::MiddlewareFailed {
+                    message: err.to_string(),
+                })
+        }
     }
 }
 

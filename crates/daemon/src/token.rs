@@ -12,8 +12,7 @@ use argon2::{
 /// Generate a fresh 256-bit bearer token, hex-encoded.
 #[must_use]
 pub fn generate_token() -> String {
-    let bytes: [u8; 32] = rand::random();
-    hex_encode(&bytes)
+    hex::encode(rand::random::<[u8; 32]>())
 }
 
 /// Hash a token with argon2id, returning a PHC-format string.
@@ -35,13 +34,4 @@ pub fn verify_token(token: &str, hash: &str) -> bool {
     Argon2::default()
         .verify_password(token.as_bytes(), &parsed)
         .is_ok()
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(char::from_digit(u32::from(byte >> 4), 16).unwrap_or('0'));
-        out.push(char::from_digit(u32::from(byte & 0x0F), 16).unwrap_or('0'));
-    }
-    out
 }

@@ -1,0 +1,191 @@
+syntax = "proto3";
+
+package rustylink.daemon.persist.v1;
+
+import "google/protobuf/timestamp.proto";
+import "rustylink/daemon/v1/configuration.proto";
+import "rustylink/daemon/v1/session.proto";
+import "rustylink/daemon/v1/types.proto";
+
+// On-disk persistence schema.  The state IS the state machine: a two-level
+// proto oneof where each variant carries exactly the data valid in that state,
+// and only the data needed to proceed to the next state.  Invalid combinations
+// (e.g. VPN Connected while Unconfigured) are unrepresentable.
+//
+// Serialized with buffa JSON (camelCase, RFC 3339 timestamps, enum names).
+// Carries secrets (cookies, signing keys, TOTP, OAuth verifier, token hash);
+// file is written mode 0600.
+message PersistedState {
+  // ---- shared across every auth state ----
+  uint32 version = 1;
+  google.protobuf.Timestamp updated_at = 2;
+  optional string token_hash = 3;
+  PersistedIdentity identity = 4;
+  rustylink.daemon.v1.OutboundInterface outbound_interface = 5;
+  bool auto_reconnect_on_start = 6;
+
+  // ---- two-level state oneof ----
+  oneof auth_state {
+    PersistedUnconfigured unconfigured = 10;
+    PersistedConfigured configured = 11;
+    PersistedAuthenticating authenticating = 12;
+    PersistedAuthenticated authenticated = 13;
+    PersistedExpired expired = 14;
+  }
+}
+
+// Data available once a tenant is configured (shared base for all
+// non-Unconfigured states).
+message PersistedConfiguredBase {
+  PersistedTenant tenant = 1;
+  PersistedSigning signing = 2;
+  PersistedLoginApi login_api = 3;
+}
+
+// No tenant — activation required.
+message PersistedUnconfigured {}
+
+// Tenant set, logged out.
+message PersistedConfigured {
+  PersistedConfiguredBase base = 1;
+}
+
+// Login in progress; a challenge is pending.
+message PersistedAuthenticating {
+  PersistedConfiguredBase base = 1;
+  map<string, string> cookies = 2;
+  optional string csrf_token = 3;
+  optional string knock_token = 4;
+  PersistedOauth oauth = 5;
+  optional PersistedTotp totp = 6;
+  rustylink.daemon.v1.PendingChallenge pending_challenge = 7;
+}
+
+// Fully authenticated; VPN states are nested inside.
+message PersistedAuthenticated {
+  PersistedConfiguredBase base = 1;
+  map<string, string> cookies = 2;
+  optional string csrf_token = 3;
+  optional string knock_token = 4;
+  optional PersistedTotp totp = 5;
+
+  oneof vpn_state {
+    PersistedVpnDisconnected vpn_disconnected = 10;
+    PersistedVpnConnecting vpn_connecting = 11;
+    PersistedVpnConfiguring vpn_configuring = 12;
+    PersistedVpnConnected vpn_connected = 13;
+    PersistedVpnReconnecting vpn_reconnecting = 14;
+    PersistedVpnFailed vpn_failed = 15;
+    PersistedVpnDisconnecting vpn_disconnecting = 16;
+  }
+}
+
+// Session expired (401/force-logout); only base retained for re-login.
+message PersistedExpired {
+  PersistedConfiguredBase base = 1;
+}
+
+// ---- VPN variant messages (nested inside Authenticated) ----
+message PersistedVpnDisconnected {}
+message PersistedVpnConnecting {
+  PersistedVpnRequest request = 1;
+}
+message PersistedVpnConfiguring {
+  PersistedVpnRequest request = 1;
+}
+message PersistedVpnConnected {
+  PersistedVpnRequest request = 1;
+  PersistedActiveTunnel active = 2;
+}
+message PersistedVpnReconnecting {
+  PersistedVpnRequest request = 1;
+  uint32 reconnect_attempts = 2;
+}
+message PersistedVpnFailed {
+  PersistedVpnRequest request = 1;
+  string error = 2;
+  uint32 reconnect_attempts = 3;
+}
+message PersistedVpnDisconnecting {
+  PersistedVpnRequest request = 1;
+}
+
+// ---- sub-messages (unchanged from v1) ----
+
+enum PersistedLoginApi {
+  PERSISTED_LOGIN_API_UNSPECIFIED = 0;
+  PERSISTED_LOGIN_API_V1 = 1;
+  PERSISTED_LOGIN_API_LEGACY = 2;
+}
+
+message PersistedTenant {
+  optional string base_url = 1;
+  optional string backup_url = 2;
+  bool use_backup = 3;
+  optional string name = 4;
+}
+
+message PersistedIdentity {
+  string os = 1;
+  string os_version = 2;
+  string app_version = 3;
+  string brand = 4;
+  string model = 5;
+  string device_id = 6;
+  string build_number = 7;
+  string os_version_patch = 8;
+  string client_source = 9;
+  string language = 10;
+  string user_agent = 11;
+}
+
+message PersistedSigning {
+  bool enabled = 1;
+  uint64 root_key_version = 2;
+  uint64 signing_input_params = 3;
+  repeated string algorithms = 4;
+  repeated PersistedSigningRule rules = 5;
+  optional string activation_code = 6;
+  optional string device_id = 7;
+  optional string hmac_key_base64 = 8;
+  optional string shared_secret = 9;
+}
+
+message PersistedSigningRule {
+  repeated string urls = 1;
+  bool enable_signing = 2;
+  uint64 signing_input_params = 3;
+  optional uint64 max_time_desync = 4;
+}
+
+message PersistedTotp {
+  string secret = 1;
+  string algorithm = 2;
+  uint32 digits = 3;
+  uint32 period = 4;
+}
+
+message PersistedOauth {
+  optional string alias_key = 1;
+  optional string state = 2;
+  optional string code_verifier = 3;
+}
+
+message PersistedVpnRequest {
+  rustylink.daemon.v1.VpnMode mode = 1;
+  int32 export_id = 2;
+  optional int32 preferred_dot_id = 3;
+  optional string otp = 4;
+  bool reconnect = 5;
+  optional int32 protocol_mode = 6;
+}
+
+message PersistedActiveTunnel {
+  int32 dot_id = 1;
+  string dot_name = 2;
+  string endpoint = 3;
+  string assigned_ip = 4;
+  optional google.protobuf.Timestamp connected_at = 5;
+  optional google.protobuf.Timestamp last_handshake_at = 6;
+  optional int32 protocol_mode = 7;
+}

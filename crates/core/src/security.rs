@@ -33,7 +33,7 @@ pub async fn report_security(
     let mut changes = Vec::new();
     if let Some(cookies) = &meta.cookies {
         changes.push(StateChange::CookiesUpdated {
-            cookies: cookies.clone(),
+            cookies: cookies.to_map(),
         });
     }
     if let Some(csrf) = &meta.csrf_token {

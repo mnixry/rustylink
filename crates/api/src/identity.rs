@@ -76,3 +76,35 @@ impl Default for ClientIdentity {
         Self::android_compatible_default()
     }
 }
+
+// ---------------------------------------------------------------------------
+// Proto bridge: ClientIdentity <-> PersistedIdentity
+// ---------------------------------------------------------------------------
+
+use rustylink_proto::proto::rustylink::daemon::persist::v1 as persist;
+
+impl From<&persist::PersistedIdentity> for ClientIdentity {
+    fn from(p: &persist::PersistedIdentity) -> Self {
+        Self {
+            os: p.os.clone(), os_version: p.os_version.clone(),
+            app_version: p.app_version.clone(), brand: p.brand.clone(),
+            model: p.model.clone(), device_id: p.device_id.clone(),
+            build_number: p.build_number.clone(), os_version_patch: p.os_version_patch.clone(),
+            client_source: p.client_source.clone(), language: p.language.clone(),
+            user_agent: p.user_agent.clone(),
+        }
+    }
+}
+
+impl From<&ClientIdentity> for persist::PersistedIdentity {
+    fn from(i: &ClientIdentity) -> Self {
+        Self {
+            os: i.os.clone(), os_version: i.os_version.clone(),
+            app_version: i.app_version.clone(), brand: i.brand.clone(),
+            model: i.model.clone(), device_id: i.device_id.clone(),
+            build_number: i.build_number.clone(), os_version_patch: i.os_version_patch.clone(),
+            client_source: i.client_source.clone(), language: i.language.clone(),
+            user_agent: i.user_agent.clone(), ..Default::default()
+        }
+    }
+}

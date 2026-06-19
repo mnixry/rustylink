@@ -7,9 +7,9 @@ use rustylink_api::{
     V1LoginRequest, V1LoginSkipRequest, V1MfaSendRequest, V1MfaVerifyRequest, V1SendCodeRequest,
     V1VerifyCodeRequest, VerifyCodeRequest, VerifyMfaRequest,
 };
+use rustylink_proto::proto::rustylink::daemon::persist::v1 as persist;
 use sha2::{Digest as _, Sha256};
 use snafu::prelude::*;
-use uuid::Uuid;
 
 use crate::{AppContext, state::StateChange};
 
@@ -48,7 +48,7 @@ fn collect_meta_changes(meta: &ResponseMeta) -> Vec<StateChange> {
     let mut changes = Vec::new();
     if let Some(cookies) = &meta.cookies {
         changes.push(StateChange::CookiesUpdated {
-            cookies: cookies.clone(),
+            cookies: cookies.to_map(),
         });
     }
     if let Some(csrf) = &meta.csrf_token {
@@ -73,7 +73,7 @@ pub async fn activate(
     let mut changes = Vec::new();
 
     // Apply URL overrides to a copy of tenant state
-    let mut tenant = ctx.state.tenant.clone();
+    let mut tenant = ctx.tenant().cloned().unwrap_or_default();
     if let Some(value) = base_url {
         tenant.base_url = Some(value);
     }
@@ -83,16 +83,16 @@ pub async fn activate(
 
     let Some(code) = code else {
         // URL-only activation — just persist the tenant URLs
-        let mut signing = ctx.state.signing.clone();
+        let mut signing = ctx.signing_proto().cloned().unwrap_or_default();
         signing.enabled = true;
         changes.push(StateChange::TenantConfigured { tenant, signing });
         return Ok((None, changes));
     };
 
-    let mut signing = ctx.state.signing.clone();
+    let mut signing = ctx.signing_proto().cloned().unwrap_or_default();
     signing.enabled = true;
     signing.activation_code = Some(code.clone());
-    signing.device_id = Some(ctx.state.identity.device_id.clone());
+    signing.device_id = Some(ctx.device_id());
 
     let client = match match_base_url {
         Some(url) => ctx.match_client_with_url(&url).context(ContextSnafu)?,
@@ -183,7 +183,7 @@ pub fn start_oauth(
     _ctx: &AppContext, auth_url: &str, alias_key: String, state: Option<String>,
     redirect_uri: &str,
 ) -> Result<(String, Vec<StateChange>)> {
-    let state_value = state.unwrap_or_else(|| Uuid::new_v4().simple().to_string());
+    let state_value = state.unwrap_or_else(random_token);
     let (code_verifier, code_challenge) = pkce_pair();
     let mut url = url::Url::parse(auth_url).context(InvalidUrlSnafu {
         value: auth_url.to_string(),
@@ -237,16 +237,14 @@ pub async fn oauth_callback(
     ctx: &AppContext, alias_key: Option<String>, code: String, state: Option<String>,
 ) -> Result<(BaseResponse<LoginResult>, Vec<StateChange>)> {
     let alias_key = alias_key
-        .or_else(|| ctx.state.oauth.alias_key.clone())
+        .or_else(|| ctx.oauth().and_then(|o| o.alias_key.clone()))
         .context(MissingOAuthVerifierSnafu)?;
     let state = state
-        .or_else(|| ctx.state.oauth.state.clone())
+        .or_else(|| ctx.oauth().and_then(|o| o.state.clone()))
         .context(MissingOAuthVerifierSnafu)?;
     let verifier = ctx
-        .state
-        .oauth
-        .code_verifier
-        .clone()
+        .oauth()
+        .and_then(|o| o.code_verifier.clone())
         .context(MissingOAuthVerifierSnafu)?;
     let client = ctx.tenant_client().context(ContextSnafu)?;
     let (response, meta) = OAuthCallbackRequest {
@@ -404,7 +402,7 @@ pub async fn logout(
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-fn merge_activation(tenant: &mut crate::state::TenantState, data: &ActivateInfo) {
+fn merge_activation(tenant: &mut persist::PersistedTenant, data: &ActivateInfo) {
     if let Some(host) = first_non_empty([data.activate_host.as_deref(), data.domain.as_deref()]) {
         tenant.base_url = Some(host);
     }
@@ -425,9 +423,14 @@ fn merge_activation(tenant: &mut crate::state::TenantState, data: &ActivateInfo)
 }
 
 fn pkce_pair() -> (String, String) {
-    let verifier = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    let verifier = random_token();
     let challenge = code_challenge(&verifier);
     (verifier, challenge)
+}
+
+/// A hex-encoded 256-bit random token (used for PKCE verifiers and OAuth state).
+fn random_token() -> String {
+    hex::encode(rand::random::<[u8; 32]>())
 }
 
 fn code_challenge(verifier: &str) -> String {

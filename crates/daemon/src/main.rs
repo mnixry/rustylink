@@ -7,20 +7,24 @@
 mod auth_layer;
 mod daemon;
 mod error;
-mod server;
 mod state;
 mod supervisor;
 mod token;
 
 use std::{net::SocketAddr, path::PathBuf};
 
-use axum::middleware::from_fn_with_state;
 use clap::Parser;
 use connectrpc::Router as ConnectRouter;
 use rustylink_proto::proto::rustylink::daemon::v1::RustylinkServiceExt as _;
+use tower::ServiceBuilder;
+use tower_http::{
+    request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
+    trace::TraceLayer,
+    validate_request::ValidateRequestHeaderLayer,
+};
 use tracing_subscriber::{EnvFilter, fmt};
 
-use crate::{auth_layer::AuthState, daemon::Daemon, server::Svc, state::DaemonState};
+use crate::{auth_layer::AuthState, daemon::Daemon, state::DaemonState};
 
 #[derive(Debug, Parser)]
 #[command(name = "rustylinkd", version, about = "Rustylink Connect RPC daemon")]
@@ -58,6 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     state.save(&state_path)?;
 
     let token_hash = state
+        .proto
         .token_hash
         .clone()
         .expect("token hash is set by ensure_token");
@@ -68,13 +73,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // is enabled, re-establish the tunnel (fresh /vpn/conn, keypair, TOTP).
     daemon.maybe_auto_resume().await;
 
-    let svc = std::sync::Arc::new(Svc::new(daemon));
+    let connect = std::sync::Arc::new(daemon).register(ConnectRouter::new());
+    let auth = AuthState::new(token_hash);
 
-    let connect = svc.register(ConnectRouter::new());
-    let auth_state = AuthState::new(token_hash);
+    // Layer stack (outermost first): stamp a request id, open a tracing span
+    // carrying it, enforce loopback + bearer auth, then echo the id on the way
+    // out.  The connect router serves Connect + gRPC + gRPC-Web as the fallback.
     let app = axum::Router::new()
         .fallback_service(connect.into_axum_service())
-        .layer(from_fn_with_state(auth_state, auth_layer::require_auth));
+        .layer(
+            ServiceBuilder::new()
+                .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
+                .layer(
+                    TraceLayer::new_for_http().make_span_with(|request: &axum::extract::Request| {
+                        let request_id = request
+                            .headers()
+                            .get("x-request-id")
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default();
+                        tracing::info_span!(
+                            "request",
+                            method = %request.method(),
+                            uri = %request.uri(),
+                            request_id,
+                        )
+                    }),
+                )
+                .layer(ValidateRequestHeaderLayer::custom(auth))
+                .layer(PropagateRequestIdLayer::x_request_id()),
+        );
 
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     tracing::info!(addr = %args.listen, "rustylinkd listening");
@@ -88,7 +115,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Generate + print + hash a token on first run or `--rotate-token`.
 fn ensure_token(state: &mut DaemonState, rotate: bool) {
-    if !rotate && state.token_hash.is_some() {
+    if !rotate && state.proto.token_hash.is_some() {
         return;
     }
     let token = token::generate_token();
@@ -96,7 +123,7 @@ fn ensure_token(state: &mut DaemonState, rotate: bool) {
         tracing::error!("failed to hash bearer token");
         return;
     };
-    state.token_hash = Some(hash);
+    state.proto.token_hash = Some(hash);
     eprintln!("─────────────────────────────────────────────────────────────");
     eprintln!("  rustylinkd bearer token (shown once — store it securely):");
     eprintln!("    {token}");

@@ -15,8 +15,6 @@ use std::time::Duration;
 use rustylink_tunnel::{ReconnectEvent, TunnelSession};
 use tokio_util::sync::CancellationToken;
 
-use crate::state::OutboundSelector;
-
 /// How often to poll the WG handshake age and the network state.
 const HANDSHAKE_POLL: Duration = Duration::from_secs(3);
 const NETWORK_POLL: Duration = Duration::from_secs(5);
@@ -69,7 +67,7 @@ fn handshake_threshold(protocol_mode: Option<i32>) -> Duration {
 /// `report` is invoked on the report interval; it returns `Ok(true)` if the
 /// server signalled a force-logout/kickout.
 pub async fn run<F, Fut>(
-    session: &mut TunnelSession, protocol_mode: Option<i32>, outbound: OutboundSelector,
+    session: &mut TunnelSession, protocol_mode: Option<i32>, outbound: Option<String>,
     cancel: CancellationToken, mut report: F,
 ) -> SupervisorOutcome
 where
@@ -104,19 +102,16 @@ where
             }
 
             _ = network_tick.tick() => {
-                match &outbound {
-                    OutboundSelector::Name(name) => {
-                        if !interface_present(name) {
-                            tracing::warn!(interface = %name, "pinned outbound interface lost");
-                            return SupervisorOutcome::Trigger(ReconnectEvent::NetworkChanged);
-                        }
+                if let Some(name) = &outbound {
+                    if !interface_present(name) {
+                        tracing::warn!(interface = %name, "pinned outbound interface lost");
+                        return SupervisorOutcome::Trigger(ReconnectEvent::NetworkChanged);
                     }
-                    OutboundSelector::Auto => {
-                        let now = current_net();
-                        if now != last_net {
-                            tracing::info!(?last_net, ?now, "default network changed");
-                            return SupervisorOutcome::Trigger(ReconnectEvent::NetworkChanged);
-                        }
+                } else {
+                    let now = current_net();
+                    if now != last_net {
+                        tracing::info!(?last_net, ?now, "default network changed");
+                        return SupervisorOutcome::Trigger(ReconnectEvent::NetworkChanged);
                     }
                 }
             }

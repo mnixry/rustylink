@@ -4,13 +4,11 @@ use rustylink_api::{
     SendableRequest, TenantConfig, TenantEndpoint, UserInfo, VpnConnRequest, VpnConnResponse,
     VpnDot, VpnReportRequest, VpnSetting,
 };
+use rustylink_proto::proto::rustylink::daemon::persist::v1 as persist;
 use snafu::prelude::*;
 use strum::{Display, EnumIter, EnumString, FromRepr, IntoStaticStr};
 
-use crate::{
-    AppContext,
-    state::{StateChange, TotpConfig},
-};
+use crate::{AppContext, state::StateChange};
 
 const MAX_DOT_ATTEMPTS: usize = 3;
 const MAX_CONFIG_ATTEMPTS_PER_DOT: usize = 3;
@@ -109,7 +107,7 @@ fn collect_meta_changes(meta: &rustylink_api::ResponseMeta) -> Vec<StateChange> 
     let mut changes = Vec::new();
     if let Some(cookies) = &meta.cookies {
         changes.push(StateChange::CookiesUpdated {
-            cookies: cookies.clone(),
+            cookies: cookies.to_map(),
         });
     }
     if let Some(csrf) = &meta.csrf_token {
@@ -166,9 +164,9 @@ pub async fn login_setting(
 
 fn build_signing_config_update(
     ctx: &AppContext, data: &TenantConfig,
-) -> Option<rustylink_api::SigningConfig> {
+) -> Option<persist::PersistedSigning> {
     let config = data.signing_config.as_ref()?;
-    let mut signing = ctx.state.signing.clone();
+    let mut signing = ctx.signing_proto().cloned().unwrap_or_default();
     signing.enabled = config.enable.unwrap_or(signing.enabled);
     signing.algorithms = config.algorithms.clone().unwrap_or_default();
     signing.rules = config
@@ -176,7 +174,7 @@ fn build_signing_config_update(
         .as_deref()
         .unwrap_or_default()
         .iter()
-        .map(|rule| rustylink_api::SigningRuleConfig {
+        .map(|rule| persist::PersistedSigningRule {
             urls: rule.urls.clone().unwrap_or_default(),
             enable_signing: rule.enable_signing.unwrap_or(false),
             signing_input_params: rule
@@ -186,6 +184,7 @@ fn build_signing_config_update(
             max_time_desync: rule
                 .max_time_desync
                 .and_then(|value| u64::try_from(value).ok()),
+            ..Default::default()
         })
         .collect();
     Some(signing)
@@ -349,7 +348,7 @@ pub async fn report_vpn(
 /// defensively from a free-form JSON value (see `models::otp`) to extract the
 /// default account.  Returns `Ok((None, _))` when no usable OTP account is
 /// present (the caller falls back to a manual OTP on connect).
-pub async fn fetch_totp(ctx: &AppContext) -> Result<(Option<TotpConfig>, Vec<StateChange>)> {
+pub async fn fetch_totp(ctx: &AppContext) -> Result<(Option<persist::PersistedTotp>, Vec<StateChange>)> {
     let client = ctx.tenant_client().context(ContextSnafu)?;
     let (response, meta) = FetchOtpRequest
         .send_with_meta(client)
@@ -393,7 +392,7 @@ fn extract_default_otp_account(value: &serde_json::Value) -> Option<OtpAccount> 
         .cloned()
 }
 
-fn totp_config_from_account(account: OtpAccount) -> Option<TotpConfig> {
+fn totp_config_from_account(account: OtpAccount) -> Option<persist::PersistedTotp> {
     let secret = account.secret.filter(|s| !s.is_empty())?;
     let digits = account
         .digits
@@ -409,11 +408,12 @@ fn totp_config_from_account(account: OtpAccount) -> Option<TotpConfig> {
         .algorithm
         .filter(|a| !a.is_empty())
         .unwrap_or_else(|| "SHA1".to_string());
-    Some(TotpConfig {
+    Some(persist::PersistedTotp {
         secret,
         algorithm,
         digits,
         period,
+        ..Default::default()
     })
 }
 
@@ -423,7 +423,7 @@ fn totp_config_from_account(account: OtpAccount) -> Option<TotpConfig> {
 /// Uses `new_unchecked` to tolerate short/non-standard tenant secrets (matches
 /// the Android app, which does not enforce the RFC minimum length).
 #[must_use]
-pub fn generate_totp(config: &TotpConfig, unix_time: u64) -> Option<String> {
+pub fn generate_totp(config: &persist::PersistedTotp, unix_time: u64) -> Option<String> {
     use totp_rs::{Algorithm, Secret, TOTP};
 
     let algorithm = match config.algorithm.to_ascii_uppercase().as_str() {

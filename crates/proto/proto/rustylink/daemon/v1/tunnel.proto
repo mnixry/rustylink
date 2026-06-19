@@ -39,8 +39,8 @@ message GetTunnelResponse {
 message ConnectTunnelRequest {
   VpnMode mode = 1;
   int32 export_id = 2;
-  int32 preferred_dot_id = 3;
-  string otp = 4;
+  optional int32 preferred_dot_id = 3;
+  optional string otp = 4;
   ProtocolMode protocol_mode = 5;
   bool reconnect = 6;
 }

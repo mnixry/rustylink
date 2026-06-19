@@ -9,6 +9,7 @@
 
 use std::{path::PathBuf, sync::Arc, time::Instant};
 
+use connectrpc::{RequestContext, Response, ServiceRequest, ServiceResult, ServiceStream};
 use rustylink_api::{
     ApiClientOptions, LoginSetting, LoginV2Next, LoginV2Result, UserInfo, VpnConnResponse, VpnDot,
     VpnReportRequest,
@@ -17,7 +18,10 @@ use rustylink_core::{
     AppContext, StateChange,
     vpn::{VpnConfigRequest, VpnConfigResult, VpnConnectMode},
 };
-use rustylink_proto::proto::rustylink::daemon::v1 as pb;
+use rustylink_proto::proto::rustylink::daemon::{
+    persist::v1 as persist,
+    v1::{self as pb, RustylinkService},
+};
 use rustylink_tunnel::{
     LocalTunnelParams, ReconnectController, ReconnectDecision, ReconnectEvent, ReconnectPolicy,
     TunnelConfig, TunnelSession,
@@ -27,16 +31,15 @@ use tokio::{
     sync::{Mutex, watch},
     task::JoinHandle,
 };
+use tokio_stream::{StreamExt as _, wrappers::WatchStream};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     error::{
-        ContextSnafu, InvalidArgumentSnafu, NotConfiguredSnafu, PersistSnafu, Result, TunnelSnafu,
+        ContextSnafu, DaemonError, InvalidArgumentSnafu, NotAuthenticatedSnafu, NotConfiguredSnafu,
+        PersistSnafu, Result, TunnelSnafu,
     },
-    state::{
-        ActiveTunnel, AuthPhase, DaemonState, LoginApi, OutboundSelector, PendingChallenge,
-        VpnPhase, VpnRequest,
-    },
+    state::{ActiveTunnel, DaemonState, VpnRequest},
     supervisor::{self, SupervisorOutcome},
 };
 
@@ -45,7 +48,7 @@ struct DaemonInner {
     state: DaemonState,
     ctx: AppContext,
     state_path: PathBuf,
-    watch_tx: watch::Sender<Arc<DaemonState>>,
+    watch_tx: watch::Sender<Arc<persist::PersistedState>>,
     /// Cancellation token for the active connect/supervise task, if any.
     tunnel_cancel: Option<CancellationToken>,
     /// Handle to the active connect/supervise task, if any.
@@ -56,11 +59,12 @@ struct DaemonInner {
 #[derive(Clone)]
 pub struct Daemon {
     inner: Arc<Mutex<DaemonInner>>,
-    watch_rx: watch::Receiver<Arc<DaemonState>>,
+    watch_rx: watch::Receiver<Arc<persist::PersistedState>>,
     started_at: Instant,
 }
 
-/// Parameters for a `/vpn/report` call, bundled to keep helper signatures small.
+/// Parameters for a `/vpn/report` call, bundled to keep helper signatures
+/// small.
 #[derive(Clone)]
 struct ReportParams {
     dot: VpnDot,
@@ -73,14 +77,10 @@ impl Daemon {
     /// Build the daemon core from a loaded state and its on-disk path.
     pub fn new(state: DaemonState, state_path: PathBuf) -> Result<Self> {
         let api_options = ApiClientOptions {
-            outbound_interface: state
-                .config
-                .outbound_interface
-                .name()
-                .map(ToOwned::to_owned),
+            outbound_interface: state.outbound_interface_name(),
         };
-        let ctx = AppContext::new(state.core.clone(), api_options).context(ContextSnafu)?;
-        let (watch_tx, watch_rx) = watch::channel(Arc::new(state.clone()));
+        let ctx = AppContext::new(&state.proto, api_options).context(ContextSnafu)?;
+        let (watch_tx, watch_rx) = watch::channel(Arc::new(state.proto.clone()));
         let inner = DaemonInner {
             state,
             ctx,
@@ -98,378 +98,13 @@ impl Daemon {
 
     /// Subscribe to state snapshots (for `WatchState`).
     #[must_use]
-    pub fn subscribe(&self) -> watch::Receiver<Arc<DaemonState>> {
+    pub fn subscribe(&self) -> watch::Receiver<Arc<persist::PersistedState>> {
         self.watch_rx.clone()
     }
 
     #[must_use]
     pub fn uptime_seconds(&self) -> i64 {
         i64::try_from(self.started_at.elapsed().as_secs()).unwrap_or(i64::MAX)
-    }
-
-    // -----------------------------------------------------------------------
-    // Read RPCs
-    // -----------------------------------------------------------------------
-
-    pub async fn session(&self) -> pb::Session {
-        self.inner.lock().await.state.to_session()
-    }
-
-    pub async fn tunnel(&self) -> pb::Tunnel {
-        self.inner.lock().await.state.to_tunnel()
-    }
-
-    pub async fn configuration(&self) -> pb::Configuration {
-        self.inner.lock().await.state.to_configuration()
-    }
-
-    // -----------------------------------------------------------------------
-    // Activation + login-API detection
-    // -----------------------------------------------------------------------
-
-    pub async fn activate(
-        &self, code: Option<String>, base_url: Option<String>, backup_url: Option<String>,
-        match_base_url: Option<String>,
-    ) -> Result<pb::Session> {
-        let mut inner = self.inner.lock().await;
-        let (_resp, changes) =
-            rustylink_core::auth::activate(&inner.ctx, code, base_url, backup_url, match_base_url)
-                .await?;
-        inner.apply(changes);
-        if inner.state.auth_phase == AuthPhase::Unconfigured {
-            inner.state.auth_phase = AuthPhase::Configured;
-        }
-        // Auto-detect login API from /api/login/setting (best-effort).
-        if let Ok((setting, setting_changes)) = rustylink_core::vpn::login_setting(&inner.ctx).await
-        {
-            inner.apply(setting_changes);
-            let v1 = setting.data.as_ref().is_some_and(login_setting_is_v1);
-            inner.state.login_api = Some(if v1 { LoginApi::V1 } else { LoginApi::Legacy });
-        }
-        inner.persist_and_broadcast()?;
-        Ok(inner.state.to_session())
-    }
-
-    // -----------------------------------------------------------------------
-    // Login (auto v1/legacy)
-    // -----------------------------------------------------------------------
-
-    pub async fn login(
-        &self, login_scene: String, account_type: String, account: String, password: String,
-    ) -> Result<pb::Session> {
-        let mut inner = self.inner.lock().await;
-        inner.require_configured()?;
-        let is_v1 = inner.is_v1();
-        let (resp, changes) = if is_v1 {
-            rustylink_core::auth::v1_login_password(
-                &inner.ctx,
-                login_scene,
-                account_type,
-                account,
-                password,
-            )
-            .await?
-        } else {
-            rustylink_core::auth::login_password(
-                &inner.ctx,
-                login_scene,
-                account_type,
-                account,
-                password,
-            )
-            .await?
-        };
-        inner.apply(changes);
-        inner.apply_login_outcome(resp.data.as_ref());
-        inner.maybe_fetch_totp().await;
-        inner.persist_and_broadcast()?;
-        Ok(inner.state.to_session())
-    }
-
-    pub async fn request_login_code(
-        &self, login_scene: String, account_type: String, login_type: String, account: String,
-    ) -> Result<String> {
-        let mut inner = self.inner.lock().await;
-        inner.require_configured()?;
-        let is_v1 = inner.is_v1();
-        let (resp, changes) = if is_v1 {
-            rustylink_core::auth::v1_send_code(
-                &inner.ctx,
-                login_scene,
-                account_type,
-                login_type,
-                account,
-            )
-            .await?
-        } else {
-            rustylink_core::auth::send_code(
-                &inner.ctx,
-                login_scene,
-                account_type,
-                login_type,
-                account,
-            )
-            .await?
-        };
-        inner.apply(changes);
-        inner.persist_and_broadcast()?;
-        drop(inner);
-        Ok(resp.data.and_then(|d| d.result).unwrap_or_default())
-    }
-
-    pub async fn verify_login_code(
-        &self, login_scene: String, account_type: String, login_type: String, account: String,
-        code: String,
-    ) -> Result<pb::Session> {
-        let mut inner = self.inner.lock().await;
-        inner.require_configured()?;
-        let is_v1 = inner.is_v1();
-        let (resp, changes) = if is_v1 {
-            rustylink_core::auth::v1_verify_code(
-                &inner.ctx,
-                login_scene,
-                account_type,
-                login_type,
-                account,
-                code,
-            )
-            .await?
-        } else {
-            rustylink_core::auth::verify_code(
-                &inner.ctx,
-                login_scene,
-                account_type,
-                login_type,
-                account,
-                code,
-            )
-            .await?
-        };
-        inner.apply(changes);
-        inner.apply_login_outcome(resp.data.as_ref());
-        inner.maybe_fetch_totp().await;
-        inner.persist_and_broadcast()?;
-        Ok(inner.state.to_session())
-    }
-
-    pub async fn request_mfa_code(
-        &self, login_scene: String, mfa_type: String, account: String,
-    ) -> Result<String> {
-        let mut inner = self.inner.lock().await;
-        inner.require_configured()?;
-        // MFA code send only exists in the v1 flow.
-        let (resp, changes) =
-            rustylink_core::auth::v1_mfa_send(&inner.ctx, login_scene, mfa_type, account).await?;
-        inner.apply(changes);
-        inner.persist_and_broadcast()?;
-        drop(inner);
-        Ok(resp.data.and_then(|d| d.result).unwrap_or_default())
-    }
-
-    pub async fn verify_mfa(
-        &self, login_scene: String, mfa_type: String, account: String, code: Option<String>,
-        password: Option<String>,
-    ) -> Result<pb::Session> {
-        let mut inner = self.inner.lock().await;
-        inner.require_configured()?;
-        if code.is_none() && password.is_none() {
-            return InvalidArgumentSnafu {
-                message: "VerifyMfa requires either code or password",
-            }
-            .fail();
-        }
-        let is_v1 = inner.is_v1();
-        let (resp, changes) = if is_v1 {
-            rustylink_core::auth::v1_mfa_verify(
-                &inner.ctx,
-                login_scene,
-                mfa_type,
-                account,
-                code,
-                password,
-            )
-            .await?
-        } else {
-            rustylink_core::auth::verify_mfa(
-                &inner.ctx,
-                login_scene,
-                mfa_type,
-                account,
-                code,
-                password,
-            )
-            .await?
-        };
-        inner.apply(changes);
-        inner.apply_login_outcome(resp.data.as_ref());
-        inner.maybe_fetch_totp().await;
-        inner.persist_and_broadcast()?;
-        Ok(inner.state.to_session())
-    }
-
-    pub async fn skip_pending_challenge(&self, login_scene: String) -> Result<pb::Session> {
-        let mut inner = self.inner.lock().await;
-        inner.require_configured()?;
-        // Skip is a v1 concept; reuse v1_login_skip with the stored account is
-        // not tracked, so we require the client to drive the account via login.
-        let account = String::new();
-        let (resp, changes) =
-            rustylink_core::auth::v1_login_skip(&inner.ctx, login_scene, account).await?;
-        inner.apply(changes);
-        inner.apply_login_outcome(resp.data.as_ref());
-        inner.persist_and_broadcast()?;
-        Ok(inner.state.to_session())
-    }
-
-    // -----------------------------------------------------------------------
-    // Third-party (OAuth) login
-    // -----------------------------------------------------------------------
-
-    pub async fn list_third_party_providers(&self) -> Result<Vec<pb::ThirdPartyProvider>> {
-        let mut inner = self.inner.lock().await;
-        inner.require_configured()?;
-        let (links, changes) = rustylink_core::auth::third_party_login_links(&inner.ctx).await?;
-        inner.apply(changes);
-        inner.persist_and_broadcast()?;
-        drop(inner);
-        let providers = links
-            .response
-            .data
-            .unwrap_or_default()
-            .into_iter()
-            .map(|info| pb::ThirdPartyProvider {
-                alias_key: info.alias_key.unwrap_or_default(),
-                name: info.name.unwrap_or_default(),
-                login_url: info.login_url.or(info.url).unwrap_or_default(),
-                is_custom: info.is_custom.unwrap_or(false),
-                supports_poll: info.token.is_some(),
-                ..Default::default()
-            })
-            .collect();
-        Ok(providers)
-    }
-
-    pub async fn start_third_party_login(
-        &self, alias_key: String, redirect_uri: String,
-    ) -> Result<pb::StartThirdPartyLoginResponse> {
-        let mut inner = self.inner.lock().await;
-        inner.require_configured()?;
-        // Look up the provider's auth URL by alias.
-        let (links, link_changes) =
-            rustylink_core::auth::third_party_login_links(&inner.ctx).await?;
-        inner.apply(link_changes);
-        let auth_url = links
-            .response
-            .data
-            .unwrap_or_default()
-            .into_iter()
-            .find(|info| info.alias_key.as_deref() == Some(alias_key.as_str()))
-            .and_then(|info| info.login_url.or(info.url))
-            .ok_or_else(|| {
-                InvalidArgumentSnafu {
-                    message: format!("unknown third-party provider alias `{alias_key}`"),
-                }
-                .build()
-            })?;
-        let (url, changes) = rustylink_core::auth::start_oauth(
-            &inner.ctx,
-            &auth_url,
-            alias_key,
-            None,
-            &redirect_uri,
-        )?;
-        let state = inner.state.core.oauth.state.clone().unwrap_or_default();
-        inner.apply(changes);
-        inner.persist_and_broadcast()?;
-        drop(inner);
-        Ok(pb::StartThirdPartyLoginResponse {
-            auth_url: url,
-            state,
-            polling: false,
-            ..Default::default()
-        })
-    }
-
-    pub async fn complete_third_party_login(
-        &self, alias_key: String, code: String, state: String,
-    ) -> Result<pb::Session> {
-        let mut inner = self.inner.lock().await;
-        inner.require_configured()?;
-        let (_resp, changes) =
-            rustylink_core::auth::oauth_callback(&inner.ctx, Some(alias_key), code, Some(state))
-                .await?;
-        inner.apply(changes);
-        inner.state.auth_phase = AuthPhase::Authenticated;
-        inner.state.pending_challenge = None;
-        inner.maybe_fetch_totp().await;
-        inner.persist_and_broadcast()?;
-        Ok(inner.state.to_session())
-    }
-
-    pub async fn logout(&self, logout_all: bool) -> Result<pb::Session> {
-        let mut inner = self.inner.lock().await;
-        inner.require_configured()?;
-        let (_resp, changes) = rustylink_core::auth::logout(&inner.ctx, logout_all).await?;
-        inner.apply(changes);
-        inner.persist_and_broadcast()?;
-        Ok(inner.state.to_session())
-    }
-
-    // -----------------------------------------------------------------------
-    // Profile + configuration
-    // -----------------------------------------------------------------------
-
-    pub async fn user_info(&self) -> Result<pb::UserInfo> {
-        let mut inner = self.inner.lock().await;
-        inner.require_authenticated()?;
-        let (resp, changes) = rustylink_core::vpn::user_info(&inner.ctx).await?;
-        inner.apply(changes);
-        inner.persist_and_broadcast()?;
-        drop(inner);
-        Ok(project_user_info(resp.data))
-    }
-
-    pub async fn set_outbound_interface(&self, name: Option<String>) -> Result<pb::Configuration> {
-        let mut inner = self.inner.lock().await;
-        inner.state.config.outbound_interface =
-            name.map_or(OutboundSelector::Auto, OutboundSelector::Name);
-        let api_options = ApiClientOptions {
-            outbound_interface: inner
-                .state
-                .config
-                .outbound_interface
-                .name()
-                .map(ToOwned::to_owned),
-        };
-        inner.ctx.rebuild_http(api_options).context(ContextSnafu)?;
-        inner.persist_and_broadcast()?;
-        Ok(inner.state.to_configuration())
-    }
-
-    pub async fn set_auto_reconnect(&self, enabled: bool) -> Result<pb::Configuration> {
-        let mut inner = self.inner.lock().await;
-        inner.state.config.auto_reconnect_on_start = enabled;
-        inner.persist_and_broadcast()?;
-        Ok(inner.state.to_configuration())
-    }
-
-    // -----------------------------------------------------------------------
-    // VPN reads
-    // -----------------------------------------------------------------------
-
-    pub async fn list_vpn_locations(&self) -> Result<Vec<pb::VpnLocation>> {
-        let mut inner = self.inner.lock().await;
-        inner.require_authenticated()?;
-        let (resp, changes) = rustylink_core::vpn::vpn_locations(&inner.ctx).await?;
-        inner.apply(changes);
-        inner.persist_and_broadcast()?;
-        drop(inner);
-        Ok(resp
-            .data
-            .unwrap_or_default()
-            .into_iter()
-            .map(project_vpn_location)
-            .collect())
     }
 
     // -----------------------------------------------------------------------
@@ -482,13 +117,10 @@ impl Daemon {
     pub async fn maybe_auto_resume(&self) {
         let request = {
             let inner = self.inner.lock().await;
-            let resume = inner.state.config.auto_reconnect_on_start
-                && inner.state.auth_phase == AuthPhase::Authenticated
-                && inner.state.vpn.request.is_some();
-            if !resume {
+            if !inner.state.auto_reconnect_on_start() {
                 return;
             }
-            inner.state.vpn.request.clone()
+            inner.state.vpn_request()
         };
         if let Some(request) = request {
             tracing::info!("auto-resuming tunnel from persisted request");
@@ -503,24 +135,13 @@ impl Daemon {
     pub async fn connect_tunnel(&self, request: VpnRequest) -> Result<pb::Tunnel> {
         let mut inner = self.inner.lock().await;
         inner.require_authenticated()?;
-        if matches!(
-            inner.state.vpn.phase,
-            VpnPhase::Connecting
-                | VpnPhase::Configuring
-                | VpnPhase::Connected
-                | VpnPhase::Reconnecting
-        ) {
+        if !inner.state.vpn_can_connect() {
             return InvalidArgumentSnafu {
                 message: "tunnel is already connecting or connected; disconnect first",
             }
             .fail();
         }
-
-        inner.state.vpn.phase = VpnPhase::Connecting;
-        inner.state.vpn.request = Some(request.clone());
-        inner.state.vpn.active = None;
-        inner.state.vpn.reconnect_attempts = 0;
-        inner.state.vpn.last_error = None;
+        inner.state.vpn_set_connecting(&request);
         inner.persist_and_broadcast()?;
         let tunnel = inner.state.to_tunnel();
 
@@ -544,7 +165,7 @@ impl Daemon {
     pub async fn disconnect_tunnel(&self) -> Result<pb::Tunnel> {
         let (cancel, task) = {
             let mut inner = self.inner.lock().await;
-            inner.state.vpn.phase = VpnPhase::Disconnecting;
+            inner.state.vpn_set_disconnecting();
             inner.persist_and_broadcast()?;
             (inner.tunnel_cancel.take(), inner.tunnel_task.take())
         };
@@ -555,9 +176,7 @@ impl Daemon {
             let _ = task.await;
         }
         let mut inner = self.inner.lock().await;
-        inner.state.vpn.phase = VpnPhase::Disconnected;
-        inner.state.vpn.request = None;
-        inner.state.vpn.active = None;
+        inner.state.vpn_set_disconnected();
         inner.persist_and_broadcast()?;
         Ok(inner.state.to_tunnel())
     }
@@ -607,8 +226,7 @@ impl Daemon {
     async fn connect_once(
         &self, request: &VpnRequest, cancel: &CancellationToken,
     ) -> Result<SupervisorOutcome> {
-        self.vpn_update(|state| state.vpn.phase = VpnPhase::Configuring)
-            .await?;
+        self.vpn_transition(DaemonState::vpn_set_configuring).await?;
 
         let ctx = self.snapshot_ctx().await;
         let local_params = LocalTunnelParams::generate();
@@ -632,7 +250,9 @@ impl Daemon {
             message: "/vpn/conn returned no data",
         })?;
 
-        let mut session = self.start_session(&config_result, &data, &local_params).await?;
+        let mut session = self
+            .start_session(&config_result, &data, &local_params)
+            .await?;
 
         self.mark_connected(&config_result, &data.ip).await?;
 
@@ -655,19 +275,15 @@ impl Daemon {
         Ok(outcome)
     }
 
-    /// Build the tunnel config from a `/vpn/conn` result and bring the device up.
+    /// Build the tunnel config from a `/vpn/conn` result and bring the device
+    /// up.
     async fn start_session(
         &self, config_result: &VpnConfigResult, data: &VpnConnResponse,
         local_params: &LocalTunnelParams,
     ) -> Result<TunnelSession> {
         let outbound_iface = {
             let inner = self.inner.lock().await;
-            inner
-                .state
-                .config
-                .outbound_interface
-                .name()
-                .map(ToOwned::to_owned)
+            inner.state.outbound_interface_name()
         };
 
         let mut tunnel_config = TunnelConfig::from_vpn_conn(
@@ -705,16 +321,11 @@ impl Daemon {
             dot_name: dot.name.clone().unwrap_or_default(),
             endpoint: config_result.endpoint.wireguard_endpoint.to_string(),
             assigned_ip: assigned_ip.to_string(),
-            connected_at_unix: Some(jiff::Timestamp::now().as_second()),
-            last_handshake_unix: None,
+            connected_at: Some(jiff::Timestamp::now()),
+            last_handshake_at: None,
             protocol_mode: dot.protocol_mode,
         };
-        self.vpn_update(|state| {
-            state.vpn.phase = VpnPhase::Connected;
-            state.vpn.active = Some(active);
-            state.vpn.last_error = None;
-        })
-        .await
+        self.vpn_transition(move |s| s.vpn_set_connected(&active)).await
     }
 
     /// Run the supervisor over a live session with a periodic `/vpn/report`.
@@ -724,7 +335,7 @@ impl Daemon {
     ) -> SupervisorOutcome {
         let outbound = {
             let inner = self.inner.lock().await;
-            inner.state.config.outbound_interface.clone()
+            inner.state.outbound_interface_name()
         };
         let protocol_mode = report.dot.protocol_mode;
         let report_daemon = self.clone();
@@ -774,7 +385,7 @@ impl Daemon {
         }
         let config = {
             let inner = self.inner.lock().await;
-            inner.state.core.totp.clone()?
+            inner.state.totp().cloned()?
         };
         let now = u64::try_from(jiff::Timestamp::now().as_second()).unwrap_or(0);
         rustylink_core::vpn::generate_totp(&config, now)
@@ -788,13 +399,7 @@ impl Daemon {
         match decision {
             ReconnectDecision::Retry { after, .. }
             | ReconnectDecision::SwitchNode { after, .. } => {
-                let _ = self
-                    .vpn_update(|state| {
-                        state.vpn.phase = VpnPhase::Reconnecting;
-                        state.vpn.reconnect_attempts =
-                            state.vpn.reconnect_attempts.saturating_add(1);
-                    })
-                    .await;
+                let _ = self.vpn_transition(DaemonState::vpn_set_reconnecting).await;
                 tokio::select! {
                     () = cancel.cancelled() => {
                         self.mark_disconnected().await;
@@ -812,22 +417,12 @@ impl Daemon {
     }
 
     async fn mark_disconnected(&self) {
-        let _ = self
-            .vpn_update(|state| {
-                state.vpn.phase = VpnPhase::Disconnected;
-                state.vpn.request = None;
-                state.vpn.active = None;
-            })
-            .await;
+        let _ = self.vpn_transition(DaemonState::vpn_set_disconnected).await;
     }
 
     async fn mark_failed(&self, error: String) {
         let _ = self
-            .vpn_update(|state| {
-                state.vpn.phase = VpnPhase::Failed;
-                state.vpn.active = None;
-                state.vpn.last_error = Some(error);
-            })
+            .vpn_transition(move |s| s.vpn_set_failed(error))
             .await;
     }
 
@@ -843,8 +438,8 @@ impl Daemon {
         inner.persist_and_broadcast()
     }
 
-    /// Mutate `DaemonState` under the lock, then persist + broadcast.
-    async fn vpn_update(&self, f: impl FnOnce(&mut DaemonState)) -> Result<()> {
+    /// Mutate the daemon state via a transition method, then persist + broadcast.
+    async fn vpn_transition(&self, f: impl FnOnce(&mut DaemonState)) -> Result<()> {
         let mut inner = self.inner.lock().await;
         f(&mut inner.state);
         inner.persist_and_broadcast()
@@ -857,136 +452,71 @@ impl Daemon {
 
 impl DaemonInner {
     fn require_configured(&self) -> Result<()> {
-        if self.state.auth_phase == AuthPhase::Unconfigured {
-            return NotConfiguredSnafu.fail();
+        if self.state.configured_base().is_some() {
+            Ok(())
+        } else {
+            Err(NotConfiguredSnafu.build())
         }
-        Ok(())
     }
 
     fn require_authenticated(&self) -> Result<()> {
-        if self.state.auth_phase == AuthPhase::Authenticated {
+        if self.state.is_authenticated() {
             Ok(())
         } else {
-            crate::error::NotAuthenticatedSnafu.fail()
+            Err(NotAuthenticatedSnafu.build())
         }
     }
 
     fn is_v1(&self) -> bool {
-        matches!(self.state.login_api, Some(LoginApi::V1))
+        self.state.is_v1()
     }
 
-    /// Apply core state changes to `DaemonState`, then refresh the API context
-    /// so subsequent calls see the new cookies/signing.
     fn apply(&mut self, changes: Vec<StateChange>) {
         for change in changes {
             match change {
                 StateChange::TenantConfigured { tenant, signing } => {
-                    self.state.core.tenant = tenant;
-                    self.state.core.signing = signing;
+                    self.state.set_tenant_configured(tenant, signing);
                 }
                 StateChange::CookiesUpdated { cookies } => {
-                    self.state.core.cookies = cookies;
+                    self.state.set_cookies(cookies);
                 }
                 StateChange::CsrfTokenUpdated { token } => {
-                    self.state.core.csrf_token = token;
-                }
-                StateChange::KnockTokenUpdated { token } => {
-                    self.state.core.knock_token = token;
+                    self.state.set_csrf_token(token);
                 }
                 StateChange::SigningConfigUpdated { config } => {
-                    self.state.core.signing = config;
-                }
-                StateChange::LoginApiDetected { v1_login } => {
-                    self.state.login_api = Some(if v1_login {
-                        LoginApi::V1
-                    } else {
-                        LoginApi::Legacy
-                    });
-                }
-                StateChange::LoginSuccess { .. } => {
-                    self.state.auth_phase = AuthPhase::Authenticated;
-                    self.state.pending_challenge = None;
-                }
-                StateChange::OtpChallengePending {
-                    masked_target,
-                    login_type,
-                } => {
-                    self.state.auth_phase = AuthPhase::Authenticating;
-                    self.state.pending_challenge = Some(PendingChallenge::Otp {
-                        masked_target,
-                        login_type,
-                    });
-                }
-                StateChange::MfaChallengePending {
-                    mfa_type,
-                    auth_list,
-                    can_skip,
-                } => {
-                    self.state.auth_phase = AuthPhase::Authenticating;
-                    self.state.pending_challenge = Some(PendingChallenge::Mfa {
-                        mfa_type,
-                        auth_list,
-                        can_skip,
-                    });
+                    self.state.set_signing(config);
                 }
                 StateChange::OAuthStateSet {
                     alias_key,
                     state,
                     code_verifier,
                 } => {
-                    self.state.core.oauth.alias_key = Some(alias_key.clone());
-                    self.state.core.oauth.state = Some(state.clone());
-                    self.state.core.oauth.code_verifier = Some(code_verifier);
-                    self.state.auth_phase = AuthPhase::Authenticating;
-                    self.state.pending_challenge = Some(PendingChallenge::Oauth {
-                        alias_key,
-                        state,
-                        poll_token: None,
-                    });
+                    self.state.set_oauth(alias_key, state, code_verifier);
                 }
-                StateChange::OAuthCleared => {
-                    self.state.core.oauth = rustylink_core::OAuthState::default();
-                }
-                StateChange::SessionExpired => {
-                    self.state.auth_phase = AuthPhase::Expired;
-                }
-                StateChange::LoggedOut => {
-                    self.state.core.cookies = rustylink_api::SessionCookies::default();
-                    self.state.core.csrf_token = None;
-                    self.state.core.knock_token = None;
-                    self.state.core.oauth = rustylink_core::OAuthState::default();
-                    self.state.auth_phase = AuthPhase::Configured;
-                    self.state.pending_challenge = None;
-                }
-                StateChange::TotpConfigFetched { config } => {
-                    self.state.core.totp = Some(config);
-                }
+                StateChange::OAuthCleared => self.state.clear_oauth(),
+                StateChange::SessionExpired => self.state.expire(),
+                StateChange::LoggedOut => self.state.logout(),
             }
         }
-        self.ctx.refresh(&self.state.core);
+        self.ctx.refresh(&self.state.proto);
     }
 
-    /// Interpret a `LoginV2Result` to set the auth phase / pending challenge.
     fn apply_login_outcome(&mut self, result: Option<&LoginV2Result>) {
-        if let Some(next) = result.and_then(|result| result.next.as_ref()) {
-            self.state.auth_phase = AuthPhase::Authenticating;
-            self.state.pending_challenge = Some(challenge_from_next(next));
+        if let Some(next) = result.and_then(|r| r.next.as_ref()) {
+            self.state.set_pending_challenge(challenge_from_next(next));
         } else {
-            self.state.auth_phase = AuthPhase::Authenticated;
-            self.state.pending_challenge = None;
+            self.state.complete_login();
         }
     }
 
-    /// After successful authentication, fetch and store the TOTP secret
-    /// (best-effort — failures don't block login).
     async fn maybe_fetch_totp(&mut self) {
-        if self.state.auth_phase != AuthPhase::Authenticated || self.state.core.totp.is_some() {
+        if !self.state.needs_totp() {
             return;
         }
         match rustylink_core::vpn::fetch_totp(&self.ctx).await {
             Ok((Some(config), changes)) => {
                 self.apply(changes);
-                self.state.core.totp = Some(config);
+                self.state.set_totp(config);
             }
             Ok((None, changes)) => self.apply(changes),
             Err(error) => {
@@ -997,7 +527,7 @@ impl DaemonInner {
 
     fn persist_and_broadcast(&mut self) -> Result<()> {
         self.state.save(&self.state_path).context(PersistSnafu)?;
-        let _ = self.watch_tx.send(Arc::new(self.state.clone()));
+        let _ = self.watch_tx.send(Arc::new(self.state.proto.clone()));
         Ok(())
     }
 }
@@ -1010,24 +540,30 @@ fn login_setting_is_v1(setting: &LoginSetting) -> bool {
     setting.v1_login.unwrap_or(false)
 }
 
-fn challenge_from_next(next: &LoginV2Next) -> PendingChallenge {
+fn challenge_from_next(next: &LoginV2Next) -> pb::PendingChallenge {
     let action = next.action.clone().unwrap_or_default();
-    if action.eq_ignore_ascii_case("mfa") {
-        PendingChallenge::Mfa {
+    let challenge = if action.eq_ignore_ascii_case("mfa") {
+        pb::pending_challenge::Challenge::from(pb::MfaChallenge {
             mfa_type: action,
             auth_list: next.auth_list.clone().unwrap_or_default(),
             can_skip: next.can_skip.unwrap_or(false),
-        }
+            ..Default::default()
+        })
     } else {
         let masked = next
             .mobile
             .clone()
             .or_else(|| next.email.clone())
             .unwrap_or_default();
-        PendingChallenge::Otp {
+        pb::pending_challenge::Challenge::from(pb::OtpChallenge {
             masked_target: masked,
             login_type: action,
-        }
+            ..Default::default()
+        })
+    };
+    pb::PendingChallenge {
+        challenge: Some(challenge),
+        ..Default::default()
     }
 }
 
@@ -1059,5 +595,552 @@ fn mode_from_dot(mode: Option<i32>) -> pb::VpnMode {
         Some(1) => pb::VpnMode::Split,
         Some(2) => pb::VpnMode::Relay,
         _ => pb::VpnMode::Unspecified,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RustylinkService implementation — the RPC surface lives directly on `Daemon`
+// (no separate service wrapper).  Handlers extract the request, run the logic
+// against the locked inner state, and project the result to the wire types.
+//
+// Core errors are mapped through `DaemonError` (local to this crate) on the way
+// to `ConnectError`, because the orphan rule forbids `impl From<core::Error>
+// for ConnectError` and `impl From<&DaemonState> for pb::*` directly.
+// ---------------------------------------------------------------------------
+
+// Handlers return concrete response types, which are more specific than the
+// generated trait's `impl Encodable<...>` bound — intentional refinement (a
+// rustc lint, unavoidable when implementing connectrpc's RPITIT trait).
+#[allow(refining_impl_trait_reachable)]
+impl RustylinkService for Daemon {
+    // ----- meta -----
+
+    async fn ping(
+        &self, _ctx: RequestContext, _request: ServiceRequest<'_, pb::PingRequest>,
+    ) -> ServiceResult<pb::PingResponse> {
+        Response::ok(pb::PingResponse {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            uptime_seconds: self.uptime_seconds(),
+            ..Default::default()
+        })
+    }
+
+    async fn watch_state(
+        &self, _ctx: RequestContext, _request: ServiceRequest<'_, pb::WatchStateRequest>,
+    ) -> ServiceResult<ServiceStream<pb::WatchStateResponse>> {
+        let stream = WatchStream::new(self.subscribe())
+            .map(|state| Ok(pb::WatchStateResponse::from(state.as_ref())));
+        Response::stream_ok(stream)
+    }
+
+    // ----- session -----
+
+    async fn get_session(
+        &self, _ctx: RequestContext, _request: ServiceRequest<'_, pb::GetSessionRequest>,
+    ) -> ServiceResult<pb::GetSessionResponse> {
+        let session = self.inner.lock().await.state.to_session();
+        Response::ok(pb::GetSessionResponse {
+            session: session.into(),
+            ..Default::default()
+        })
+    }
+
+    async fn activate(
+        &self, _ctx: RequestContext, request: ServiceRequest<'_, pb::ActivateRequest>,
+    ) -> ServiceResult<pb::ActivateResponse> {
+        let code = request.code.map(ToOwned::to_owned);
+        let base_url = request.base_url.map(ToOwned::to_owned);
+        let backup_url = request.backup_url.map(ToOwned::to_owned);
+        let match_base_url = request.match_base_url.map(ToOwned::to_owned);
+        let mut inner = self.inner.lock().await;
+        let (_resp, changes) =
+            rustylink_core::auth::activate(&inner.ctx, code, base_url, backup_url, match_base_url)
+                .await
+                .map_err(DaemonError::from)?;
+        inner.apply(changes);
+        // TenantConfigured in apply already promotes Unconfigured → Configured.
+        // Auto-detect the login API from /api/login/setting (best-effort).
+        if let Ok((setting, setting_changes)) = rustylink_core::vpn::login_setting(&inner.ctx).await
+        {
+            inner.apply(setting_changes);
+            if let Some(data) = setting.data.as_ref() {
+                inner.state.set_login_api(login_setting_is_v1(data));
+            }
+        }
+        inner.persist_and_broadcast()?;
+        let session = inner.state.to_session();
+        drop(inner);
+        Response::ok(pb::ActivateResponse {
+            session: session.into(),
+            ..Default::default()
+        })
+    }
+
+    async fn login(
+        &self, _ctx: RequestContext, request: ServiceRequest<'_, pb::LoginRequest>,
+    ) -> ServiceResult<pb::LoginResponse> {
+        let login_scene = nonempty_or(request.login_scene, "login");
+        let account_type = nonempty_or(request.account_type, "account");
+        let account = request.account.to_string();
+        let password = request.password.to_string();
+        let mut inner = self.inner.lock().await;
+        inner.require_configured()?;
+        let is_v1 = inner.is_v1();
+        let (resp, changes) = if is_v1 {
+            rustylink_core::auth::v1_login_password(
+                &inner.ctx,
+                login_scene,
+                account_type,
+                account,
+                password,
+            )
+            .await
+            .map_err(DaemonError::from)?
+        } else {
+            rustylink_core::auth::login_password(
+                &inner.ctx,
+                login_scene,
+                account_type,
+                account,
+                password,
+            )
+            .await
+            .map_err(DaemonError::from)?
+        };
+        inner.apply(changes);
+        inner.apply_login_outcome(resp.data.as_ref());
+        inner.maybe_fetch_totp().await;
+        inner.persist_and_broadcast()?;
+        let session = inner.state.to_session();
+        drop(inner);
+        Response::ok(pb::LoginResponse {
+            session: session.into(),
+            ..Default::default()
+        })
+    }
+
+    async fn request_login_code(
+        &self, _ctx: RequestContext, request: ServiceRequest<'_, pb::RequestLoginCodeRequest>,
+    ) -> ServiceResult<pb::RequestLoginCodeResponse> {
+        let login_scene = nonempty_or(request.login_scene, "login");
+        let account_type = nonempty_or(request.account_type, "account");
+        let login_type = request.login_type.to_string();
+        let account = request.account.to_string();
+        let mut inner = self.inner.lock().await;
+        inner.require_configured()?;
+        let is_v1 = inner.is_v1();
+        let (resp, changes) = if is_v1 {
+            rustylink_core::auth::v1_send_code(
+                &inner.ctx,
+                login_scene,
+                account_type,
+                login_type,
+                account,
+            )
+            .await
+            .map_err(DaemonError::from)?
+        } else {
+            rustylink_core::auth::send_code(
+                &inner.ctx,
+                login_scene,
+                account_type,
+                login_type,
+                account,
+            )
+            .await
+            .map_err(DaemonError::from)?
+        };
+        inner.apply(changes);
+        inner.persist_and_broadcast()?;
+        drop(inner);
+        Response::ok(pb::RequestLoginCodeResponse {
+            code: resp.data.and_then(|d| d.result).unwrap_or_default(),
+            ..Default::default()
+        })
+    }
+
+    async fn verify_login_code(
+        &self, _ctx: RequestContext, request: ServiceRequest<'_, pb::VerifyLoginCodeRequest>,
+    ) -> ServiceResult<pb::VerifyLoginCodeResponse> {
+        let login_scene = nonempty_or(request.login_scene, "login");
+        let account_type = nonempty_or(request.account_type, "account");
+        let login_type = request.login_type.to_string();
+        let account = request.account.to_string();
+        let code = request.code.to_string();
+        let mut inner = self.inner.lock().await;
+        inner.require_configured()?;
+        let is_v1 = inner.is_v1();
+        let (resp, changes) = if is_v1 {
+            rustylink_core::auth::v1_verify_code(
+                &inner.ctx,
+                login_scene,
+                account_type,
+                login_type,
+                account,
+                code,
+            )
+            .await
+            .map_err(DaemonError::from)?
+        } else {
+            rustylink_core::auth::verify_code(
+                &inner.ctx,
+                login_scene,
+                account_type,
+                login_type,
+                account,
+                code,
+            )
+            .await
+            .map_err(DaemonError::from)?
+        };
+        inner.apply(changes);
+        inner.apply_login_outcome(resp.data.as_ref());
+        inner.maybe_fetch_totp().await;
+        inner.persist_and_broadcast()?;
+        let session = inner.state.to_session();
+        drop(inner);
+        Response::ok(pb::VerifyLoginCodeResponse {
+            session: session.into(),
+            ..Default::default()
+        })
+    }
+
+    async fn request_mfa_code(
+        &self, _ctx: RequestContext, request: ServiceRequest<'_, pb::RequestMfaCodeRequest>,
+    ) -> ServiceResult<pb::RequestMfaCodeResponse> {
+        let login_scene = nonempty_or(request.login_scene, "login");
+        let mfa_type = request.mfa_type.to_string();
+        let account = request.account.to_string();
+        let mut inner = self.inner.lock().await;
+        inner.require_configured()?;
+        let (resp, changes) =
+            rustylink_core::auth::v1_mfa_send(&inner.ctx, login_scene, mfa_type, account)
+                .await
+                .map_err(DaemonError::from)?;
+        inner.apply(changes);
+        inner.persist_and_broadcast()?;
+        drop(inner);
+        Response::ok(pb::RequestMfaCodeResponse {
+            code: resp.data.and_then(|d| d.result).unwrap_or_default(),
+            ..Default::default()
+        })
+    }
+
+    async fn verify_mfa(
+        &self, _ctx: RequestContext, request: ServiceRequest<'_, pb::VerifyMfaRequest>,
+    ) -> ServiceResult<pb::VerifyMfaResponse> {
+        let login_scene = nonempty_or(request.login_scene, "login");
+        let mfa_type = request.mfa_type.to_string();
+        let account = request.account.to_string();
+        let code = request.code.map(ToOwned::to_owned);
+        let password = request.password.map(ToOwned::to_owned);
+        let mut inner = self.inner.lock().await;
+        inner.require_configured()?;
+        let is_v1 = inner.is_v1();
+        let (resp, changes) = if is_v1 {
+            rustylink_core::auth::v1_mfa_verify(
+                &inner.ctx,
+                login_scene,
+                mfa_type,
+                account,
+                code,
+                password,
+            )
+            .await
+            .map_err(DaemonError::from)?
+        } else {
+            rustylink_core::auth::verify_mfa(
+                &inner.ctx,
+                login_scene,
+                mfa_type,
+                account,
+                code,
+                password,
+            )
+            .await
+            .map_err(DaemonError::from)?
+        };
+        inner.apply(changes);
+        inner.apply_login_outcome(resp.data.as_ref());
+        inner.maybe_fetch_totp().await;
+        inner.persist_and_broadcast()?;
+        let session = inner.state.to_session();
+        drop(inner);
+        Response::ok(pb::VerifyMfaResponse {
+            session: session.into(),
+            ..Default::default()
+        })
+    }
+
+    async fn skip_pending_challenge(
+        &self, _ctx: RequestContext, request: ServiceRequest<'_, pb::SkipPendingChallengeRequest>,
+    ) -> ServiceResult<pb::SkipPendingChallengeResponse> {
+        let login_scene = nonempty_or(request.login_scene, "login");
+        let mut inner = self.inner.lock().await;
+        inner.require_configured()?;
+        let (resp, changes) =
+            rustylink_core::auth::v1_login_skip(&inner.ctx, login_scene, String::new())
+                .await
+                .map_err(DaemonError::from)?;
+        inner.apply(changes);
+        inner.apply_login_outcome(resp.data.as_ref());
+        inner.persist_and_broadcast()?;
+        let session = inner.state.to_session();
+        drop(inner);
+        Response::ok(pb::SkipPendingChallengeResponse {
+            session: session.into(),
+            ..Default::default()
+        })
+    }
+
+    async fn list_third_party_providers(
+        &self, _ctx: RequestContext,
+        _request: ServiceRequest<'_, pb::ListThirdPartyProvidersRequest>,
+    ) -> ServiceResult<pb::ListThirdPartyProvidersResponse> {
+        let mut inner = self.inner.lock().await;
+        inner.require_configured()?;
+        let (links, changes) = rustylink_core::auth::third_party_login_links(&inner.ctx)
+            .await
+            .map_err(DaemonError::from)?;
+        inner.apply(changes);
+        inner.persist_and_broadcast()?;
+        drop(inner);
+        let providers = links
+            .response
+            .data
+            .unwrap_or_default()
+            .into_iter()
+            .map(|info| pb::ThirdPartyProvider {
+                alias_key: info.alias_key.unwrap_or_default(),
+                name: info.name.unwrap_or_default(),
+                login_url: info.login_url.or(info.url).unwrap_or_default(),
+                is_custom: info.is_custom.unwrap_or(false),
+                supports_poll: info.token.is_some(),
+                ..Default::default()
+            })
+            .collect();
+        Response::ok(pb::ListThirdPartyProvidersResponse {
+            providers,
+            ..Default::default()
+        })
+    }
+
+    async fn start_third_party_login(
+        &self, _ctx: RequestContext, request: ServiceRequest<'_, pb::StartThirdPartyLoginRequest>,
+    ) -> ServiceResult<pb::StartThirdPartyLoginResponse> {
+        let alias_key = request.alias_key.to_string();
+        let redirect_uri = request.redirect_uri.to_string();
+        let mut inner = self.inner.lock().await;
+        inner.require_configured()?;
+        let (links, link_changes) = rustylink_core::auth::third_party_login_links(&inner.ctx)
+            .await
+            .map_err(DaemonError::from)?;
+        inner.apply(link_changes);
+        let auth_url = links
+            .response
+            .data
+            .unwrap_or_default()
+            .into_iter()
+            .find(|info| info.alias_key.as_deref() == Some(alias_key.as_str()))
+            .and_then(|info| info.login_url.or(info.url))
+            .ok_or_else(|| {
+                InvalidArgumentSnafu {
+                    message: format!("unknown third-party provider alias `{alias_key}`"),
+                }
+                .build()
+            })?;
+        let (url, changes) = rustylink_core::auth::start_oauth(
+            &inner.ctx,
+            &auth_url,
+            alias_key,
+            None,
+            &redirect_uri,
+        )
+        .map_err(DaemonError::from)?;
+        let state_value = inner.state.oauth_state_value().unwrap_or_default();
+        inner.apply(changes);
+        inner.persist_and_broadcast()?;
+        drop(inner);
+        Response::ok(pb::StartThirdPartyLoginResponse {
+            auth_url: url,
+            state: state_value,
+            polling: false,
+            ..Default::default()
+        })
+    }
+
+    async fn complete_third_party_login(
+        &self, _ctx: RequestContext,
+        request: ServiceRequest<'_, pb::CompleteThirdPartyLoginRequest>,
+    ) -> ServiceResult<pb::CompleteThirdPartyLoginResponse> {
+        let alias_key = request.alias_key.to_string();
+        let code = request.code.to_string();
+        let state = request.state.to_string();
+        let mut inner = self.inner.lock().await;
+        inner.require_configured()?;
+        let (_resp, changes) =
+            rustylink_core::auth::oauth_callback(&inner.ctx, Some(alias_key), code, Some(state))
+                .await
+                .map_err(DaemonError::from)?;
+        inner.apply(changes);
+        // Promote to Authenticated (OAuth callback succeeded).
+        inner.state.complete_login();
+        inner.maybe_fetch_totp().await;
+        inner.persist_and_broadcast()?;
+        let session = inner.state.to_session();
+        drop(inner);
+        Response::ok(pb::CompleteThirdPartyLoginResponse {
+            session: session.into(),
+            ..Default::default()
+        })
+    }
+
+    async fn logout(
+        &self, _ctx: RequestContext, request: ServiceRequest<'_, pb::LogoutRequest>,
+    ) -> ServiceResult<pb::LogoutResponse> {
+        let logout_all = request.logout_all;
+        let mut inner = self.inner.lock().await;
+        inner.require_configured()?;
+        let (_resp, changes) = rustylink_core::auth::logout(&inner.ctx, logout_all)
+            .await
+            .map_err(DaemonError::from)?;
+        inner.apply(changes);
+        inner.persist_and_broadcast()?;
+        let session = inner.state.to_session();
+        drop(inner);
+        Response::ok(pb::LogoutResponse {
+            session: session.into(),
+            ..Default::default()
+        })
+    }
+
+    // ----- tunnel -----
+
+    async fn get_tunnel(
+        &self, _ctx: RequestContext, _request: ServiceRequest<'_, pb::GetTunnelRequest>,
+    ) -> ServiceResult<pb::GetTunnelResponse> {
+        let tunnel = self.inner.lock().await.state.to_tunnel();
+        Response::ok(pb::GetTunnelResponse {
+            tunnel: tunnel.into(),
+            ..Default::default()
+        })
+    }
+
+    async fn connect_tunnel(
+        &self, _ctx: RequestContext, request: ServiceRequest<'_, pb::ConnectTunnelRequest>,
+    ) -> ServiceResult<pb::ConnectTunnelResponse> {
+        let tunnel = self
+            .connect_tunnel(VpnRequest::from(request.to_owned_message()))
+            .await?;
+        Response::ok(pb::ConnectTunnelResponse {
+            tunnel: tunnel.into(),
+            ..Default::default()
+        })
+    }
+
+    async fn disconnect_tunnel(
+        &self, _ctx: RequestContext, _request: ServiceRequest<'_, pb::DisconnectTunnelRequest>,
+    ) -> ServiceResult<pb::DisconnectTunnelResponse> {
+        let tunnel = self.disconnect_tunnel().await?;
+        Response::ok(pb::DisconnectTunnelResponse {
+            tunnel: tunnel.into(),
+            ..Default::default()
+        })
+    }
+
+    async fn list_vpn_locations(
+        &self, _ctx: RequestContext, _request: ServiceRequest<'_, pb::ListVpnLocationsRequest>,
+    ) -> ServiceResult<pb::ListVpnLocationsResponse> {
+        let mut inner = self.inner.lock().await;
+        inner.require_authenticated()?;
+        let (resp, changes) = rustylink_core::vpn::vpn_locations(&inner.ctx)
+            .await
+            .map_err(DaemonError::from)?;
+        inner.apply(changes);
+        inner.persist_and_broadcast()?;
+        drop(inner);
+        let locations = resp
+            .data
+            .unwrap_or_default()
+            .into_iter()
+            .map(project_vpn_location)
+            .collect();
+        Response::ok(pb::ListVpnLocationsResponse {
+            locations,
+            ..Default::default()
+        })
+    }
+
+    // ----- profile + configuration -----
+
+    async fn get_user_info(
+        &self, _ctx: RequestContext, _request: ServiceRequest<'_, pb::GetUserInfoRequest>,
+    ) -> ServiceResult<pb::GetUserInfoResponse> {
+        let mut inner = self.inner.lock().await;
+        inner.require_authenticated()?;
+        let (resp, changes) = rustylink_core::vpn::user_info(&inner.ctx)
+            .await
+            .map_err(DaemonError::from)?;
+        inner.apply(changes);
+        inner.persist_and_broadcast()?;
+        drop(inner);
+        Response::ok(pb::GetUserInfoResponse {
+            user_info: project_user_info(resp.data).into(),
+            ..Default::default()
+        })
+    }
+
+    async fn get_configuration(
+        &self, _ctx: RequestContext, _request: ServiceRequest<'_, pb::GetConfigurationRequest>,
+    ) -> ServiceResult<pb::GetConfigurationResponse> {
+        let configuration = self.inner.lock().await.state.to_configuration();
+        Response::ok(pb::GetConfigurationResponse {
+            configuration: configuration.into(),
+            ..Default::default()
+        })
+    }
+
+    async fn update_configuration(
+        &self, _ctx: RequestContext, request: ServiceRequest<'_, pb::UpdateConfigurationRequest>,
+    ) -> ServiceResult<pb::UpdateConfigurationResponse> {
+        // Without a field mask we treat each present field as authoritative.
+        let owned = request.to_owned_message();
+        let config = owned.configuration;
+        let outbound_name = config.outbound_interface.selector.as_ref().map(|selector| {
+            match selector {
+                pb::outbound_interface::Selector::Name(name) if !name.is_empty() => {
+                    Some(name.clone())
+                }
+                _ => None,
+            }
+        });
+
+        let mut inner = self.inner.lock().await;
+        inner
+            .state
+            .set_auto_reconnect_on_start(config.auto_reconnect_on_start);
+        if let Some(name) = outbound_name {
+            inner.state.set_outbound_interface_name(name);
+            let options = ApiClientOptions {
+                outbound_interface: inner.state.outbound_interface_name(),
+            };
+            inner.ctx.rebuild_http(options).context(ContextSnafu)?;
+        }
+        inner.persist_and_broadcast()?;
+        let configuration = inner.state.to_configuration();
+        drop(inner);
+        Response::ok(pb::UpdateConfigurationResponse {
+            configuration: configuration.into(),
+            ..Default::default()
+        })
+    }
+}
+
+/// Return `value` if non-empty, otherwise the `default`.
+fn nonempty_or(value: &str, default: &str) -> String {
+    if value.is_empty() {
+        default.to_string()
+    } else {
+        value.to_string()
     }
 }

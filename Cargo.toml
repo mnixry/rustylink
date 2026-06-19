@@ -29,7 +29,7 @@ hmac               = "0.13.0"
 http               = "1.4.2"
 http-body          = "1.0.1"
 ipnetwork          = "0.21.1"
-jiff               = "0.2.28"
+jiff               = { version = "0.2.28", features = ["serde"] }
 machine-uid        = "0.6.0"
 qrcode             = { version = "0.14.1", default-features = false }
 rand               = "0.10.1"
@@ -49,11 +49,10 @@ tokio-stream       = { version = "0.1.18", features = ["sync"] }
 tokio-util         = { version = "0.7.18", features = ["rt"] }
 totp-rs            = { version = "5.7.1", features = ["otpauth"] }
 tower              = "0.5.3"
-tower-http         = { version = "0.6.11", features = ["trace"] }
+tower-http         = { version = "0.6.11", features = ["trace", "request-id", "util", "validate-request"] }
 tracing            = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 url                = { version = "2.5.8", features = ["serde"] }
-uuid               = { version = "1.23.3", features = ["v4", "serde"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

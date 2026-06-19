@@ -55,10 +55,10 @@ message GetSessionResponse {
 }
 
 message ActivateRequest {
-  string code = 1;
-  string base_url = 2;
-  string backup_url = 3;
-  string match_base_url = 4;
+  optional string code = 1;
+  optional string base_url = 2;
+  optional string backup_url = 3;
+  optional string match_base_url = 4;
 }
 
 message ActivateResponse {
@@ -112,8 +112,8 @@ message RequestMfaCodeResponse {
 message VerifyMfaRequest {
   string mfa_type = 1;
   string account = 2;
-  string code = 3;
-  string password = 4;
+  optional string code = 3;
+  optional string password = 4;
   string login_scene = 5;
 }
 

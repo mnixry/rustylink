@@ -2847,9 +2847,12 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "dirs",
+ "hex",
  "jiff",
+ "rand 0.10.1",
  "reqwest",
  "rustylink-api",
+ "rustylink-proto",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -2858,7 +2861,6 @@ dependencies = [
  "totp-rs",
  "tracing",
  "url",
- "uuid",
 ]
 
 [[package]]
@@ -2911,6 +2913,7 @@ dependencies = [
  "connectrpc-reflection",
  "default-net",
  "dirs",
+ "hex",
  "http",
  "jiff",
  "rand 0.10.1",
@@ -3609,12 +3612,14 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
+ "mime",
  "pin-project-lite",
  "tower",
  "tower-layer",
  "tower-service",
  "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -3817,7 +3822,6 @@ checksum = "144d6b123cef80b301b8f72a9e2ca4370ddec21950d0a103dd22c437006d2db7"
 dependencies = [
  "getrandom 0.4.2",
  "js-sys",
- "serde_core",
  "wasm-bindgen",
 ]
 
