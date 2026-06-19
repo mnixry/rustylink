@@ -303,8 +303,8 @@ impl AuthService for AuthServiceImpl {
             .unwrap_or_default()
             .into_iter()
             .map(|info| pb::ThirdPartyProvider {
-                alias_key: info.alias_key.unwrap_or_default(),
-                name: info.name.unwrap_or_default(),
+                alias_key: info.alias_key.or(info.alias).unwrap_or_default(),
+                name: info.name.or(info.full_title).unwrap_or_default(),
                 login_url: info.login_url.or(info.url).unwrap_or_default(),
                 is_custom: info.is_custom.unwrap_or(false),
                 supports_poll: info.token.is_some(),
