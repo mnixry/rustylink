@@ -376,9 +376,10 @@ impl_json_request!(
     BaseResponse<LoginV2Result>
 );
 
+#[skip_serializing_none]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GetThirdPartyLoginLinksRequest {
-    pub code_challenge: String,
+    pub code_challenge: Option<String>,
 }
 
 #[async_trait::async_trait]
@@ -392,7 +393,15 @@ impl SendableRequest for GetThirdPartyLoginLinksRequest {
     }
 
     fn query_pairs(&self) -> Vec<(&'static str, String)> {
-        vec![("code_challenge", self.code_challenge.clone())]
+        // With a code_challenge the server returns a PKCE OAuth login_url (no
+        // poll token); without it, the server returns a poll `token` for the
+        // device/QR flow. We rely on this distinction.
+        match &self.code_challenge {
+            Some(challenge) if !challenge.is_empty() => {
+                vec![("code_challenge", challenge.clone())]
+            }
+            _ => Vec::new(),
+        }
     }
 }
 

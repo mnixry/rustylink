@@ -53,7 +53,6 @@ pub struct DeviceLoginPending {
     pub login_url: String,
     pub alias_key: String,
     pub poll_token: String,
-    pub pkce_verifier: String,
 }
 
 // =========================================================================
@@ -363,8 +362,13 @@ impl AuthMachine {
     async fn awaiting_device_login(&mut self, event: &AuthEvent) -> Response<State> {
         self.last_error = None;
         match event {
-            AuthEvent::CompleteDeviceLogin { code, state } => {
-                self.handle_complete_device_login(code, state).await
+            AuthEvent::CompleteDeviceLogin { .. } => {
+                // The token/check poll (in the service handler) already merged
+                // the session cookies on success, so device login is complete.
+                // No separate OAuth callback is needed — corplink-rs treats a
+                // code-0 token/check as logged in.
+                self.device_login_pending = None;
+                Transition(State::authenticated())
             }
             AuthEvent::Logout { logout_all } => {
                 self.device_login_pending = None;
@@ -761,8 +765,9 @@ impl AuthMachine {
             self.last_error = Some("no tenant configured".into());
             return Handled;
         };
-        // Fetch provider list (includes PKCE code_challenge in the request).
-        let (links, meta) = match rustylink_core::auth::third_party_login_links(&client).await {
+        // Fetch provider list WITHOUT a PKCE challenge so the server returns a
+        // poll `token` for the device/QR flow (`/api/tpslogin/token/check`).
+        let (response, meta) = match rustylink_core::auth::device_login_links(&client).await {
             Ok(pair) => pair,
             Err(error) => {
                 self.last_error = Some(error.to_string());
@@ -771,12 +776,9 @@ impl AuthMachine {
         };
         self.merge_meta(&meta);
 
-        let provider = links
-            .response
-            .data
-            .unwrap_or_default()
-            .into_iter()
-            .find(|info| info.alias_key.as_deref() == Some(alias_key));
+        let provider = response.data.unwrap_or_default().into_iter().find(|info| {
+            info.alias_key.as_deref() == Some(alias_key) || info.alias.as_deref() == Some(alias_key)
+        });
         let Some(provider) = provider else {
             self.last_error = Some(format!("unknown provider alias `{alias_key}`"));
             return Handled;
@@ -786,7 +788,9 @@ impl AuthMachine {
         let poll_token = provider.token.unwrap_or_default();
 
         if poll_token.is_empty() {
-            self.last_error = Some(format!("provider `{alias_key}` does not support polling"));
+            self.last_error = Some(format!(
+                "provider `{alias_key}` does not support device login"
+            ));
             return Handled;
         }
 
@@ -794,39 +798,8 @@ impl AuthMachine {
             login_url,
             alias_key: alias_key.to_owned(),
             poll_token,
-            pkce_verifier: links.code_verifier,
         });
         Transition(State::awaiting_device_login())
-    }
-
-    async fn handle_complete_device_login(&mut self, code: &str, state: &str) -> Response<State> {
-        let pending = self.device_login_pending.take();
-        let Some(p) = pending else {
-            self.last_error = Some("no pending device login flow".into());
-            return Handled;
-        };
-        let Some(client) = self.build_tenant_client() else {
-            self.last_error = Some("no tenant configured".into());
-            return Handled;
-        };
-        match rustylink_core::auth::device_oauth_callback(
-            &client,
-            p.alias_key,
-            code.to_owned(),
-            state.to_owned(),
-            Some(p.pkce_verifier),
-        )
-        .await
-        {
-            Ok((response, meta)) => {
-                self.merge_meta(&meta);
-                route_login_next(response.data.as_ref())
-            }
-            Err(error) => {
-                self.last_error = Some(error.to_string());
-                Handled
-            }
-        }
     }
 
     async fn handle_logout(&mut self, logout_all: bool) -> Response<State> {

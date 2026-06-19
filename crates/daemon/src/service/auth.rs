@@ -430,7 +430,11 @@ impl AuthService for AuthServiceImpl {
         let poll_interval = std::time::Duration::from_secs(2);
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_mins(2);
 
-        let (code, state_value) = loop {
+        // Poll token/check until the user authenticates in the provider's app.
+        // The server returns a non-zero "user not logged in" code while pending
+        // (surfaced here as Err -> keep polling); a code-0 response means the
+        // user finished and the session cookies are now set.
+        loop {
             if tokio::time::Instant::now() >= deadline {
                 return Err(DaemonError::from(RpcFault::Unavailable {
                     message: "device login timed out waiting for user".into(),
@@ -441,59 +445,36 @@ impl AuthService for AuthServiceImpl {
             match rustylink_core::auth::check_third_party_login_token(&client, poll_token.clone())
                 .await
             {
-                Ok((response, meta)) => {
-                    // Merge cookies from the poll response.
-                    {
-                        let mut inner = self.daemon.inner.lock().await;
-                        let merge = AuthEvent::MergeResponseMeta {
+                Ok((_response, meta)) => {
+                    // Success: merge the session cookies/csrf from the response.
+                    let mut inner = self.daemon.inner.lock().await;
+                    inner
+                        .auth
+                        .handle(&AuthEvent::MergeResponseMeta {
                             cookies: meta
                                 .cookies
                                 .as_ref()
                                 .map(|c| c.values.clone())
                                 .unwrap_or_default(),
                             csrf_token: meta.csrf_token.clone(),
-                        };
-                        inner.auth.handle(&merge).await;
-                        drop(inner);
-                    }
-
-                    if let Some(data) = &response.data {
-                        // Check for a callback URL containing code + state.
-                        if let Some(ref url_str) = data.url
-                            && let Ok(parsed) = url::Url::parse(url_str)
-                        {
-                            let code = parsed
-                                .query_pairs()
-                                .find(|(k, _)| k == "code")
-                                .map(|(_, v)| v.to_string())
-                                .unwrap_or_default();
-                            let st = parsed
-                                .query_pairs()
-                                .find(|(k, _)| k == "state")
-                                .map(|(_, v)| v.to_string())
-                                .unwrap_or_default();
-                            if !code.is_empty() {
-                                break (code, st);
-                            }
-                        }
-                        // Direct success without a URL — treat as complete.
-                        if data.login_result.as_deref() == Some("success") {
-                            break (String::new(), String::new());
-                        }
-                    }
+                        })
+                        .await;
+                    drop(inner);
+                    break;
                 }
                 Err(error) => {
-                    tracing::debug!(%error, "device login poll attempt failed, retrying");
+                    tracing::debug!(%error, "device login pending, retrying");
                 }
             }
 
             tokio::time::sleep(poll_interval).await;
-        };
+        }
 
-        // Dispatch the completion event to the state machine.
+        // The poll succeeded: the session is established via cookies. Finalize
+        // (no separate OAuth callback — corplink-rs style).
         let event = AuthEvent::CompleteDeviceLogin {
-            code,
-            state: state_value,
+            code: String::new(),
+            state: String::new(),
         };
         {
             let mut inner = self.daemon.inner.lock().await;

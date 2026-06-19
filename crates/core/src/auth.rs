@@ -188,7 +188,7 @@ pub async fn third_party_login_links(
 ) -> Result<(ThirdPartyLoginLinks, ResponseMeta)> {
     let (code_verifier, code_challenge) = pkce_pair();
     let (response, meta) = GetThirdPartyLoginLinksRequest {
-        code_challenge: code_challenge.clone(),
+        code_challenge: Some(code_challenge.clone()),
     }
     .send_with_meta(client)
     .await
@@ -201,6 +201,20 @@ pub async fn third_party_login_links(
         },
         meta,
     ))
+}
+
+/// Fetch third-party login links WITHOUT a PKCE challenge. The server then
+/// returns a poll `token` per provider for the device/QR login flow
+/// (`/api/tpslogin/token/check`), as corplink-rs does.
+pub async fn device_login_links(
+    client: &ApiClient,
+) -> Result<(BaseResponse<Vec<ThirdPartyLoginInfo>>, ResponseMeta)> {
+    GetThirdPartyLoginLinksRequest {
+        code_challenge: None,
+    }
+    .send_with_meta(client)
+    .await
+    .context(ApiSnafu)
 }
 
 pub async fn oauth_callback(
