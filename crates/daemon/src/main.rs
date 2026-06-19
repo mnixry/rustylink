@@ -2,7 +2,8 @@
 //!
 //! Owns auth state (statig), VPN state, and config; persists them as JSON.
 //! Serves a Connect + gRPC + gRPC-Web endpoint under the `/api` path prefix,
-//! guarded by a bearer token and a restrictive CORS layer.
+//! guarded by a bearer token and a restrictive CORS layer. When built with
+//! `--features embed-ui`, the built web UI is embedded and served at `/`.
 //!
 //! Three RPC services are registered:
 //!   - `AuthService`  — authentication & session management
@@ -16,6 +17,8 @@ mod latency;
 mod persist;
 mod service;
 mod state;
+#[cfg(feature = "embed-ui")]
+mod static_assets;
 mod supervisor;
 mod token;
 
@@ -116,6 +119,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let app = axum::Router::new().nest("/api", api);
+
+    // Serve the embedded SPA at `/` (with SPA-fallback) when built with the
+    // `embed-ui` feature. Without it, the daemon serves `/api` only and the UI
+    // is served by the Vite dev server (which proxies `/api`).
+    #[cfg(feature = "embed-ui")]
+    let app = app.fallback(static_assets::handler);
 
     // Outer layers wrap everything: stamp a request id, open a tracing span
     // carrying it, then echo the id on the way out.
