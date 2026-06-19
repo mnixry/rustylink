@@ -8,7 +8,6 @@ use cbc::{
 use hmac::{Hmac, KeyInit, Mac};
 use reqwest::header::HeaderMap;
 use rustylink_proto::{buffa::Message, proto::rustylink::signing::v1::HttpSignHeader};
-use serde::{Deserialize, Serialize};
 use sha1::Sha1;
 use sha2::{Digest as _, Sha256};
 use snafu::prelude::*;
@@ -37,36 +36,24 @@ bitflags! {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default)]
 pub struct SigningConfig {
     pub enabled: bool,
-    #[serde(default)]
     pub root_key_version: u64,
-    #[serde(default)]
     pub signing_input_params: u64,
-    #[serde(default)]
     pub algorithms: Vec<String>,
-    #[serde(default)]
     pub rules: Vec<SigningRuleConfig>,
-    #[serde(default)]
     pub activation_code: Option<String>,
-    #[serde(default)]
     pub device_id: Option<String>,
-    #[serde(default)]
     pub hmac_key_base64: Option<String>,
-    #[serde(default)]
     pub shared_secret: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default)]
 pub struct SigningRuleConfig {
-    #[serde(default)]
     pub urls: Vec<String>,
-    #[serde(default)]
     pub enable_signing: bool,
-    #[serde(default)]
     pub signing_input_params: u64,
-    #[serde(default)]
     pub max_time_desync: Option<u64>,
 }
 
@@ -299,15 +286,14 @@ fn is_multipart(headers: &HeaderMap) -> bool {
 }
 
 fn aes_cbc_iv(key: &str) -> [u8; AES_CBC_BLOCK_SIZE] {
-    let digest = Sha1::digest(key.as_bytes());
-    let digest_hex = hex::encode(digest);
-    let iv_bytes = digest_hex
-        .as_bytes()
-        .get(..AES_CBC_BLOCK_SIZE)
-        .expect("SHA-1 hex digest is long enough for AES-CBC IV");
-    iv_bytes
-        .try_into()
-        .expect("AES-CBC IV slice has the configured block size")
+    // The IV is the first 16 bytes of the SHA-1 hex digest (always 40 chars, so
+    // the zip fills the whole array).
+    let digest_hex = hex::encode(Sha1::digest(key.as_bytes()));
+    let mut iv = [0u8; AES_CBC_BLOCK_SIZE];
+    for (slot, byte) in iv.iter_mut().zip(digest_hex.bytes()) {
+        *slot = byte;
+    }
+    iv
 }
 
 fn generate_http_sign_key_bytes(
@@ -355,7 +341,8 @@ fn encode_http_sign_header(
 }
 
 // ---------------------------------------------------------------------------
-// Proto bridge: SigningConfig <-> PersistedSigning
+// Proto bridge: PersistedSigning -> SigningConfig (read-side view; the daemon
+// produces PersistedSigning directly, so no reverse conversion is needed).
 // ---------------------------------------------------------------------------
 
 use rustylink_proto::proto::rustylink::daemon::persist::v1 as persist;
@@ -367,39 +354,20 @@ impl From<&persist::PersistedSigning> for SigningConfig {
             root_key_version: p.root_key_version,
             signing_input_params: p.signing_input_params,
             algorithms: p.algorithms.clone(),
-            rules: p.rules.iter().map(|r| SigningRuleConfig {
-                urls: r.urls.clone(),
-                enable_signing: r.enable_signing,
-                signing_input_params: r.signing_input_params,
-                max_time_desync: r.max_time_desync,
-            }).collect(),
+            rules: p
+                .rules
+                .iter()
+                .map(|r| SigningRuleConfig {
+                    urls: r.urls.clone(),
+                    enable_signing: r.enable_signing,
+                    signing_input_params: r.signing_input_params,
+                    max_time_desync: r.max_time_desync,
+                })
+                .collect(),
             activation_code: p.activation_code.clone(),
             device_id: p.device_id.clone(),
             hmac_key_base64: p.hmac_key_base64.clone(),
             shared_secret: p.shared_secret.clone(),
-        }
-    }
-}
-
-impl From<&SigningConfig> for persist::PersistedSigning {
-    fn from(s: &SigningConfig) -> Self {
-        Self {
-            enabled: s.enabled,
-            root_key_version: s.root_key_version,
-            signing_input_params: s.signing_input_params,
-            algorithms: s.algorithms.clone(),
-            rules: s.rules.iter().map(|r| persist::PersistedSigningRule {
-                urls: r.urls.clone(),
-                enable_signing: r.enable_signing,
-                signing_input_params: r.signing_input_params,
-                max_time_desync: r.max_time_desync,
-                ..Default::default()
-            }).collect(),
-            activation_code: s.activation_code.clone(),
-            device_id: s.device_id.clone(),
-            hmac_key_base64: s.hmac_key_base64.clone(),
-            shared_secret: s.shared_secret.clone(),
-            ..Default::default()
         }
     }
 }

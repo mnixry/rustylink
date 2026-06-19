@@ -67,8 +67,8 @@ fn collect_meta_changes(meta: &ResponseMeta) -> Vec<StateChange> {
 // ---------------------------------------------------------------------------
 
 pub async fn activate(
-    ctx: &AppContext, code: Option<String>, base_url: Option<String>,
-    backup_url: Option<String>, match_base_url: Option<String>,
+    ctx: &AppContext, code: Option<String>, base_url: Option<String>, backup_url: Option<String>,
+    match_base_url: Option<String>,
 ) -> Result<(Option<BaseResponse<ActivateInfo>>, Vec<StateChange>)> {
     let mut changes = Vec::new();
 
@@ -117,8 +117,7 @@ pub async fn activate(
 // ---------------------------------------------------------------------------
 
 pub async fn login_password(
-    ctx: &AppContext, login_scene: String, account_type: String, account: String,
-    password: String,
+    ctx: &AppContext, login_scene: String, account_type: String, account: String, password: String,
 ) -> Result<(BaseResponse<LoginV2Result>, Vec<StateChange>)> {
     let client = ctx.tenant_client().context(ContextSnafu)?;
     let (response, meta) =
@@ -166,8 +165,8 @@ pub async fn verify_code(
 }
 
 pub async fn verify_mfa(
-    ctx: &AppContext, login_scene: String, mfa_type: String, account: String,
-    code: Option<String>, password: Option<String>,
+    ctx: &AppContext, login_scene: String, mfa_type: String, account: String, code: Option<String>,
+    password: Option<String>,
 ) -> Result<(BaseResponse<LoginV2Result>, Vec<StateChange>)> {
     let client = ctx.tenant_client().context(ContextSnafu)?;
     let (response, meta) =
@@ -180,8 +179,7 @@ pub async fn verify_mfa(
 }
 
 pub fn start_oauth(
-    _ctx: &AppContext, auth_url: &str, alias_key: String, state: Option<String>,
-    redirect_uri: &str,
+    _ctx: &AppContext, auth_url: &str, alias_key: String, state: Option<String>, redirect_uri: &str,
 ) -> Result<(String, Vec<StateChange>)> {
     let state_value = state.unwrap_or_else(random_token);
     let (code_verifier, code_challenge) = pkce_pair();
@@ -290,16 +288,14 @@ pub async fn check_third_party_login_token(
 // ---------------------------------------------------------------------------
 
 pub async fn v1_login_password(
-    ctx: &AppContext, login_scene: String, account_type: String, account: String,
-    password: String,
+    ctx: &AppContext, login_scene: String, account_type: String, account: String, password: String,
 ) -> Result<(BaseResponse<LoginV2Result>, Vec<StateChange>)> {
     let client = ctx.tenant_client().context(ContextSnafu)?;
-    let (response, meta) =
-        V1LoginRequest::encrypted(login_scene, account_type, account, &password)
-            .context(ApiSnafu)?
-            .send_with_meta(client)
-            .await
-            .context(ApiSnafu)?;
+    let (response, meta) = V1LoginRequest::encrypted(login_scene, account_type, account, &password)
+        .context(ApiSnafu)?
+        .send_with_meta(client)
+        .await
+        .context(ApiSnafu)?;
     Ok((response, collect_meta_changes(&meta)))
 }
 
@@ -354,8 +350,8 @@ pub async fn v1_mfa_send(
 }
 
 pub async fn v1_mfa_verify(
-    ctx: &AppContext, login_scene: String, mfa_type: String, account: String,
-    code: Option<String>, password: Option<String>,
+    ctx: &AppContext, login_scene: String, mfa_type: String, account: String, code: Option<String>,
+    password: Option<String>,
 ) -> Result<(BaseResponse<LoginV2Result>, Vec<StateChange>)> {
     let client = ctx.tenant_client().context(ContextSnafu)?;
     let (response, meta) =
@@ -428,7 +424,8 @@ fn pkce_pair() -> (String, String) {
     (verifier, challenge)
 }
 
-/// A hex-encoded 256-bit random token (used for PKCE verifiers and OAuth state).
+/// A hex-encoded 256-bit random token (used for PKCE verifiers and OAuth
+/// state).
 fn random_token() -> String {
     hex::encode(rand::random::<[u8; 32]>())
 }

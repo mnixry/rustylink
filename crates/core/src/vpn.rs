@@ -1,6 +1,6 @@
 use rustylink_api::{
     BaseResponse, DotEndpoint, FetchOtpRequest, GetLoginSettingRequest, GetTenantConfigRequest,
-    GetUserInfoRequest, GetVpnLocationsRequest, GetVpnSettingRequest, LoginSetting, OtpAccount,
+    GetUserInfoRequest, GetVpnLocationsRequest, GetVpnSettingRequest, LoginSetting, OtpProvision,
     SendableRequest, TenantConfig, TenantEndpoint, UserInfo, VpnConnRequest, VpnConnResponse,
     VpnDot, VpnReportRequest, VpnSetting,
 };
@@ -292,9 +292,7 @@ pub async fn vpn_config_from_dot_list(
             match body.clone().send_with_meta(&dot_client).await {
                 Ok((response, dot_meta)) => {
                     all_changes.extend(collect_meta_changes(&dot_meta));
-                    if response.data.is_none() {
-                        return MissingVpnConfigDataSnafu.fail();
-                    }
+                    response.data.as_ref().context(MissingVpnConfigDataSnafu)?;
                     return Ok((
                         VpnConfigResult {
                             dot,
@@ -342,106 +340,52 @@ pub async fn report_vpn(
     Ok((response, collect_meta_changes(&meta)))
 }
 
-/// Fetch the tenant TOTP secret from `POST /api/v2/p/otp`.
+/// Fetch the tenant TOTP provisioning from `POST /api/v2/p/otp`.
 ///
-/// The response envelope is tenant-dependent, so the payload is parsed
-/// defensively from a free-form JSON value (see `models::otp`) to extract the
-/// default account.  Returns `Ok((None, _))` when no usable OTP account is
-/// present (the caller falls back to a manual OTP on connect).
-pub async fn fetch_totp(ctx: &AppContext) -> Result<(Option<persist::PersistedTotp>, Vec<StateChange>)> {
+/// Gated on the Android `User-Agent` we send, the server returns an
+/// `otpauth://` URI (carrying the secret/algorithm/digits/period) plus its
+/// wall-clock `timestamp`.  We persist the URI and the derived clock offset so
+/// codes can be generated locally for auto-reconnect.  Returns `Ok((None, _))`
+/// when the tenant has no OTP requirement (empty `url`).
+pub async fn fetch_totp(
+    ctx: &AppContext,
+) -> Result<(Option<persist::PersistedTotp>, Vec<StateChange>)> {
     let client = ctx.tenant_client().context(ContextSnafu)?;
     let (response, meta) = FetchOtpRequest
         .send_with_meta(client)
         .await
         .context(ApiSnafu)?;
     let changes = collect_meta_changes(&meta);
-    let config = response
-        .data
-        .as_ref()
-        .and_then(extract_default_otp_account)
-        .and_then(totp_config_from_account);
+    let config = response.data.and_then(totp_from_provision);
     Ok((config, changes))
 }
 
-/// Locate the default OTP account within a free-form provisioning response.
-fn extract_default_otp_account(value: &serde_json::Value) -> Option<OtpAccount> {
-    // Collect candidate account objects from common shapes: a bare array, or
-    // an object holding a list under a likely key, or a single account object.
-    let candidates: Vec<serde_json::Value> = match value {
-        serde_json::Value::Array(items) => items.clone(),
-        serde_json::Value::Object(map) => {
-            let list = ["otp_list", "list", "accounts", "data", "otps", "items"]
-                .iter()
-                .find_map(|key| map.get(*key))
-                .and_then(serde_json::Value::as_array);
-            list.map_or_else(|| vec![value.clone()], Clone::clone)
-        }
-        _ => return None,
+/// Build a [`persist::PersistedTotp`] from the provisioning payload, deriving
+/// the server clock offset from its `timestamp` (server − local).
+fn totp_from_provision(provision: OtpProvision) -> Option<persist::PersistedTotp> {
+    let url = (!provision.url.is_empty()).then_some(provision.url)?;
+    let now = jiff::Timestamp::now().as_second();
+    let time_diff_seconds = match provision.timestamp {
+        ts if ts > 0 => ts - now,
+        _ => 0,
     };
-
-    let accounts: Vec<OtpAccount> = candidates
-        .into_iter()
-        .filter_map(|item| serde_json::from_value::<OtpAccount>(item).ok())
-        .filter(|account| account.secret.as_ref().is_some_and(|s| !s.is_empty()))
-        .collect();
-
-    accounts
-        .iter()
-        .find(|account| account.is_default.unwrap_or(false))
-        .or_else(|| accounts.first())
-        .cloned()
-}
-
-fn totp_config_from_account(account: OtpAccount) -> Option<persist::PersistedTotp> {
-    let secret = account.secret.filter(|s| !s.is_empty())?;
-    let digits = account
-        .digits
-        .and_then(|d| d.parse::<u32>().ok())
-        .filter(|d| *d > 0)
-        .unwrap_or(6);
-    let period = account
-        .period
-        .and_then(|p| u32::try_from(p).ok())
-        .filter(|p| *p > 0)
-        .unwrap_or(30);
-    let algorithm = account
-        .algorithm
-        .filter(|a| !a.is_empty())
-        .unwrap_or_else(|| "SHA1".to_string());
     Some(persist::PersistedTotp {
-        secret,
-        algorithm,
-        digits,
-        period,
+        url,
+        time_diff_seconds,
         ..Default::default()
     })
 }
 
-/// Generate a fresh RFC 6238 TOTP code for `/vpn/conn` from a stored config.
+/// Generate a fresh RFC 6238 TOTP code for `/vpn/conn` from the stored
+/// `otpauth://` URI, applying the persisted server clock offset.
 ///
-/// `unix_time` should be the server-corrected wall clock (`now + time_diff`).
-/// Uses `new_unchecked` to tolerate short/non-standard tenant secrets (matches
-/// the Android app, which does not enforce the RFC minimum length).
+/// Uses totp-rs's `from_url_unchecked` (otpauth feature) to honour the URI's
+/// algorithm/digits/period and tolerate short/non-standard tenant secrets
+/// (matching the Android client, which does not enforce the RFC minimum).
 #[must_use]
-pub fn generate_totp(config: &persist::PersistedTotp, unix_time: u64) -> Option<String> {
-    use totp_rs::{Algorithm, Secret, TOTP};
-
-    let algorithm = match config.algorithm.to_ascii_uppercase().as_str() {
-        "SHA256" => Algorithm::SHA256,
-        "SHA512" => Algorithm::SHA512,
-        _ => Algorithm::SHA1,
-    };
-    let secret_bytes = Secret::Encoded(config.secret.clone()).to_bytes().ok()?;
-    let digits = usize::try_from(config.digits).unwrap_or(6);
-    let period = u64::from(config.period.max(1));
-    let totp = TOTP::new_unchecked(
-        algorithm,
-        digits,
-        1,
-        period,
-        secret_bytes,
-        None,
-        String::new(),
-    );
-    Some(totp.generate(unix_time))
+pub fn generate_totp(config: &persist::PersistedTotp, now_unix: i64) -> Option<String> {
+    let corrected = u64::try_from(now_unix + config.time_diff_seconds).ok()?;
+    totp_rs::TOTP::from_url_unchecked(&config.url)
+        .ok()
+        .map(|totp| totp.generate(corrected))
 }

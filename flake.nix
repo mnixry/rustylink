@@ -64,6 +64,7 @@
             { ... }:
             {
               projectRootFile = ".git/config";
+              programs.buf.enable = true;
               programs.nixfmt.enable = true;
               programs.taplo.enable = true;
               programs.rustfmt = {

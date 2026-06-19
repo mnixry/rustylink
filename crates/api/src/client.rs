@@ -717,7 +717,8 @@ fn url_from_host_port(scheme: &str, host: &str, port: i32) -> Result<Url> {
     url.set_host(Some(host)).context(InvalidBaseUrlSnafu {
         value: host.to_string(),
     })?;
-    url.set_port(Some(u16::try_from(port).expect("port range checked")))
+    let port_u16 = u16::try_from(port).map_err(|_| Error::InvalidPort { port })?;
+    url.set_port(Some(port_u16))
         .map_err(|()| Error::InvalidPort { port })?;
     Ok(url)
 }

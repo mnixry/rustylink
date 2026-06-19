@@ -35,10 +35,7 @@ use tokio_stream::{StreamExt as _, wrappers::WatchStream};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    error::{
-        ContextSnafu, DaemonError, InvalidArgumentSnafu, NotAuthenticatedSnafu, NotConfiguredSnafu,
-        PersistSnafu, Result, TunnelSnafu,
-    },
+    error::{DaemonError, Result, RpcFault, TunnelSnafu},
     state::{ActiveTunnel, DaemonState, VpnRequest},
     supervisor::{self, SupervisorOutcome},
 };
@@ -79,7 +76,7 @@ impl Daemon {
         let api_options = ApiClientOptions {
             outbound_interface: state.outbound_interface_name(),
         };
-        let ctx = AppContext::new(&state.proto, api_options).context(ContextSnafu)?;
+        let ctx = AppContext::new(&state.proto, api_options).map_err(DaemonError::from)?;
         let (watch_tx, watch_rx) = watch::channel(Arc::new(state.proto.clone()));
         let inner = DaemonInner {
             state,
@@ -136,10 +133,10 @@ impl Daemon {
         let mut inner = self.inner.lock().await;
         inner.require_authenticated()?;
         if !inner.state.vpn_can_connect() {
-            return InvalidArgumentSnafu {
-                message: "tunnel is already connecting or connected; disconnect first",
+            return Err(RpcFault::InvalidArgument {
+                message: "tunnel is already connecting or connected; disconnect first".to_owned(),
             }
-            .fail();
+            .into());
         }
         inner.state.vpn_set_connecting(&request);
         inner.persist_and_broadcast()?;
@@ -226,7 +223,8 @@ impl Daemon {
     async fn connect_once(
         &self, request: &VpnRequest, cancel: &CancellationToken,
     ) -> Result<SupervisorOutcome> {
-        self.vpn_transition(DaemonState::vpn_set_configuring).await?;
+        self.vpn_transition(DaemonState::vpn_set_configuring)
+            .await?;
 
         let ctx = self.snapshot_ctx().await;
         let local_params = LocalTunnelParams::generate();
@@ -325,7 +323,8 @@ impl Daemon {
             last_handshake_at: None,
             protocol_mode: dot.protocol_mode,
         };
-        self.vpn_transition(move |s| s.vpn_set_connected(&active)).await
+        self.vpn_transition(move |s| s.vpn_set_connected(&active))
+            .await
     }
 
     /// Run the supervisor over a live session with a periodic `/vpn/report`.
@@ -380,14 +379,14 @@ impl Daemon {
     /// Compute the OTP for `/vpn/conn`: a manual code if supplied, else a fresh
     /// TOTP derived from the stored secret (best-effort).
     async fn compute_otp(&self, manual: Option<String>) -> Option<String> {
-        if manual.is_some() {
-            return manual;
+        if let Some(code) = manual {
+            return Some(code);
         }
         let config = {
             let inner = self.inner.lock().await;
             inner.state.totp().cloned()?
         };
-        let now = u64::try_from(jiff::Timestamp::now().as_second()).unwrap_or(0);
+        let now = jiff::Timestamp::now().as_second();
         rustylink_core::vpn::generate_totp(&config, now)
     }
 
@@ -421,9 +420,7 @@ impl Daemon {
     }
 
     async fn mark_failed(&self, error: String) {
-        let _ = self
-            .vpn_transition(move |s| s.vpn_set_failed(error))
-            .await;
+        let _ = self.vpn_transition(move |s| s.vpn_set_failed(error)).await;
     }
 
     /// Snapshot the current `AppContext` (cheap clone; shares the HTTP pool).
@@ -438,7 +435,8 @@ impl Daemon {
         inner.persist_and_broadcast()
     }
 
-    /// Mutate the daemon state via a transition method, then persist + broadcast.
+    /// Mutate the daemon state via a transition method, then persist +
+    /// broadcast.
     async fn vpn_transition(&self, f: impl FnOnce(&mut DaemonState)) -> Result<()> {
         let mut inner = self.inner.lock().await;
         f(&mut inner.state);
@@ -452,10 +450,9 @@ impl Daemon {
 
 impl DaemonInner {
     fn require_configured(&self) -> Result<()> {
-        if self.state.configured_base().is_some() {
-            Ok(())
-        } else {
-            Err(NotConfiguredSnafu.build())
+        match self.state.configured_base() {
+            Some(_) => Ok(()),
+            None => Err(RpcFault::NotConfigured.into()),
         }
     }
 
@@ -463,7 +460,7 @@ impl DaemonInner {
         if self.state.is_authenticated() {
             Ok(())
         } else {
-            Err(NotAuthenticatedSnafu.build())
+            Err(RpcFault::NotAuthenticated.into())
         }
     }
 
@@ -525,8 +522,33 @@ impl DaemonInner {
         }
     }
 
+    /// Report device security posture, mirroring the Android client's
+    /// `MainActivity.onCreate` → `/api/security/report` after the home screen
+    /// (post-login) loads.  Best-effort: failures are non-fatal.
+    async fn maybe_report_security(&mut self) {
+        if !self.state.is_authenticated() {
+            return;
+        }
+        let report = rustylink_core::security::all_green_security_report();
+        match rustylink_core::security::report_security(&self.ctx, &report).await {
+            Ok((_response, changes)) => self.apply(changes),
+            Err(error) => {
+                tracing::warn!(%error, "security report failed (non-fatal)");
+            }
+        }
+    }
+
+    /// Run the post-login side effects once authentication completes: fetch the
+    /// TOTP secret (for auto-reconnect) and report device security posture.
+    async fn post_login(&mut self) {
+        self.maybe_fetch_totp().await;
+        self.maybe_report_security().await;
+    }
+
     fn persist_and_broadcast(&mut self) -> Result<()> {
-        self.state.save(&self.state_path).context(PersistSnafu)?;
+        self.state
+            .save(&self.state_path)
+            .map_err(DaemonError::from)?;
         let _ = self.watch_tx.send(Arc::new(self.state.proto.clone()));
         Ok(())
     }
@@ -709,7 +731,7 @@ impl RustylinkService for Daemon {
         };
         inner.apply(changes);
         inner.apply_login_outcome(resp.data.as_ref());
-        inner.maybe_fetch_totp().await;
+        inner.post_login().await;
         inner.persist_and_broadcast()?;
         let session = inner.state.to_session();
         drop(inner);
@@ -795,7 +817,7 @@ impl RustylinkService for Daemon {
         };
         inner.apply(changes);
         inner.apply_login_outcome(resp.data.as_ref());
-        inner.maybe_fetch_totp().await;
+        inner.post_login().await;
         inner.persist_and_broadcast()?;
         let session = inner.state.to_session();
         drop(inner);
@@ -862,7 +884,7 @@ impl RustylinkService for Daemon {
         };
         inner.apply(changes);
         inner.apply_login_outcome(resp.data.as_ref());
-        inner.maybe_fetch_totp().await;
+        inner.post_login().await;
         inner.persist_and_broadcast()?;
         let session = inner.state.to_session();
         drop(inner);
@@ -884,6 +906,7 @@ impl RustylinkService for Daemon {
                 .map_err(DaemonError::from)?;
         inner.apply(changes);
         inner.apply_login_outcome(resp.data.as_ref());
+        inner.post_login().await;
         inner.persist_and_broadcast()?;
         let session = inner.state.to_session();
         drop(inner);
@@ -944,10 +967,9 @@ impl RustylinkService for Daemon {
             .find(|info| info.alias_key.as_deref() == Some(alias_key.as_str()))
             .and_then(|info| info.login_url.or(info.url))
             .ok_or_else(|| {
-                InvalidArgumentSnafu {
+                DaemonError::from(RpcFault::InvalidArgument {
                     message: format!("unknown third-party provider alias `{alias_key}`"),
-                }
-                .build()
+                })
             })?;
         let (url, changes) = rustylink_core::auth::start_oauth(
             &inner.ctx,
@@ -985,7 +1007,7 @@ impl RustylinkService for Daemon {
         inner.apply(changes);
         // Promote to Authenticated (OAuth callback succeeded).
         inner.state.complete_login();
-        inner.maybe_fetch_totp().await;
+        inner.post_login().await;
         inner.persist_and_broadcast()?;
         let session = inner.state.to_session();
         drop(inner);
@@ -1106,14 +1128,17 @@ impl RustylinkService for Daemon {
         // Without a field mask we treat each present field as authoritative.
         let owned = request.to_owned_message();
         let config = owned.configuration;
-        let outbound_name = config.outbound_interface.selector.as_ref().map(|selector| {
-            match selector {
-                pb::outbound_interface::Selector::Name(name) if !name.is_empty() => {
-                    Some(name.clone())
-                }
-                _ => None,
-            }
-        });
+        let outbound_name =
+            config
+                .outbound_interface
+                .selector
+                .as_ref()
+                .map(|selector| match selector {
+                    pb::outbound_interface::Selector::Name(name) if !name.is_empty() => {
+                        Some(name.clone())
+                    }
+                    _ => None,
+                });
 
         let mut inner = self.inner.lock().await;
         inner
@@ -1124,7 +1149,7 @@ impl RustylinkService for Daemon {
             let options = ApiClientOptions {
                 outbound_interface: inner.state.outbound_interface_name(),
             };
-            inner.ctx.rebuild_http(options).context(ContextSnafu)?;
+            inner.ctx.rebuild_http(options).map_err(DaemonError::from)?;
         }
         inner.persist_and_broadcast()?;
         let configuration = inner.state.to_configuration();

@@ -1,19 +1,31 @@
-//! Daemon error type and its mapping to Connect RPC errors.
+//! Daemon error types and their mapping to Connect RPC errors.
 //!
-//! A single [`DaemonError`] wraps every fallible operation in the daemon
-//! (core auth/vpn/security flows, tunnel, state machine violations, and
-//! request validation). `From<DaemonError> for ConnectError` performs an
-//! exhaustive match, logs the full error chain server-side, and returns a
-//! canonical Connect code + human-readable message to clients (no structured
-//! `ErrorInfo` details — per the plan's D4/A6 decision).
+//! Errors are split into two enums:
+//!
+//! * [`RpcFault`] — *expected*, client-actionable outcomes (bad input, missing
+//!   precondition, upstream auth/availability). Each maps to a specific Connect
+//!   [`ErrorCode`] and carries a human-readable message; logged at **debug**.
+//! * [`InternalError`] — failures the client cannot act on (tunnel,
+//!   persistence, context setup, unexpected upstream/transport errors). Always
+//!   surfaced as [`ErrorCode::Internal`] with an opaque message; logged in full
+//!   at **error** when converted to a [`ConnectError`].
+//!
+//! Handlers return [`DaemonError`], a carrier that is either a fault or an
+//! internal error. Core (`auth`/`vpn`/`context`) errors are classified on the
+//! way in: an upstream auth/availability failure becomes a fault, everything
+//! else is internal.
 
 use connectrpc::{ConnectError, ErrorCode};
 use rustylink_api::Error as ApiError;
 use snafu::prelude::*;
 
+// ---------------------------------------------------------------------------
+// Expected faults — Connect code + client-facing message (logged at debug)
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
-pub enum DaemonError {
+pub enum RpcFault {
     #[snafu(display("invalid argument: {message}"))]
     InvalidArgument { message: String },
 
@@ -23,123 +35,211 @@ pub enum DaemonError {
     #[snafu(display("not authenticated; complete login first"))]
     NotAuthenticated,
 
-    #[snafu(display("tunnel is not connected"))]
-    NotConnected,
+    #[snafu(display("upstream authentication failed: {message}"))]
+    Unauthenticated { message: String },
 
-    #[snafu(display("authentication flow error"))]
-    #[snafu(context(false))]
-    Auth {
-        #[snafu(source(from(rustylink_core::auth::Error, Box::new)))]
-        source: Box<rustylink_core::auth::Error>,
-    },
+    #[snafu(display("upstream temporarily unavailable: {message}"))]
+    Unavailable { message: String },
+}
 
-    #[snafu(display("VPN flow error"))]
-    #[snafu(context(false))]
-    Vpn {
-        #[snafu(source(from(rustylink_core::vpn::Error, Box::new)))]
-        source: Box<rustylink_core::vpn::Error>,
-    },
+impl RpcFault {
+    const fn code(&self) -> ErrorCode {
+        match self {
+            Self::InvalidArgument { .. } => ErrorCode::InvalidArgument,
+            Self::NotConfigured | Self::NotAuthenticated => ErrorCode::FailedPrecondition,
+            Self::Unauthenticated { .. } => ErrorCode::Unauthenticated,
+            Self::Unavailable { .. } => ErrorCode::Unavailable,
+        }
+    }
+}
 
-    #[snafu(display("security report error"))]
-    #[snafu(context(false))]
-    Security {
-        #[snafu(source(from(rustylink_core::security::Error, Box::new)))]
-        source: Box<rustylink_core::security::Error>,
-    },
+// ---------------------------------------------------------------------------
+// Internal errors — opaque to the client (logged at error)
+// ---------------------------------------------------------------------------
 
-    #[snafu(display("context error"))]
-    Context {
-        #[snafu(source(from(rustylink_core::context::Error, Box::new)))]
-        source: Box<rustylink_core::context::Error>,
-    },
-
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub(crate)))]
+pub enum InternalError {
     #[snafu(display("tunnel error: {message}"))]
     Tunnel { message: String },
-
-    #[snafu(display("TOTP error: {message}"))]
-    Totp { message: String },
 
     #[snafu(display("state persistence failed"))]
     Persist {
         #[snafu(source(from(crate::state::Error, Box::new)))]
         source: Box<crate::state::Error>,
     },
+
+    #[snafu(display("context setup failed"))]
+    Context {
+        #[snafu(source(from(rustylink_core::context::Error, Box::new)))]
+        source: Box<rustylink_core::context::Error>,
+    },
+
+    #[snafu(display("authentication flow error"))]
+    Auth {
+        #[snafu(source(from(rustylink_core::auth::Error, Box::new)))]
+        source: Box<rustylink_core::auth::Error>,
+    },
+
+    #[snafu(display("VPN flow error"))]
+    Vpn {
+        #[snafu(source(from(rustylink_core::vpn::Error, Box::new)))]
+        source: Box<rustylink_core::vpn::Error>,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Carrier
+// ---------------------------------------------------------------------------
+
+/// The error returned by every RPC handler: an expected [`RpcFault`] or an
+/// opaque [`InternalError`].
+#[derive(Debug)]
+pub enum DaemonError {
+    Fault(RpcFault),
+    Internal(InternalError),
 }
 
 pub type Result<T, E = DaemonError> = std::result::Result<T, E>;
 
-impl DaemonError {
-    /// Find the underlying API-layer error in this error's source chain, if any.
-    fn api_error(&self) -> Option<&ApiError> {
+impl std::fmt::Display for DaemonError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Auth { source } => match source.as_ref() {
-                rustylink_core::auth::Error::Api { source } => Some(source),
-                _ => None,
-            },
-            Self::Vpn { source } => match source.as_ref() {
-                rustylink_core::vpn::Error::Api { source } => Some(source),
-                _ => None,
-            },
-            Self::Security { source } => match source.as_ref() {
-                rustylink_core::security::Error::Api { source } => Some(source),
-                rustylink_core::security::Error::Context { .. } => None,
-            },
-            Self::Context { source } => match source.as_ref() {
-                rustylink_core::context::Error::Api { source } => Some(source),
-                rustylink_core::context::Error::MissingBaseUrl => None,
-            },
-            _ => None,
+            Self::Fault(fault) => write!(f, "{fault}"),
+            Self::Internal(internal) => write!(f, "{internal}"),
         }
     }
 }
 
-/// Map an API-layer error to a canonical Connect code.
-fn api_error_code(error: &ApiError) -> ErrorCode {
-    match error {
-        // Transport/network failures — retryable.
-        ApiError::Request { .. } | ApiError::BuildHttpClient { .. } => ErrorCode::Unavailable,
-        // Upstream HTTP error: map 401/403 to Unauthenticated, else Internal.
-        ApiError::HttpStatus { status, .. } => {
-            if status.as_u16() == 401 || status.as_u16() == 403 {
-                ErrorCode::Unauthenticated
-            } else {
-                ErrorCode::Internal
-            }
+impl std::error::Error for DaemonError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Fault(fault) => fault.source(),
+            Self::Internal(internal) => internal.source(),
         }
-        // Upstream API status code: negative codes are auth/permission failures
-        // in the CorpLink protocol; treat as Unauthenticated, else Internal.
-        ApiError::ApiStatus { code, .. } => {
-            if *code < 0 {
-                ErrorCode::Unauthenticated
-            } else {
-                ErrorCode::Internal
-            }
-        }
-        _ => ErrorCode::Internal,
     }
 }
+
+impl From<RpcFault> for DaemonError {
+    fn from(fault: RpcFault) -> Self {
+        Self::Fault(fault)
+    }
+}
+
+impl From<InternalError> for DaemonError {
+    fn from(error: InternalError) -> Self {
+        Self::Internal(error)
+    }
+}
+
+impl From<crate::state::Error> for DaemonError {
+    fn from(error: crate::state::Error) -> Self {
+        Self::Internal(InternalError::Persist {
+            source: Box::new(error),
+        })
+    }
+}
+
+impl From<rustylink_core::auth::Error> for DaemonError {
+    fn from(error: rustylink_core::auth::Error) -> Self {
+        auth_api(&error).and_then(classify_api).map_or_else(
+            || {
+                Self::Internal(InternalError::Auth {
+                    source: Box::new(error),
+                })
+            },
+            Self::Fault,
+        )
+    }
+}
+
+impl From<rustylink_core::vpn::Error> for DaemonError {
+    fn from(error: rustylink_core::vpn::Error) -> Self {
+        vpn_api(&error).and_then(classify_api).map_or_else(
+            || {
+                Self::Internal(InternalError::Vpn {
+                    source: Box::new(error),
+                })
+            },
+            Self::Fault,
+        )
+    }
+}
+
+impl From<rustylink_core::context::Error> for DaemonError {
+    fn from(error: rustylink_core::context::Error) -> Self {
+        context_api(&error).and_then(classify_api).map_or_else(
+            || {
+                Self::Internal(InternalError::Context {
+                    source: Box::new(error),
+                })
+            },
+            Self::Fault,
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Classification of upstream API errors
+// ---------------------------------------------------------------------------
+
+/// Map an upstream API error to an expected fault, or `None` when it should be
+/// treated as internal (5xx, decode, signing, …).
+fn classify_api(error: &ApiError) -> Option<RpcFault> {
+    let message = error.to_string();
+    match error {
+        // Transport/network failures — retryable.
+        ApiError::Request { .. } | ApiError::BuildHttpClient { .. } => {
+            Some(RpcFault::Unavailable { message })
+        }
+        // Upstream HTTP 401/403 — session/permission failure.
+        ApiError::HttpStatus { status, .. } if matches!(status.as_u16(), 401 | 403) => {
+            Some(RpcFault::Unauthenticated { message })
+        }
+        // CorpLink negative status codes are auth/permission failures.
+        ApiError::ApiStatus { code, .. } if *code < 0 => {
+            Some(RpcFault::Unauthenticated { message })
+        }
+        _ => None,
+    }
+}
+
+fn auth_api(error: &rustylink_core::auth::Error) -> Option<&ApiError> {
+    match error {
+        rustylink_core::auth::Error::Api { source } => Some(source),
+        _ => None,
+    }
+}
+
+fn vpn_api(error: &rustylink_core::vpn::Error) -> Option<&ApiError> {
+    match error {
+        rustylink_core::vpn::Error::Api { source } => Some(source),
+        _ => None,
+    }
+}
+
+fn context_api(error: &rustylink_core::context::Error) -> Option<&ApiError> {
+    match error {
+        rustylink_core::context::Error::Api { source } => Some(source),
+        rustylink_core::context::Error::MissingBaseUrl => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Connect mapping — debug for faults, error for internal failures
+// ---------------------------------------------------------------------------
 
 impl From<DaemonError> for ConnectError {
     fn from(error: DaemonError) -> Self {
-        // Log the full error chain server-side for debugging.
-        tracing::error!(error = ?error, "RPC failed");
-
-        let code = match &error {
-            DaemonError::InvalidArgument { .. } => ErrorCode::InvalidArgument,
-            DaemonError::NotConfigured
-            | DaemonError::NotAuthenticated
-            | DaemonError::NotConnected => ErrorCode::FailedPrecondition,
-            DaemonError::Tunnel { .. }
-            | DaemonError::Totp { .. }
-            | DaemonError::Persist { .. } => ErrorCode::Internal,
-            DaemonError::Auth { .. }
-            | DaemonError::Vpn { .. }
-            | DaemonError::Security { .. }
-            | DaemonError::Context { .. } => error
-                .api_error()
-                .map_or(ErrorCode::Internal, api_error_code),
-        };
-
-        Self::new(code, error.to_string())
+        match error {
+            DaemonError::Fault(fault) => {
+                tracing::debug!(%fault, "rpc fault");
+                Self::new(fault.code(), fault.to_string())
+            }
+            DaemonError::Internal(internal) => {
+                tracing::error!(error = ?internal, "internal rpc failure");
+                Self::new(ErrorCode::Internal, "internal error")
+            }
+        }
     }
 }

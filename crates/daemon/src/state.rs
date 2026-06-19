@@ -18,24 +18,34 @@ use std::{
 
 use buffa::MessageField;
 use jiff::Timestamp;
+use persist::{persisted_authenticated::VpnState as PV, persisted_state::AuthState as PA};
 use rustylink_core::vpn::VpnConnectMode;
 use rustylink_proto::proto::rustylink::daemon::{persist::v1 as persist, v1 as pb};
 use snafu::prelude::*;
-
-use persist::persisted_authenticated::VpnState as PV;
-use persist::persisted_state::AuthState as PA;
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
 pub enum Error {
     #[snafu(display("failed to read state file {}", path.display()))]
-    Read { path: PathBuf, source: std::io::Error },
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[snafu(display("failed to write state file {}", path.display()))]
-    Write { path: PathBuf, source: std::io::Error },
+    Write {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[snafu(display("failed to create state directory {}", path.display()))]
-    CreateDir { path: PathBuf, source: std::io::Error },
+    CreateDir {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[snafu(display("failed to parse state file {}", path.display()))]
-    Parse { path: PathBuf, source: serde_json::Error },
+    Parse {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
     #[snafu(display("failed to serialize state"))]
     Serialize { source: serde_json::Error },
 }
@@ -77,9 +87,12 @@ impl From<pb::ConnectTunnelRequest> for VpnRequest {
             _ => None,
         };
         Self {
-            mode, export_id: request.export_id,
-            preferred_dot_id: request.preferred_dot_id, otp: request.otp,
-            reconnect: request.reconnect, protocol_mode,
+            mode,
+            export_id: request.export_id,
+            preferred_dot_id: request.preferred_dot_id,
+            otp: request.otp,
+            reconnect: request.reconnect,
+            protocol_mode,
         }
     }
 }
@@ -109,16 +122,26 @@ pub struct DaemonState {
 }
 
 impl Default for DaemonState {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DaemonState {
     #[must_use]
     pub fn new() -> Self {
+        // Persist only the per-install device id; the rest of the identity is
+        // filled from the built-in Android-profile default on read
+        // (partial-merge-with-default), so the profile tracks the code.
+        let identity = persist::PersistedIdentity {
+            device_id: Some(rustylink_api::ClientIdentity::default().device_id),
+            ..Default::default()
+        };
         Self {
             proto: persist::PersistedState {
                 version: STATE_VERSION,
                 updated_at: MessageField::some(proto_timestamp(Timestamp::now())),
+                identity: MessageField::some(identity),
                 auth_state: Some(PA::from(persist::PersistedUnconfigured::default())),
                 ..Default::default()
             },
@@ -131,28 +154,47 @@ impl DaemonState {
         if !path.exists() {
             return Ok(Self::new());
         }
-        let bytes = fs::read(path).context(ReadSnafu { path: path.to_path_buf() })?;
+        let bytes = fs::read(path).context(ReadSnafu {
+            path: path.to_path_buf(),
+        })?;
         let proto: persist::PersistedState =
-            serde_json::from_slice(&bytes).context(ParseSnafu { path: path.to_path_buf() })?;
+            serde_json::from_slice(&bytes).context(ParseSnafu {
+                path: path.to_path_buf(),
+            })?;
         Ok(Self { proto })
     }
 
     pub fn save(&mut self, path: &Path) -> Result<()> {
         self.proto.updated_at = MessageField::some(proto_timestamp(Timestamp::now()));
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).context(CreateDirSnafu { path: parent.to_path_buf() })?;
+            fs::create_dir_all(parent).context(CreateDirSnafu {
+                path: parent.to_path_buf(),
+            })?;
         }
         let bytes = serde_json::to_vec_pretty(&self.proto).context(SerializeSnafu)?;
         let tmp_path = path.with_extension("json.tmp");
         let mut tmp = fs::OpenOptions::new()
-            .write(true).create(true).truncate(true).mode(0o600)
-            .open(&tmp_path).context(WriteSnafu { path: tmp_path.clone() })?;
-        tmp.write_all(&bytes).context(WriteSnafu { path: tmp_path.clone() })?;
-        tmp.sync_all().context(WriteSnafu { path: tmp_path.clone() })?;
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp_path)
+            .context(WriteSnafu {
+                path: tmp_path.clone(),
+            })?;
+        tmp.write_all(&bytes).context(WriteSnafu {
+            path: tmp_path.clone(),
+        })?;
+        tmp.sync_all().context(WriteSnafu {
+            path: tmp_path.clone(),
+        })?;
         drop(tmp);
-        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))
-            .context(WriteSnafu { path: tmp_path.clone() })?;
-        fs::rename(&tmp_path, path).context(WriteSnafu { path: path.to_path_buf() })
+        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600)).context(WriteSnafu {
+            path: tmp_path.clone(),
+        })?;
+        fs::rename(&tmp_path, path).context(WriteSnafu {
+            path: path.to_path_buf(),
+        })
     }
 
     // ------- projections (proto-to-proto From impls in the proto crate) -------
@@ -185,21 +227,28 @@ impl DaemonState {
 
     #[must_use]
     pub fn outbound_interface_name(&self) -> Option<String> {
-        self.proto.outbound_interface.as_option().and_then(|o| match &o.selector {
-            Some(pb::outbound_interface::Selector::Name(name)) if !name.is_empty() => {
-                Some(name.clone())
-            }
-            _ => None,
-        })
+        self.proto
+            .outbound_interface
+            .as_option()
+            .and_then(|o| match &o.selector {
+                Some(pb::outbound_interface::Selector::Name(name)) if !name.is_empty() => {
+                    Some(name.clone())
+                }
+                _ => None,
+            })
     }
 
     pub fn set_outbound_interface_name(&mut self, name: Option<String>) {
         let selector = match name {
             Some(n) if !n.is_empty() => pb::outbound_interface::Selector::Name(n),
-            _ => pb::outbound_interface::Selector::from(buffa_types::google::protobuf::Empty::default()),
+            _ => pb::outbound_interface::Selector::from(
+                buffa_types::google::protobuf::Empty::default(),
+            ),
         };
-        self.proto.outbound_interface =
-            MessageField::some(pb::OutboundInterface { selector: Some(selector), ..Default::default() });
+        self.proto.outbound_interface = MessageField::some(pb::OutboundInterface {
+            selector: Some(selector),
+            ..Default::default()
+        });
     }
 
     // ------- auth-state queries -------
@@ -247,8 +296,10 @@ impl DaemonState {
 
     #[must_use]
     pub fn is_v1(&self) -> bool {
-        self.configured_base()
-            .is_some_and(|b| b.login_api.as_known() == Some(persist::PersistedLoginApi::V1))
+        matches!(
+            self.configured_base().map(|b| b.login_api.as_known()),
+            Some(Some(persist::PersistedLoginApi::V1))
+        )
     }
 
     pub fn set_login_api(&mut self, v1: bool) {
@@ -347,10 +398,12 @@ impl DaemonState {
     pub fn expire(&mut self) {
         self.proto.auth_state = match self.proto.auth_state.take() {
             Some(PA::Authenticated(d)) => Some(PA::from(persist::PersistedExpired {
-                base: d.base, ..Default::default()
+                base: d.base,
+                ..Default::default()
             })),
             Some(PA::Authenticating(d)) => Some(PA::from(persist::PersistedExpired {
-                base: d.base, ..Default::default()
+                base: d.base,
+                ..Default::default()
             })),
             other => other,
         };
@@ -362,7 +415,12 @@ impl DaemonState {
             None | Some(PA::Unconfigured(_)) => PA::from(persist::PersistedUnconfigured::default()),
             Some(other) => into_base(other).map_or_else(
                 || PA::from(persist::PersistedUnconfigured::default()),
-                |base| PA::from(persist::PersistedConfigured { base, ..Default::default() }),
+                |base| {
+                    PA::from(persist::PersistedConfigured {
+                        base,
+                        ..Default::default()
+                    })
+                },
             ),
         });
     }
@@ -477,7 +535,9 @@ impl DaemonState {
     }
 
     pub fn vpn_set_configuring(&mut self) {
-        let request = self.current_vpn_request().unwrap_or_else(default_request_proto);
+        let request = self
+            .current_vpn_request()
+            .unwrap_or_else(default_request_proto);
         self.set_vpn(PV::from(persist::PersistedVpnConfiguring {
             request: MessageField::some(request),
             ..Default::default()
@@ -485,7 +545,9 @@ impl DaemonState {
     }
 
     pub fn vpn_set_connected(&mut self, active: &ActiveTunnel) {
-        let request = self.current_vpn_request().unwrap_or_else(default_request_proto);
+        let request = self
+            .current_vpn_request()
+            .unwrap_or_else(default_request_proto);
         self.set_vpn(PV::from(persist::PersistedVpnConnected {
             request: MessageField::some(request),
             active: MessageField::some(active_to_proto(active)),
@@ -494,7 +556,9 @@ impl DaemonState {
     }
 
     pub fn vpn_set_reconnecting(&mut self) {
-        let request = self.current_vpn_request().unwrap_or_else(default_request_proto);
+        let request = self
+            .current_vpn_request()
+            .unwrap_or_else(default_request_proto);
         let attempts = self.vpn_attempts().saturating_add(1);
         self.set_vpn(PV::from(persist::PersistedVpnReconnecting {
             request: MessageField::some(request),
@@ -504,7 +568,9 @@ impl DaemonState {
     }
 
     pub fn vpn_set_disconnecting(&mut self) {
-        let request = self.current_vpn_request().unwrap_or_else(default_request_proto);
+        let request = self
+            .current_vpn_request()
+            .unwrap_or_else(default_request_proto);
         self.set_vpn(PV::from(persist::PersistedVpnDisconnecting {
             request: MessageField::some(request),
             ..Default::default()
@@ -516,7 +582,9 @@ impl DaemonState {
     }
 
     pub fn vpn_set_failed(&mut self, error: String) {
-        let request = self.current_vpn_request().unwrap_or_else(default_request_proto);
+        let request = self
+            .current_vpn_request()
+            .unwrap_or_else(default_request_proto);
         self.set_vpn(PV::from(persist::PersistedVpnFailed {
             request: MessageField::some(request),
             error,
@@ -537,7 +605,9 @@ fn make_base(
     persist::PersistedConfiguredBase {
         tenant: MessageField::some(tenant),
         signing: MessageField::some(signing),
-        login_api: login_api.unwrap_or(persist::PersistedLoginApi::Unspecified).into(),
+        login_api: login_api
+            .unwrap_or(persist::PersistedLoginApi::Unspecified)
+            .into(),
         ..Default::default()
     }
 }

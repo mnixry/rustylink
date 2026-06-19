@@ -16,10 +16,8 @@ pub struct ClientIdentity {
     pub language: String,
     pub user_agent: String,
 }
-
-impl ClientIdentity {
-    #[must_use]
-    pub fn android_compatible_default() -> Self {
+impl Default for ClientIdentity {
+    fn default() -> Self {
         let device_id = stable_device_id();
         Self {
             os: "android".to_string(),
@@ -35,7 +33,9 @@ impl ClientIdentity {
             user_agent: "CorpLink/3.2.16 (Android; Rustylink)".to_string(),
         }
     }
+}
 
+impl ClientIdentity {
     #[must_use]
     pub fn query_pairs(&self, now: Timestamp) -> Vec<(&'static str, String)> {
         vec![
@@ -61,20 +61,14 @@ fn stable_device_id() -> String {
                 %error,
                 "failed to read machine UID; using deterministic fallback device id"
             );
-            "rustylink-machine-uid-unavailable".to_string()
+            String::new()
         }
     };
     let mut hasher = Sha256::new();
-    hasher.update(b"rustylink-feilian-device-id-v1");
+    hasher.update(b"device-id-v1");
     hasher.update(machine_uid.trim().as_bytes());
     let digest = hex::encode(hasher.finalize());
     digest[..32].to_string()
-}
-
-impl Default for ClientIdentity {
-    fn default() -> Self {
-        Self::android_compatible_default()
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -83,28 +77,30 @@ impl Default for ClientIdentity {
 
 use rustylink_proto::proto::rustylink::daemon::persist::v1 as persist;
 
+/// Project a persisted identity onto the working `ClientIdentity`, filling any
+/// unset field from the built-in Android-profile [`Default`]
+/// (partial-merge-with-default).  The reverse direction is intentionally
+/// absent: the daemon writes `PersistedIdentity` fields directly (only
+/// per-install overrides such as `device_id`), so a whole-struct round-trip is
+/// never needed.
 impl From<&persist::PersistedIdentity> for ClientIdentity {
     fn from(p: &persist::PersistedIdentity) -> Self {
+        let default = Self::default();
         Self {
-            os: p.os.clone(), os_version: p.os_version.clone(),
-            app_version: p.app_version.clone(), brand: p.brand.clone(),
-            model: p.model.clone(), device_id: p.device_id.clone(),
-            build_number: p.build_number.clone(), os_version_patch: p.os_version_patch.clone(),
-            client_source: p.client_source.clone(), language: p.language.clone(),
-            user_agent: p.user_agent.clone(),
-        }
-    }
-}
-
-impl From<&ClientIdentity> for persist::PersistedIdentity {
-    fn from(i: &ClientIdentity) -> Self {
-        Self {
-            os: i.os.clone(), os_version: i.os_version.clone(),
-            app_version: i.app_version.clone(), brand: i.brand.clone(),
-            model: i.model.clone(), device_id: i.device_id.clone(),
-            build_number: i.build_number.clone(), os_version_patch: i.os_version_patch.clone(),
-            client_source: i.client_source.clone(), language: i.language.clone(),
-            user_agent: i.user_agent.clone(), ..Default::default()
+            os: p.os.clone().unwrap_or(default.os),
+            os_version: p.os_version.clone().unwrap_or(default.os_version),
+            app_version: p.app_version.clone().unwrap_or(default.app_version),
+            brand: p.brand.clone().unwrap_or(default.brand),
+            model: p.model.clone().unwrap_or(default.model),
+            device_id: p.device_id.clone().unwrap_or(default.device_id),
+            build_number: p.build_number.clone().unwrap_or(default.build_number),
+            os_version_patch: p
+                .os_version_patch
+                .clone()
+                .unwrap_or(default.os_version_patch),
+            client_source: p.client_source.clone().unwrap_or(default.client_source),
+            language: p.language.clone().unwrap_or(default.language),
+            user_agent: p.user_agent.clone().unwrap_or(default.user_agent),
         }
     }
 }

@@ -1,9 +1,8 @@
 use std::collections::HashMap;
 
 use rustylink_api::{
-    ApiClient, ApiClientOptions, ApiEndpoint, ApiHooks, ClientIdentity, DotEndpoint,
-    MatchEndpoint, SessionCookies, SigningConfig, SigningContext, TenantEndpoint, VpnDot,
-    build_http_client,
+    ApiClient, ApiClientOptions, ApiEndpoint, ApiHooks, ClientIdentity, DotEndpoint, MatchEndpoint,
+    SessionCookies, SigningConfig, SigningContext, TenantEndpoint, VpnDot, build_http_client,
 };
 use rustylink_proto::proto::rustylink::daemon::persist::v1 as persist;
 use snafu::prelude::*;
@@ -33,7 +32,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct AppContext {
     http: reqwest::Client,
     tenant_client: Option<ApiClient>,
-    match_client: Option<ApiClient>,
+    match_client: ApiClient,
     proto: persist::PersistedState,
     api_options: ApiClientOptions,
 }
@@ -42,11 +41,19 @@ impl AppContext {
     /// Create a new `AppContext` from a proto state snapshot.
     pub fn new(proto: &persist::PersistedState, api_options: ApiClientOptions) -> Result<Self> {
         let http = build_http_client(&api_options).context(ApiSnafu)?;
+        let proto = proto.clone();
+        // The match client targets the infallible default match endpoint, so it
+        // is always present (unlike the tenant client, which needs a base URL).
+        let match_client = ApiClient::for_endpoint(
+            &MatchEndpoint::default(),
+            http.clone(),
+            Self::hooks_for(&proto),
+        );
         let mut ctx = Self {
             http,
             tenant_client: None,
-            match_client: None,
-            proto: proto.clone(),
+            match_client,
+            proto,
             api_options,
         };
         ctx.rebuild_clients();
@@ -74,19 +81,18 @@ impl AppContext {
     }
 
     /// The always-present match-server API client.
-    ///
-    /// # Panics
-    /// Panics if the match client was not built (it always is, in `new`).
     #[must_use]
     pub fn match_client(&self) -> &ApiClient {
-        self.match_client
-            .as_ref()
-            .expect("match client is always built")
+        &self.match_client
     }
 
     pub fn match_client_with_url(&self, base_url: &str) -> Result<ApiClient> {
         let endpoint = MatchEndpoint::new(base_url).context(ApiSnafu)?;
-        Ok(ApiClient::for_endpoint(&endpoint, self.http.clone(), self.build_hooks()))
+        Ok(ApiClient::for_endpoint(
+            &endpoint,
+            self.http.clone(),
+            self.build_hooks(),
+        ))
     }
 
     #[must_use]
@@ -99,7 +105,9 @@ impl AppContext {
         ApiClient::for_endpoint(endpoint, self.http.clone(), self.build_hooks())
     }
 
-    pub fn dot_endpoint(dot: &VpnDot, use_vpn_ip_for_api: bool) -> rustylink_api::Result<DotEndpoint> {
+    pub fn dot_endpoint(
+        dot: &VpnDot, use_vpn_ip_for_api: bool,
+    ) -> rustylink_api::Result<DotEndpoint> {
         DotEndpoint::from_dot(dot, use_vpn_ip_for_api)
     }
 
@@ -140,14 +148,10 @@ impl AppContext {
             .unwrap_or_default()
     }
 
-    /// The device ID from the identity.
+    /// The device ID from the (merged) identity.
     #[must_use]
     pub fn device_id(&self) -> String {
-        self.proto
-            .identity
-            .as_option()
-            .map(|i| i.device_id.clone())
-            .unwrap_or_default()
+        self.identity().device_id
     }
 
     /// The OAuth state (only in Authenticating).
@@ -165,7 +169,10 @@ impl AppContext {
     pub fn selected_base_url(&self) -> Option<String> {
         let tenant = self.tenant()?;
         if tenant.use_backup {
-            tenant.backup_url.clone().or_else(|| tenant.base_url.clone())
+            tenant
+                .backup_url
+                .clone()
+                .or_else(|| tenant.base_url.clone())
         } else {
             tenant.base_url.clone()
         }
@@ -185,58 +192,58 @@ impl AppContext {
     // ------- private helpers -------
 
     fn configured_base(&self) -> Option<&persist::PersistedConfiguredBase> {
-        use persist::persisted_state::AuthState;
-        match &self.proto.auth_state {
-            Some(AuthState::Configured(d)) => d.base.as_option(),
-            Some(AuthState::Authenticating(d)) => d.base.as_option(),
-            Some(AuthState::Authenticated(d)) => d.base.as_option(),
-            Some(AuthState::Expired(d)) => d.base.as_option(),
-            _ => None,
-        }
+        configured_base_of(&self.proto)
     }
 
     fn rebuild_clients(&mut self) {
         let hooks = self.build_hooks();
-        let match_endpoint = MatchEndpoint::default();
-        self.match_client = Some(ApiClient::for_endpoint(
-            &match_endpoint, self.http.clone(), hooks.clone(),
-        ));
-        if let Some(base_url) = self.selected_base_url() {
+        self.match_client =
+            ApiClient::for_endpoint(&MatchEndpoint::default(), self.http.clone(), hooks.clone());
+        self.tenant_client = self.selected_base_url().and_then(|base_url| {
             if let Ok(endpoint) = TenantEndpoint::new(&base_url) {
-                self.tenant_client = Some(ApiClient::for_endpoint(
-                    &endpoint, self.http.clone(), hooks,
-                ));
+                Some(ApiClient::for_endpoint(
+                    &endpoint,
+                    self.http.clone(),
+                    hooks.clone(),
+                ))
             } else {
                 tracing::warn!(%base_url, "invalid tenant base URL");
-                self.tenant_client = None;
+                None
             }
-        } else {
-            self.tenant_client = None;
-        }
+        });
     }
 
     fn build_hooks(&self) -> ApiHooks {
-        let identity = self.identity();
-        let signing = self.signing().unwrap_or_default();
-        let cookies = self
-            .session_cookies()
-            .map(SessionCookies::from_map)
+        Self::hooks_for(&self.proto)
+    }
+
+    fn hooks_for(proto: &persist::PersistedState) -> ApiHooks {
+        use persist::persisted_state::AuthState;
+        let identity = proto
+            .identity
+            .as_option()
+            .map(ClientIdentity::from)
             .unwrap_or_default();
-        let csrf_token = {
-            use persist::persisted_state::AuthState;
-            match &self.proto.auth_state {
-                Some(AuthState::Authenticating(d)) => d.csrf_token.clone(),
-                Some(AuthState::Authenticated(d)) => d.csrf_token.clone(),
-                _ => None,
-            }
+        let signing = configured_base_of(proto)
+            .and_then(|base| base.signing.as_option())
+            .map(SigningConfig::from)
+            .unwrap_or_default();
+        let cookies = match &proto.auth_state {
+            Some(AuthState::Authenticating(d)) => Some(&d.cookies),
+            Some(AuthState::Authenticated(d)) => Some(&d.cookies),
+            _ => None,
+        }
+        .map(SessionCookies::from_map)
+        .unwrap_or_default();
+        let csrf_token = match &proto.auth_state {
+            Some(AuthState::Authenticating(d)) => d.csrf_token.clone(),
+            Some(AuthState::Authenticated(d)) => d.csrf_token.clone(),
+            _ => None,
         };
-        let knock_token = {
-            use persist::persisted_state::AuthState;
-            match &self.proto.auth_state {
-                Some(AuthState::Authenticating(d)) => d.knock_token.clone(),
-                Some(AuthState::Authenticated(d)) => d.knock_token.clone(),
-                _ => None,
-            }
+        let knock_token = match &proto.auth_state {
+            Some(AuthState::Authenticating(d)) => d.knock_token.clone(),
+            Some(AuthState::Authenticated(d)) => d.knock_token.clone(),
+            _ => None,
         };
         ApiHooks {
             identity,
@@ -245,5 +252,19 @@ impl AppContext {
             knock_token,
             signer: SigningContext::new(signing),
         }
+    }
+}
+
+/// The configured tenant/signing base shared by every non-Unconfigured state.
+fn configured_base_of(
+    proto: &persist::PersistedState,
+) -> Option<&persist::PersistedConfiguredBase> {
+    use persist::persisted_state::AuthState;
+    match &proto.auth_state {
+        Some(AuthState::Configured(d)) => d.base.as_option(),
+        Some(AuthState::Authenticating(d)) => d.base.as_option(),
+        Some(AuthState::Authenticated(d)) => d.base.as_option(),
+        Some(AuthState::Expired(d)) => d.base.as_option(),
+        _ => None,
     }
 }

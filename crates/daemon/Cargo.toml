@@ -18,7 +18,7 @@ axum.workspace                  = true
 buffa.workspace                 = true
 buffa-types.workspace           = true
 clap.workspace                  = true
-connectrpc            = { workspace = true, features = ["axum"] }
+connectrpc                      = { workspace = true, features = ["axum"] }
 connectrpc-reflection.workspace = true
 default-net.workspace           = true
 dirs.workspace                  = true

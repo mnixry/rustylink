@@ -48,7 +48,8 @@ fn current_net() -> NetSnapshot {
     }
 }
 
-/// Returns true if the pinned interface is present in the system interface list.
+/// Returns true if the pinned interface is present in the system interface
+/// list.
 fn interface_present(name: &str) -> bool {
     default_net::get_interfaces().iter().any(|i| i.name == name)
 }
@@ -72,8 +73,7 @@ pub async fn run<F, Fut>(
 ) -> SupervisorOutcome
 where
     F: FnMut() -> Fut + Send,
-    Fut: std::future::Future<Output = bool> + Send,
-{
+    Fut: std::future::Future<Output = bool> + Send, {
     let mut handshake_tick = tokio::time::interval(HANDSHAKE_POLL);
     let mut network_tick = tokio::time::interval(NETWORK_POLL);
     let mut report_tick = tokio::time::interval(REPORT_INTERVAL);

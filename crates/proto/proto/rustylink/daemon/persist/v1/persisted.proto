@@ -125,18 +125,22 @@ message PersistedTenant {
   optional string name = 4;
 }
 
+// Device identity sent to the tenant. Every field is optional: unset fields
+// fall back to the built-in Android-profile default when projected to the
+// working `ClientIdentity` (partial-merge-with-default), so the persisted
+// state only needs to carry per-install overrides (e.g. the device id).
 message PersistedIdentity {
-  string os = 1;
-  string os_version = 2;
-  string app_version = 3;
-  string brand = 4;
-  string model = 5;
-  string device_id = 6;
-  string build_number = 7;
-  string os_version_patch = 8;
-  string client_source = 9;
-  string language = 10;
-  string user_agent = 11;
+  optional string os = 1;
+  optional string os_version = 2;
+  optional string app_version = 3;
+  optional string brand = 4;
+  optional string model = 5;
+  optional string device_id = 6;
+  optional string build_number = 7;
+  optional string os_version_patch = 8;
+  optional string client_source = 9;
+  optional string language = 10;
+  optional string user_agent = 11;
 }
 
 message PersistedSigning {
@@ -159,10 +163,14 @@ message PersistedSigningRule {
 }
 
 message PersistedTotp {
-  string secret = 1;
-  string algorithm = 2;
-  uint32 digits = 3;
-  uint32 period = 4;
+  // The otpauth:// provisioning URI returned by POST /api/v2/p/otp. It carries
+  // the secret, algorithm, digits and period; parsed via totp-rs's otpauth
+  // feature to generate codes. Empty/unset means no tenant OTP.
+  string url = 1;
+  // Server clock offset in seconds (server_time - local_time, from the OTP
+  // response timestamp), applied when generating codes so they validate against
+  // the server's clock even if the host clock drifts.
+  int64 time_diff_seconds = 2;
 }
 
 message PersistedOauth {
