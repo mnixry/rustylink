@@ -1,6 +1,7 @@
 import { Navigate } from "react-router"
 import { AppHeader } from "@/components/app-header"
 import { FullScreenLoader } from "@/components/full-screen-loader"
+import { SettingsSection } from "@/features/settings/settings-section"
 import { ConnectCard } from "@/features/vpn/connect-card"
 import { LocationsSection } from "@/features/vpn/locations-section"
 import { Session_State } from "@/gen/rustylink/daemon/v1/session_pb"
@@ -29,6 +30,7 @@ function Dashboard() {
       <main className="mx-auto max-w-3xl space-y-6 px-4 py-6">
         <ConnectCard />
         <LocationsSection />
+        <SettingsSection />
       </main>
     </div>
   )
