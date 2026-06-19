@@ -20,7 +20,7 @@ impl Default for ClientIdentity {
     fn default() -> Self {
         let device_id = stable_device_id();
         Self {
-            os: "android".to_string(),
+            os: "Android".to_string(),
             os_version: "35".to_string(),
             app_version: "3.2.16".to_string(),
             brand: "Google".to_string(),
