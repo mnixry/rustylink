@@ -1,0 +1,12 @@
+version: v2
+inputs:
+  - directory: ../crates/proto/proto
+plugins:
+  # Message + service schema (protobuf-es). Local npm plugin, pinned in devDeps.
+  - local: ./node_modules/.bin/protoc-gen-es
+    out: src/gen
+    opt: target=ts
+  # Per-RPC convenience exports for connect-query (TanStack Query).
+  - local: ./node_modules/.bin/protoc-gen-connect-query
+    out: src/gen
+    opt: target=ts
