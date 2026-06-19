@@ -70,37 +70,3 @@ fn stable_device_id() -> String {
     let digest = hex::encode(hasher.finalize());
     digest[..32].to_string()
 }
-
-// ---------------------------------------------------------------------------
-// Proto bridge: ClientIdentity <-> PersistedIdentity
-// ---------------------------------------------------------------------------
-
-use rustylink_proto::proto::rustylink::daemon::persist::v1 as persist;
-
-/// Project a persisted identity onto the working `ClientIdentity`, filling any
-/// unset field from the built-in Android-profile [`Default`]
-/// (partial-merge-with-default).  The reverse direction is intentionally
-/// absent: the daemon writes `PersistedIdentity` fields directly (only
-/// per-install overrides such as `device_id`), so a whole-struct round-trip is
-/// never needed.
-impl From<&persist::PersistedIdentity> for ClientIdentity {
-    fn from(p: &persist::PersistedIdentity) -> Self {
-        let default = Self::default();
-        Self {
-            os: p.os.clone().unwrap_or(default.os),
-            os_version: p.os_version.clone().unwrap_or(default.os_version),
-            app_version: p.app_version.clone().unwrap_or(default.app_version),
-            brand: p.brand.clone().unwrap_or(default.brand),
-            model: p.model.clone().unwrap_or(default.model),
-            device_id: p.device_id.clone().unwrap_or(default.device_id),
-            build_number: p.build_number.clone().unwrap_or(default.build_number),
-            os_version_patch: p
-                .os_version_patch
-                .clone()
-                .unwrap_or(default.os_version_patch),
-            client_source: p.client_source.clone().unwrap_or(default.client_source),
-            language: p.language.clone().unwrap_or(default.language),
-            user_agent: p.user_agent.clone().unwrap_or(default.user_agent),
-        }
-    }
-}

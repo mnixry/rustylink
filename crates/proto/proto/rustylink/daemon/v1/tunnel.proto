@@ -5,6 +5,10 @@ package rustylink.daemon.v1;
 import "google/protobuf/timestamp.proto";
 import "rustylink/daemon/v1/types.proto";
 
+// ---------------------------------------------------------------------------
+// Tunnel state — used by VpnService RPCs and WatchTunnel stream
+// ---------------------------------------------------------------------------
+
 message Tunnel {
   enum State {
     STATE_UNSPECIFIED = 0;
@@ -28,6 +32,7 @@ message Tunnel {
   google.protobuf.Timestamp last_handshake_at = 9;
   uint32 reconnect_attempts = 10;
   string error = 11;
+  string outbound_interface = 12;
 }
 
 message GetTunnelRequest {}
@@ -71,4 +76,32 @@ message VpnLocation {
   string icon = 7;
   bool dedicated = 8;
   string tag = 9;
+}
+
+// ---------------------------------------------------------------------------
+// WatchTunnel — server-side streaming for VPN state changes
+// ---------------------------------------------------------------------------
+
+message WatchTunnelRequest {}
+
+message WatchTunnelResponse {
+  Tunnel tunnel = 1;
+  google.protobuf.Timestamp updated_at = 2;
+}
+
+// ---------------------------------------------------------------------------
+// ProbeDotLatency — client-side ICMP latency probing for dot selection
+// ---------------------------------------------------------------------------
+
+message ProbeDotLatencyRequest {}
+
+message ProbeDotLatencyResponse {
+  repeated DotLatency results = 1;
+}
+
+message DotLatency {
+  int32 dot_id = 1;
+  string dot_name = 2;
+  int32 latency_ms = 3;
+  bool reachable = 4;
 }

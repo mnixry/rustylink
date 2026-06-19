@@ -6,14 +6,14 @@
 //!   precondition, upstream auth/availability). Each maps to a specific Connect
 //!   [`ErrorCode`] and carries a human-readable message; logged at **debug**.
 //! * [`InternalError`] — failures the client cannot act on (tunnel,
-//!   persistence, context setup, unexpected upstream/transport errors). Always
-//!   surfaced as [`ErrorCode::Internal`] with an opaque message; logged in full
-//!   at **error** when converted to a [`ConnectError`].
+//!   persistence, unexpected upstream/transport errors). Always surfaced as
+//!   [`ErrorCode::Internal`] with an opaque message; logged in full at
+//!   **error** when converted to a [`ConnectError`].
 //!
 //! Handlers return [`DaemonError`], a carrier that is either a fault or an
-//! internal error. Core (`auth`/`vpn`/`context`) errors are classified on the
-//! way in: an upstream auth/availability failure becomes a fault, everything
-//! else is internal.
+//! internal error. Core (`auth`/`vpn`) errors are classified on the way in: an
+//! upstream auth/availability failure becomes a fault, everything else is
+//! internal.
 
 use connectrpc::{ConnectError, ErrorCode};
 use rustylink_api::Error as ApiError;
@@ -65,14 +65,8 @@ pub enum InternalError {
 
     #[snafu(display("state persistence failed"))]
     Persist {
-        #[snafu(source(from(crate::state::Error, Box::new)))]
-        source: Box<crate::state::Error>,
-    },
-
-    #[snafu(display("context setup failed"))]
-    Context {
-        #[snafu(source(from(rustylink_core::context::Error, Box::new)))]
-        source: Box<rustylink_core::context::Error>,
+        #[snafu(source(from(crate::persist::Error, Box::new)))]
+        source: Box<crate::persist::Error>,
     },
 
     #[snafu(display("authentication flow error"))]
@@ -132,8 +126,8 @@ impl From<InternalError> for DaemonError {
     }
 }
 
-impl From<crate::state::Error> for DaemonError {
-    fn from(error: crate::state::Error) -> Self {
+impl From<crate::persist::Error> for DaemonError {
+    fn from(error: crate::persist::Error) -> Self {
         Self::Internal(InternalError::Persist {
             source: Box::new(error),
         })
@@ -158,19 +152,6 @@ impl From<rustylink_core::vpn::Error> for DaemonError {
         vpn_api(&error).and_then(classify_api).map_or_else(
             || {
                 Self::Internal(InternalError::Vpn {
-                    source: Box::new(error),
-                })
-            },
-            Self::Fault,
-        )
-    }
-}
-
-impl From<rustylink_core::context::Error> for DaemonError {
-    fn from(error: rustylink_core::context::Error) -> Self {
-        context_api(&error).and_then(classify_api).map_or_else(
-            || {
-                Self::Internal(InternalError::Context {
                     source: Box::new(error),
                 })
             },
@@ -215,13 +196,6 @@ fn vpn_api(error: &rustylink_core::vpn::Error) -> Option<&ApiError> {
     match error {
         rustylink_core::vpn::Error::Api { source } => Some(source),
         _ => None,
-    }
-}
-
-fn context_api(error: &rustylink_core::context::Error) -> Option<&ApiError> {
-    match error {
-        rustylink_core::context::Error::Api { source } => Some(source),
-        rustylink_core::context::Error::MissingBaseUrl => None,
     }
 }
 

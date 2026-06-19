@@ -1,17 +1,12 @@
-use rustylink_api::{BaseResponse, SecurityReportItem, SecurityReportRequest, SendableRequest};
+use rustylink_api::{
+    ApiClient, BaseResponse, ResponseMeta, SecurityReportItem, SecurityReportRequest,
+    SendableRequest,
+};
 use snafu::prelude::*;
-
-use crate::{AppContext, state::StateChange};
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
 pub enum Error {
-    #[snafu(display("application context operation failed"))]
-    Context {
-        #[snafu(source(from(crate::context::Error, Box::new)))]
-        source: Box<crate::context::Error>,
-    },
-
     #[snafu(display("API operation failed"))]
     Api {
         #[snafu(source(from(rustylink_api::Error, Box::new)))]
@@ -22,26 +17,14 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub async fn report_security(
-    ctx: &AppContext, report: &SecurityReportRequest,
-) -> Result<(BaseResponse<String>, Vec<StateChange>)> {
-    let client = ctx.tenant_client().context(ContextSnafu)?;
+    client: &ApiClient, report: &SecurityReportRequest,
+) -> Result<(BaseResponse<String>, ResponseMeta)> {
     let (response, meta) = report
         .clone()
         .send_with_meta(client)
         .await
         .context(ApiSnafu)?;
-    let mut changes = Vec::new();
-    if let Some(cookies) = &meta.cookies {
-        changes.push(StateChange::CookiesUpdated {
-            cookies: cookies.to_map(),
-        });
-    }
-    if let Some(csrf) = &meta.csrf_token {
-        changes.push(StateChange::CsrfTokenUpdated {
-            token: Some(csrf.clone()),
-        });
-    }
-    Ok((response, changes))
+    Ok((response, meta))
 }
 
 #[must_use]

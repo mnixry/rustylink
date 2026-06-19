@@ -1,68 +1,1125 @@
-//! Daemon state — a thin wrapper around the canonical proto `PersistedState`.
+//! Daemon state machines — auth (statig) and VPN (plain enum).
 //!
-//! The persisted proto **is** the state machine: a two-level oneof where each
-//! variant carries exactly the data valid in that state.  Invalid combinations
-//! (e.g. VPN Connected while Unconfigured) are unrepresentable.  All state
-//! transitions are methods on [`DaemonState`] that navigate the oneof directly
-//! — there is no parallel Rust state type and no whole-state conversion.
+//! ## `AuthMachine`
 //!
-//! Persisted as buffa JSON (camelCase, RFC 3339 timestamps, enum names).
+//! A [`statig`]-based hierarchical state machine owning all auth-related state
+//! (tenant, signing, cookies, tokens).  State handlers call
+//! [`rustylink_core::auth`] functions directly — the machine builds an
+//! [`ApiClient`] from its own fields for each API call.
+//!
+//! States: `Unconfigured → Configured → AwaitingOtp / AwaitingMfa /
+//! AwaitingOAuth → Authenticated`.
+//!
+//! ## `VpnMachine`
+//!
+//! A plain `enum`-based state machine (no statig).  VPN state transitions are
+//! driven by background tasks (connect loop, supervisor) which make statig's
+//! `&mut self` locking problematic.  Explicit transition methods advance the
+//! state.
 
-use std::{
-    collections::HashMap,
-    fs,
-    io::Write as _,
-    os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _},
-    path::{Path, PathBuf},
+use std::collections::BTreeMap;
+
+use jiff::Timestamp;
+use rustylink_api::{
+    ApiClient, ApiHooks, ClientIdentity, LoginV2Result, MatchEndpoint, ResponseMeta,
+    SessionCookies, SigningConfig, SigningContext, TenantEndpoint,
+};
+use rustylink_core::vpn::VpnConnectMode;
+use rustylink_proto::proto::rustylink::daemon::v1 as pb;
+use rustylink_tunnel::TunnelSession;
+use statig::prelude::*;
+use tokio_util::sync::CancellationToken;
+
+use crate::persist::{
+    LoginApiVersion, PersistedCredentials, PersistedSigningConfig, PersistedTotpConfig,
+    TenantConfig,
 };
 
-use buffa::MessageField;
-use jiff::Timestamp;
-use persist::{persisted_authenticated::VpnState as PV, persisted_state::AuthState as PA};
-use rustylink_core::vpn::VpnConnectMode;
-use rustylink_proto::proto::rustylink::daemon::{persist::v1 as persist, v1 as pb};
-use snafu::prelude::*;
-
-#[derive(Debug, Snafu)]
-#[snafu(visibility(pub(crate)))]
-pub enum Error {
-    #[snafu(display("failed to read state file {}", path.display()))]
-    Read {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    #[snafu(display("failed to write state file {}", path.display()))]
-    Write {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    #[snafu(display("failed to create state directory {}", path.display()))]
-    CreateDir {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    #[snafu(display("failed to parse state file {}", path.display()))]
-    Parse {
-        path: PathBuf,
-        source: serde_json::Error,
-    },
-    #[snafu(display("failed to serialize state"))]
-    Serialize { source: serde_json::Error },
+/// Pending OAuth flow parameters, stored in shared storage because statig
+/// state-local `&String` parameters trigger false-positive `ptr_arg` lints.
+#[derive(Clone, Debug)]
+pub struct OAuthPending {
+    pub alias_key: String,
+    pub oauth_state: String,
+    pub poll_token: String,
+    pub pkce_verifier: String,
 }
 
-pub type Result<T, E = Error> = std::result::Result<T, E>;
-
-const STATE_VERSION: u32 = 2;
+/// Pending device login flow parameters (QR/headless login).
+#[derive(Clone, Debug)]
+pub struct DeviceLoginPending {
+    pub login_url: String,
+    pub alias_key: String,
+    pub poll_token: String,
+    pub pkce_verifier: String,
+}
 
 // =========================================================================
-// Live working types (kept for behavior; persisted via proto conversion)
+// `AuthMachine` — statig-based auth state machine
+// =========================================================================
+
+/// Shared storage for the auth state machine.
+///
+/// All fields are updated by state handlers; the daemon reads them after each
+/// transition to persist and broadcast.
+pub struct AuthMachine {
+    /// Shared HTTP connection pool (clone-cheap, `Arc`-backed).
+    pub(crate) http_pool: reqwest::Client,
+    /// Device identity used for API request decoration.
+    pub(crate) identity: ClientIdentity,
+    /// Tenant connection parameters (set after activation).
+    pub(crate) tenant: Option<TenantConfig>,
+    /// Signing / HMAC configuration (set after activation).
+    pub(crate) signing: Option<PersistedSigningConfig>,
+    /// HTTP session cookies (`name → value`).
+    pub(crate) cookies: BTreeMap<String, String>,
+    /// CSRF token from `Set-Cookie: csrf-token=…`.
+    pub(crate) csrf_token: Option<String>,
+    /// Knock token for API request decoration.
+    pub(crate) knock_token: Option<String>,
+    /// TOTP provisioning for auto-reconnect OTP generation.
+    pub(crate) totp: Option<PersistedTotpConfig>,
+    /// Which login API variant the tenant uses.
+    pub(crate) login_api_version: LoginApiVersion,
+    /// Pending OAuth flow parameters (set when entering `AwaitingOauth`).
+    pub(crate) oauth_pending: Option<OAuthPending>,
+    /// Pending device login flow parameters (set when entering
+    /// `AwaitingDeviceLogin`).
+    pub(crate) device_login_pending: Option<DeviceLoginPending>,
+    /// Last error from a state handler (inspected by the daemon after
+    /// `handle()`).  Cleared at the start of each handler invocation.
+    pub(crate) last_error: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Auth events
+// ---------------------------------------------------------------------------
+
+/// Events consumed by the auth state machine.
+#[derive(Debug)]
+pub enum AuthEvent {
+    /// Tenant activation via the match server.
+    Activate {
+        code: String,
+        /// Fallback tenant base URL (used when the activation response omits
+        /// one).
+        base_url: Option<String>,
+        /// Fallback backup URL.
+        backup_url: Option<String>,
+        /// Match server URL override (defaults to
+        /// [`DEFAULT_MATCH_BASE_URL`]).
+        match_base_url: Option<String>,
+    },
+    /// Username + password login (legacy or v1, dispatched automatically).
+    Login {
+        account: String,
+        password: String,
+        login_scene: String,
+        account_type: String,
+    },
+    /// Request a login verification code (OTP via SMS/email).
+    SendLoginCode {
+        account: String,
+        login_type: String,
+        login_scene: String,
+        account_type: String,
+    },
+    /// Verify a received login code.
+    VerifyLoginCode {
+        account: String,
+        code: String,
+        login_type: String,
+        login_scene: String,
+        account_type: String,
+    },
+    /// Send an MFA challenge code.
+    SendMfaCode {
+        mfa_type: String,
+        account: String,
+        login_scene: String,
+    },
+    /// Verify an MFA challenge.
+    VerifyMfa {
+        mfa_type: String,
+        account: String,
+        code: Option<String>,
+        password: Option<String>,
+        login_scene: String,
+    },
+    /// Skip a skippable MFA challenge.
+    SkipChallenge { login_scene: String },
+    /// Begin a third-party OAuth login flow.
+    StartOAuth {
+        alias_key: String,
+        redirect_uri: String,
+    },
+    /// Complete an OAuth login with the authorization code.
+    CompleteOAuth { code: String, state: String },
+    /// Begin a device/QR login flow (headless CLI).
+    #[allow(dead_code)]
+    StartDeviceLogin { alias_key: String },
+    /// Complete a device login with the authorization code from polling.
+    #[allow(dead_code)]
+    CompleteDeviceLogin { code: String, state: String },
+    /// Log out of the current session.
+    Logout { logout_all: bool },
+
+    // -- passthrough events (no state transition; update shared storage) --
+    /// Merge cookies/CSRF from an out-of-band API response.
+    MergeResponseMeta {
+        cookies: BTreeMap<String, String>,
+        csrf_token: Option<String>,
+    },
+    /// Store the TOTP provisioning config after a successful fetch.
+    StoreTotp { config: Option<PersistedTotpConfig> },
+    /// Update the detected login API version.
+    SetLoginApiVersion { version: LoginApiVersion },
+}
+
+// ---------------------------------------------------------------------------
+// statig state machine — AuthMachine
+// ---------------------------------------------------------------------------
+
+#[state_machine(initial = "State::unconfigured()")]
+impl AuthMachine {
+    // ----- Unconfigured -----
+
+    #[state]
+    async fn unconfigured(&mut self, event: &AuthEvent) -> Response<State> {
+        self.last_error = None;
+        match event {
+            AuthEvent::Activate {
+                code,
+                base_url,
+                backup_url,
+                match_base_url,
+            } => {
+                self.handle_activate(
+                    code,
+                    base_url.as_deref(),
+                    backup_url.as_deref(),
+                    match_base_url.as_deref(),
+                )
+                .await
+            }
+            other => self.handle_passthrough(other),
+        }
+    }
+
+    // ----- Configured -----
+
+    #[state]
+    async fn configured(&mut self, event: &AuthEvent) -> Response<State> {
+        self.last_error = None;
+        match event {
+            AuthEvent::Activate {
+                code,
+                base_url,
+                backup_url,
+                match_base_url,
+            } => {
+                self.handle_activate(
+                    code,
+                    base_url.as_deref(),
+                    backup_url.as_deref(),
+                    match_base_url.as_deref(),
+                )
+                .await
+            }
+            AuthEvent::Login {
+                account,
+                password,
+                login_scene,
+                account_type,
+            } => {
+                self.handle_login(account, password, login_scene, account_type)
+                    .await
+            }
+            AuthEvent::SendLoginCode {
+                account,
+                login_type,
+                login_scene,
+                account_type,
+            } => {
+                self.handle_send_login_code(account, login_type, login_scene, account_type)
+                    .await
+            }
+            AuthEvent::StartOAuth {
+                alias_key,
+                redirect_uri,
+            } => self.handle_start_oauth(alias_key, redirect_uri).await,
+            AuthEvent::StartDeviceLogin { alias_key } => {
+                self.handle_start_device_login(alias_key).await
+            }
+            other => self.handle_passthrough(other),
+        }
+    }
+
+    // ----- AwaitingOtp (state-local: masked_target, login_type) -----
+
+    #[state]
+    async fn awaiting_otp(
+        &mut self, masked_target: &String, login_type: &String, event: &AuthEvent,
+    ) -> Response<State> {
+        self.last_error = None;
+        let _ = (masked_target, login_type); // used by proto projection
+        match event {
+            AuthEvent::VerifyLoginCode {
+                account,
+                code,
+                login_type: lt,
+                login_scene,
+                account_type,
+            } => {
+                self.handle_verify_login_code(account, code, lt, login_scene, account_type)
+                    .await
+            }
+            AuthEvent::SendLoginCode {
+                account,
+                login_type: lt,
+                login_scene,
+                account_type,
+            } => {
+                self.handle_send_login_code(account, lt, login_scene, account_type)
+                    .await
+            }
+            AuthEvent::Logout { logout_all } => self.handle_logout(*logout_all).await,
+            other => self.handle_passthrough(other),
+        }
+    }
+
+    // ----- AwaitingMfa (state-local: mfa metadata) -----
+
+    #[state]
+    #[allow(clippy::too_many_arguments)]
+    async fn awaiting_mfa(
+        &mut self, mfa_type: &String, auth_list: &Vec<String>, can_skip: &bool,
+        masked_mobile: &String, masked_email: &String, event: &AuthEvent,
+    ) -> Response<State> {
+        self.last_error = None;
+        let _ = (mfa_type, auth_list, can_skip, masked_mobile, masked_email);
+        match event {
+            AuthEvent::VerifyMfa {
+                mfa_type,
+                account,
+                code,
+                password,
+                login_scene,
+            } => {
+                self.handle_verify_mfa(
+                    mfa_type,
+                    account,
+                    code.as_deref(),
+                    password.as_deref(),
+                    login_scene,
+                )
+                .await
+            }
+            AuthEvent::SendMfaCode {
+                mfa_type,
+                account,
+                login_scene,
+            } => {
+                self.handle_send_mfa_code(mfa_type, account, login_scene)
+                    .await
+            }
+            AuthEvent::SkipChallenge { login_scene } => {
+                self.handle_skip_challenge(login_scene).await
+            }
+            AuthEvent::Logout { logout_all } => self.handle_logout(*logout_all).await,
+            other => self.handle_passthrough(other),
+        }
+    }
+
+    // ----- AwaitingOAuth (params stored in shared `oauth_pending`) -----
+
+    #[state]
+    async fn awaiting_oauth(&mut self, event: &AuthEvent) -> Response<State> {
+        self.last_error = None;
+        match event {
+            AuthEvent::CompleteOAuth { code, state, .. } => {
+                let pending = self.oauth_pending.take();
+                let Some(p) = pending else {
+                    self.last_error = Some("no pending OAuth flow".into());
+                    return Handled;
+                };
+                self.handle_complete_oauth(&p.alias_key, code, state, &p.pkce_verifier)
+                    .await
+            }
+            AuthEvent::Logout { logout_all } => {
+                self.oauth_pending = None;
+                self.handle_logout(*logout_all).await
+            }
+            other => self.handle_passthrough(other),
+        }
+    }
+
+    // ----- AwaitingDeviceLogin (params stored in shared
+    // `device_login_pending`) -----
+
+    #[state]
+    async fn awaiting_device_login(&mut self, event: &AuthEvent) -> Response<State> {
+        self.last_error = None;
+        match event {
+            AuthEvent::CompleteDeviceLogin { code, state } => {
+                self.handle_complete_device_login(code, state).await
+            }
+            AuthEvent::Logout { logout_all } => {
+                self.device_login_pending = None;
+                self.handle_logout(*logout_all).await
+            }
+            other => self.handle_passthrough(other),
+        }
+    }
+
+    // ----- Authenticated -----
+
+    #[state]
+    async fn authenticated(&mut self, event: &AuthEvent) -> Response<State> {
+        self.last_error = None;
+        match event {
+            AuthEvent::Logout { logout_all } => self.handle_logout(*logout_all).await,
+            // Re-activation while authenticated (tenant migration).
+            AuthEvent::Activate {
+                code,
+                base_url,
+                backup_url,
+                match_base_url,
+            } => {
+                self.handle_activate(
+                    code,
+                    base_url.as_deref(),
+                    backup_url.as_deref(),
+                    match_base_url.as_deref(),
+                )
+                .await
+            }
+            other => self.handle_passthrough(other),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AuthMachine — event handler helpers (called from state handlers)
+// ---------------------------------------------------------------------------
+
+impl AuthMachine {
+    /// Handle passthrough (side-effect) events that are valid in every state.
+    /// These update shared storage without causing state transitions.
+    fn handle_passthrough(&mut self, event: &AuthEvent) -> Response<State> {
+        match event {
+            AuthEvent::MergeResponseMeta {
+                cookies,
+                csrf_token,
+            } => {
+                for (name, value) in cookies {
+                    self.cookies.insert(name.clone(), value.clone());
+                }
+                if let Some(csrf) = csrf_token {
+                    self.csrf_token = Some(csrf.clone());
+                }
+                Handled
+            }
+            AuthEvent::StoreTotp { config } => {
+                self.totp.clone_from(config);
+                Handled
+            }
+            AuthEvent::SetLoginApiVersion { version } => {
+                self.login_api_version = *version;
+                Handled
+            }
+            _ => Handled,
+        }
+    }
+
+    async fn handle_activate(
+        &mut self, code: &str, base_url: Option<&str>, backup_url: Option<&str>,
+        match_base_url: Option<&str>,
+    ) -> Response<State> {
+        let match_client = self.build_match_client(match_base_url);
+        match rustylink_core::auth::activate(&match_client, code).await {
+            Ok((response, meta)) => {
+                self.merge_meta(&meta);
+                if let Some(data) = &response.data {
+                    let update = rustylink_core::auth::extract_activation_update(data);
+                    self.tenant = Some(TenantConfig {
+                        base_url: update
+                            .base_url
+                            .or_else(|| base_url.map(ToOwned::to_owned))
+                            .unwrap_or_default(),
+                        backup_url: update
+                            .backup_url
+                            .or_else(|| backup_url.map(ToOwned::to_owned)),
+                        use_backup: update.use_backup.unwrap_or(false),
+                        name: update.name.unwrap_or_default(),
+                    });
+                    self.signing = Some(PersistedSigningConfig {
+                        enabled: false,
+                        activation_code: code.to_owned(),
+                        device_id: self.identity.device_id.clone(),
+                    });
+                }
+                Transition(State::configured())
+            }
+            Err(error) => {
+                self.last_error = Some(error.to_string());
+                Handled
+            }
+        }
+    }
+
+    async fn handle_login(
+        &mut self, account: &str, password: &str, login_scene: &str, account_type: &str,
+    ) -> Response<State> {
+        let Some(client) = self.build_tenant_client() else {
+            self.last_error = Some("no tenant configured".into());
+            return Handled;
+        };
+        let result = if self.login_api_version == LoginApiVersion::V1 {
+            rustylink_core::auth::v1_login_password(
+                &client,
+                login_scene.to_owned(),
+                account_type.to_owned(),
+                account.to_owned(),
+                password.to_owned(),
+            )
+            .await
+        } else {
+            rustylink_core::auth::login_password(
+                &client,
+                login_scene.to_owned(),
+                account_type.to_owned(),
+                account.to_owned(),
+                password.to_owned(),
+            )
+            .await
+        };
+        match result {
+            Ok((response, meta)) => {
+                self.merge_meta(&meta);
+                route_login_next(response.data.as_ref())
+            }
+            Err(error) => {
+                self.last_error = Some(error.to_string());
+                Handled
+            }
+        }
+    }
+
+    async fn handle_send_login_code(
+        &mut self, account: &str, login_type: &str, login_scene: &str, account_type: &str,
+    ) -> Response<State> {
+        let Some(client) = self.build_tenant_client() else {
+            self.last_error = Some("no tenant configured".into());
+            return Handled;
+        };
+        let result = if self.login_api_version == LoginApiVersion::V1 {
+            rustylink_core::auth::v1_send_code(
+                &client,
+                login_scene.to_owned(),
+                account_type.to_owned(),
+                login_type.to_owned(),
+                account.to_owned(),
+            )
+            .await
+        } else {
+            rustylink_core::auth::send_code(
+                &client,
+                login_scene.to_owned(),
+                account_type.to_owned(),
+                login_type.to_owned(),
+                account.to_owned(),
+            )
+            .await
+        };
+        match result {
+            Ok((_response, meta)) => {
+                self.merge_meta(&meta);
+                // Stay in current state — the user hasn't entered the code yet.
+                Handled
+            }
+            Err(error) => {
+                self.last_error = Some(error.to_string());
+                Handled
+            }
+        }
+    }
+
+    async fn handle_verify_login_code(
+        &mut self, account: &str, code: &str, login_type: &str, login_scene: &str,
+        account_type: &str,
+    ) -> Response<State> {
+        let Some(client) = self.build_tenant_client() else {
+            self.last_error = Some("no tenant configured".into());
+            return Handled;
+        };
+        let result = if self.login_api_version == LoginApiVersion::V1 {
+            rustylink_core::auth::v1_verify_code(
+                &client,
+                login_scene.to_owned(),
+                account_type.to_owned(),
+                login_type.to_owned(),
+                account.to_owned(),
+                code.to_owned(),
+            )
+            .await
+        } else {
+            rustylink_core::auth::verify_code(
+                &client,
+                login_scene.to_owned(),
+                account_type.to_owned(),
+                login_type.to_owned(),
+                account.to_owned(),
+                code.to_owned(),
+            )
+            .await
+        };
+        match result {
+            Ok((response, meta)) => {
+                self.merge_meta(&meta);
+                route_login_next(response.data.as_ref())
+            }
+            Err(error) => {
+                self.last_error = Some(error.to_string());
+                Handled
+            }
+        }
+    }
+
+    async fn handle_send_mfa_code(
+        &mut self, mfa_type: &str, account: &str, login_scene: &str,
+    ) -> Response<State> {
+        let Some(client) = self.build_tenant_client() else {
+            self.last_error = Some("no tenant configured".into());
+            return Handled;
+        };
+        if self.login_api_version != LoginApiVersion::V1 {
+            // Legacy (pre-v1) flow has no separate MFA send endpoint.
+            return Handled;
+        }
+        let result = rustylink_core::auth::v1_mfa_send(
+            &client,
+            login_scene.to_owned(),
+            mfa_type.to_owned(),
+            account.to_owned(),
+        )
+        .await;
+        match result {
+            Ok((_response, meta)) => {
+                self.merge_meta(&meta);
+                Handled
+            }
+            Err(error) => {
+                self.last_error = Some(error.to_string());
+                Handled
+            }
+        }
+    }
+
+    async fn handle_verify_mfa(
+        &mut self, mfa_type: &str, account: &str, code: Option<&str>, password: Option<&str>,
+        login_scene: &str,
+    ) -> Response<State> {
+        let Some(client) = self.build_tenant_client() else {
+            self.last_error = Some("no tenant configured".into());
+            return Handled;
+        };
+        let result = if self.login_api_version == LoginApiVersion::V1 {
+            rustylink_core::auth::v1_mfa_verify(
+                &client,
+                login_scene.to_owned(),
+                mfa_type.to_owned(),
+                account.to_owned(),
+                code.map(ToOwned::to_owned),
+                password.map(ToOwned::to_owned),
+            )
+            .await
+        } else {
+            rustylink_core::auth::verify_mfa(
+                &client,
+                login_scene.to_owned(),
+                mfa_type.to_owned(),
+                account.to_owned(),
+                code.map(ToOwned::to_owned),
+                password.map(ToOwned::to_owned),
+            )
+            .await
+        };
+        match result {
+            Ok((response, meta)) => {
+                self.merge_meta(&meta);
+                route_login_next(response.data.as_ref())
+            }
+            Err(error) => {
+                self.last_error = Some(error.to_string());
+                Handled
+            }
+        }
+    }
+
+    async fn handle_skip_challenge(&mut self, login_scene: &str) -> Response<State> {
+        let Some(client) = self.build_tenant_client() else {
+            self.last_error = Some("no tenant configured".into());
+            return Handled;
+        };
+        match rustylink_core::auth::v1_login_skip(&client, login_scene.to_owned(), String::new())
+            .await
+        {
+            Ok((response, meta)) => {
+                self.merge_meta(&meta);
+                route_login_next(response.data.as_ref())
+            }
+            Err(error) => {
+                self.last_error = Some(error.to_string());
+                Handled
+            }
+        }
+    }
+
+    async fn handle_start_oauth(&mut self, alias_key: &str, redirect_uri: &str) -> Response<State> {
+        let Some(client) = self.build_tenant_client() else {
+            self.last_error = Some("no tenant configured".into());
+            return Handled;
+        };
+        // Fetch provider list to find the auth URL for this alias.
+        let links_result = rustylink_core::auth::third_party_login_links(&client).await;
+        let (links, meta) = match links_result {
+            Ok((links, meta)) => (links, meta),
+            Err(error) => {
+                self.last_error = Some(error.to_string());
+                return Handled;
+            }
+        };
+        self.merge_meta(&meta);
+
+        let auth_url = links
+            .response
+            .data
+            .unwrap_or_default()
+            .into_iter()
+            .find(|info| info.alias_key.as_deref() == Some(alias_key))
+            .and_then(|info| info.login_url.or(info.url));
+        let Some(auth_url) = auth_url else {
+            self.last_error = Some(format!("unknown provider alias `{alias_key}`"));
+            return Handled;
+        };
+
+        match rustylink_core::auth::start_oauth(&auth_url, alias_key.to_owned(), None, redirect_uri)
+        {
+            Ok(oauth_start) => {
+                self.oauth_pending = Some(OAuthPending {
+                    alias_key: oauth_start.alias_key,
+                    oauth_state: oauth_start.state,
+                    poll_token: String::new(),
+                    pkce_verifier: oauth_start.code_verifier,
+                });
+                Transition(State::awaiting_oauth())
+            }
+            Err(error) => {
+                self.last_error = Some(error.to_string());
+                Handled
+            }
+        }
+    }
+
+    async fn handle_complete_oauth(
+        &mut self, alias_key: &str, code: &str, state: &str, pkce_verifier: &str,
+    ) -> Response<State> {
+        let Some(client) = self.build_tenant_client() else {
+            self.last_error = Some("no tenant configured".into());
+            return Handled;
+        };
+        match rustylink_core::auth::oauth_callback(
+            &client,
+            alias_key.to_owned(),
+            code.to_owned(),
+            state.to_owned(),
+            pkce_verifier.to_owned(),
+        )
+        .await
+        {
+            Ok((_response, meta)) => {
+                self.merge_meta(&meta);
+                Transition(State::authenticated())
+            }
+            Err(error) => {
+                self.last_error = Some(error.to_string());
+                Handled
+            }
+        }
+    }
+
+    async fn handle_start_device_login(&mut self, alias_key: &str) -> Response<State> {
+        let Some(client) = self.build_tenant_client() else {
+            self.last_error = Some("no tenant configured".into());
+            return Handled;
+        };
+        // Fetch provider list (includes PKCE code_challenge in the request).
+        let (links, meta) = match rustylink_core::auth::third_party_login_links(&client).await {
+            Ok(pair) => pair,
+            Err(error) => {
+                self.last_error = Some(error.to_string());
+                return Handled;
+            }
+        };
+        self.merge_meta(&meta);
+
+        let provider = links
+            .response
+            .data
+            .unwrap_or_default()
+            .into_iter()
+            .find(|info| info.alias_key.as_deref() == Some(alias_key));
+        let Some(provider) = provider else {
+            self.last_error = Some(format!("unknown provider alias `{alias_key}`"));
+            return Handled;
+        };
+
+        let login_url = provider.login_url.or(provider.url).unwrap_or_default();
+        let poll_token = provider.token.unwrap_or_default();
+
+        if poll_token.is_empty() {
+            self.last_error = Some(format!("provider `{alias_key}` does not support polling"));
+            return Handled;
+        }
+
+        self.device_login_pending = Some(DeviceLoginPending {
+            login_url,
+            alias_key: alias_key.to_owned(),
+            poll_token,
+            pkce_verifier: links.code_verifier,
+        });
+        Transition(State::awaiting_device_login())
+    }
+
+    async fn handle_complete_device_login(&mut self, code: &str, state: &str) -> Response<State> {
+        let pending = self.device_login_pending.take();
+        let Some(p) = pending else {
+            self.last_error = Some("no pending device login flow".into());
+            return Handled;
+        };
+        let Some(client) = self.build_tenant_client() else {
+            self.last_error = Some("no tenant configured".into());
+            return Handled;
+        };
+        match rustylink_core::auth::device_oauth_callback(
+            &client,
+            p.alias_key,
+            code.to_owned(),
+            state.to_owned(),
+            Some(p.pkce_verifier),
+        )
+        .await
+        {
+            Ok((response, meta)) => {
+                self.merge_meta(&meta);
+                route_login_next(response.data.as_ref())
+            }
+            Err(error) => {
+                self.last_error = Some(error.to_string());
+                Handled
+            }
+        }
+    }
+
+    async fn handle_logout(&mut self, logout_all: bool) -> Response<State> {
+        // Best-effort server-side logout.
+        if let Some(client) = self.build_tenant_client() {
+            match rustylink_core::auth::logout(&client, logout_all).await {
+                Ok((_response, meta)) => self.merge_meta(&meta),
+                Err(error) => {
+                    tracing::warn!(%error, "server-side logout failed (proceeding locally)");
+                }
+            }
+        }
+        self.clear_session();
+        Transition(State::configured())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AuthMachine — client construction + state helpers
+// ---------------------------------------------------------------------------
+
+impl AuthMachine {
+    /// Build an [`ApiClient`] pointing at the tenant's base URL with the
+    /// current signing/cookie state.  Returns `None` before activation.
+    pub fn build_tenant_client(&self) -> Option<ApiClient> {
+        let tenant = self.tenant.as_ref()?;
+        let endpoint = TenantEndpoint::new(&tenant.base_url).ok()?;
+        let hooks = self.build_hooks();
+        Some(ApiClient::for_endpoint(
+            &endpoint,
+            self.http_pool.clone(),
+            hooks,
+        ))
+    }
+
+    /// Build an [`ApiClient`] pointing at the match server (for activation).
+    pub fn build_match_client(&self, match_url: Option<&str>) -> ApiClient {
+        let endpoint = match_url.map_or_else(MatchEndpoint::default, |url| {
+            MatchEndpoint::new(url).unwrap_or_default()
+        });
+        let hooks = self.build_hooks();
+        ApiClient::for_endpoint(&endpoint, self.http_pool.clone(), hooks)
+    }
+
+    /// Merge cookies and CSRF token from an API response into shared storage.
+    pub fn merge_meta(&mut self, meta: &ResponseMeta) {
+        if let Some(cookies) = &meta.cookies {
+            for (name, value) in &cookies.values {
+                self.cookies.insert(name.clone(), value.clone());
+            }
+        }
+        if let Some(csrf) = &meta.csrf_token {
+            self.csrf_token = Some(csrf.clone());
+        }
+    }
+
+    /// Project the current auth state to an RPC [`Session`](pb::Session)
+    /// message.
+    #[must_use]
+    pub fn to_session_proto(&self, state: &State) -> pb::Session {
+        let status = match state {
+            State::Unconfigured {} => pb::session::State::Unconfigured,
+            State::Configured {} => pb::session::State::Configured,
+            State::AwaitingOtp { .. } => pb::session::State::AwaitingOtp,
+            State::AwaitingMfa { .. } => pb::session::State::AwaitingMfa,
+            State::AwaitingOauth {} => pb::session::State::AwaitingOauth,
+            State::AwaitingDeviceLogin {} => pb::session::State::AwaitingDeviceLogin,
+            State::Authenticated {} => pb::session::State::Authenticated,
+        };
+        let mut session = pb::Session {
+            state: status.into(),
+            tenant_name: self
+                .tenant
+                .as_ref()
+                .map(|t| t.name.clone())
+                .unwrap_or_default(),
+            base_url: self
+                .tenant
+                .as_ref()
+                .map(|t| t.base_url.clone())
+                .unwrap_or_default(),
+            ..Default::default()
+        };
+        // Populate state-specific challenge fields.
+        match state {
+            State::AwaitingOtp {
+                masked_target,
+                login_type,
+            } => {
+                session.otp_challenge = pb::OtpChallenge {
+                    masked_target: masked_target.clone(),
+                    login_type: login_type.clone(),
+                    ..Default::default()
+                }
+                .into();
+            }
+            State::AwaitingMfa {
+                mfa_type,
+                auth_list,
+                can_skip,
+                masked_mobile,
+                masked_email,
+            } => {
+                session.mfa_challenge = pb::MfaChallenge {
+                    mfa_type: mfa_type.clone(),
+                    auth_list: auth_list.clone(),
+                    can_skip: *can_skip,
+                    masked_mobile: masked_mobile.clone(),
+                    masked_email: masked_email.clone(),
+                    ..Default::default()
+                }
+                .into();
+            }
+            State::AwaitingOauth {} => {
+                if let Some(pending) = &self.oauth_pending {
+                    session.oauth_challenge = pb::OauthChallenge {
+                        alias_key: pending.alias_key.clone(),
+                        state: pending.oauth_state.clone(),
+                        poll_token: pending.poll_token.clone(),
+                        ..Default::default()
+                    }
+                    .into();
+                }
+            }
+            State::AwaitingDeviceLogin {} => {
+                if let Some(pending) = &self.device_login_pending {
+                    session.device_login_challenge = pb::DeviceLoginChallenge {
+                        login_url: pending.login_url.clone(),
+                        alias_key: pending.alias_key.clone(),
+                        poll_token: pending.poll_token.clone(),
+                        ..Default::default()
+                    }
+                    .into();
+                }
+            }
+            _ => {}
+        }
+        session
+    }
+
+    /// Snapshot the current session as [`PersistedCredentials`].
+    ///
+    /// Returns `Some` only when the machine is in the `Authenticated` state
+    /// (i.e. a complete, persistable session exists).
+    #[must_use]
+    pub fn to_credentials(&self) -> Option<PersistedCredentials> {
+        let tenant = self.tenant.clone()?;
+        let signing = self.signing.clone()?;
+        Some(PersistedCredentials {
+            tenant,
+            signing,
+            cookies: self.cookies.clone(),
+            csrf_token: self.csrf_token.clone(),
+            knock_token: self.knock_token.clone(),
+            totp: self.totp.clone(),
+            login_api_version: self.login_api_version,
+            last_vpn_request: None,
+            saved_at: Timestamp::now().to_string(),
+        })
+    }
+
+    /// Snapshot credentials, injecting the given VPN request for persistence.
+    #[must_use]
+    pub fn to_credentials_with_vpn(
+        &self, vpn_request: Option<crate::persist::PersistedVpnRequest>,
+    ) -> Option<PersistedCredentials> {
+        let mut creds = self.to_credentials()?;
+        creds.last_vpn_request = vpn_request;
+        Some(creds)
+    }
+
+    /// Restore an `AuthMachine` from persisted credentials, ready to be
+    /// wrapped in a statig state machine.
+    ///
+    /// **Note:** the statig wrapper will start in its declared initial state
+    /// (`Unconfigured`).  The daemon should feed a synthetic transition (or
+    /// manage the current state externally) to place the machine into
+    /// `Authenticated` after restoration.
+    #[must_use]
+    pub fn restore_from_credentials(
+        creds: PersistedCredentials, http_pool: reqwest::Client, identity: ClientIdentity,
+    ) -> Self {
+        Self {
+            http_pool,
+            identity,
+            tenant: Some(creds.tenant),
+            signing: Some(creds.signing),
+            cookies: creds.cookies,
+            csrf_token: creds.csrf_token,
+            knock_token: creds.knock_token,
+            totp: creds.totp,
+            login_api_version: creds.login_api_version,
+            oauth_pending: None,
+            device_login_pending: None,
+            last_error: None,
+        }
+    }
+
+    // ----- private helpers -----
+
+    pub(crate) fn build_hooks(&self) -> ApiHooks {
+        let signing_config = self
+            .signing
+            .as_ref()
+            .map(|s| SigningConfig {
+                enabled: s.enabled,
+                activation_code: Some(s.activation_code.clone()),
+                device_id: Some(s.device_id.clone()),
+                ..Default::default()
+            })
+            .unwrap_or_default();
+
+        ApiHooks {
+            identity: self.identity.clone(),
+            cookies: SessionCookies {
+                values: self.cookies.clone(),
+            },
+            csrf_token: self.csrf_token.clone(),
+            knock_token: self.knock_token.clone(),
+            signer: SigningContext::new(signing_config),
+        }
+    }
+
+    /// Clear session-specific data (cookies, tokens), keeping tenant +
+    /// signing config intact.
+    fn clear_session(&mut self) {
+        self.cookies.clear();
+        self.csrf_token = None;
+        self.knock_token = None;
+        self.totp = None;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// route_login_next — centralized 2FA / GoToLink routing
+// ---------------------------------------------------------------------------
+
+/// Decide the next auth state from a [`LoginV2Result`].
+///
+/// This function fixes two bugs present in the old per-handler routing:
+///
+/// 1. **`GoToLink` bug:** when `result.result == Some("success")` but `.next`
+///    contains a `goto_link` action (password-change URL), the old code
+///    incorrectly treated it as a pending challenge.  We now check `result ==
+///    "success"` **first** and transition to Authenticated.
+///
+/// 2. **2FA routing bug:** the old code mapped all non-MFA actions to OTP
+///    indiscriminately.  We now inspect the action string to distinguish
+///    between OTP challenges, MFA, and terminal success.
+fn route_login_next(result: Option<&LoginV2Result>) -> Response<State> {
+    let Some(result) = result else {
+        // No data at all — treat as success (matches Android fallback).
+        return Transition(State::authenticated());
+    };
+
+    // ① Success explicitly reported — done, regardless of `.next`.
+    if result.result.as_deref() == Some("success") {
+        return Transition(State::authenticated());
+    }
+
+    // ② Process `.next` for multi-step flows.
+    if let Some(next) = &result.next {
+        let action = next.action.as_deref().unwrap_or_default();
+
+        // MFA challenge.
+        if action.eq_ignore_ascii_case("mfa") || action.eq_ignore_ascii_case("verify_mfa") {
+            return Transition(State::awaiting_mfa(
+                action.to_owned(),
+                next.auth_list.clone().unwrap_or_default(),
+                next.can_skip.unwrap_or(false),
+                next.mobile.clone().unwrap_or_default(),
+                next.email.clone().unwrap_or_default(),
+            ));
+        }
+
+        // GoToLink — the server wants the user to visit a URL (e.g.
+        // password reset), but the session is authenticated.
+        if action.eq_ignore_ascii_case("goto_link") || action.eq_ignore_ascii_case("goToLink") {
+            return Transition(State::authenticated());
+        }
+
+        // OTP / verify_code / other verification challenge.
+        let masked = next
+            .mobile
+            .clone()
+            .or_else(|| next.email.clone())
+            .unwrap_or_default();
+        return Transition(State::awaiting_otp(masked, action.to_owned()));
+    }
+
+    // ③ No explicit success AND no `.next` — treat as authenticated
+    // (matches Android client fallback).
+    Transition(State::authenticated())
+}
+
+// =========================================================================
+// VpnMachine — plain enum state machine (no statig)
 // =========================================================================
 
 /// A VPN connect request — the working form that drives the connect loop.
-///
-/// Kept as a Rust type for the `From<ConnectTunnelRequest>` bridge and the
-/// `VpnConnectMode` enum (consumed directly by core).  Converted to/from
-/// `PersistedVpnRequest` only at the persisted `vpn_state` boundary.
 #[derive(Clone, Debug)]
 pub struct VpnRequest {
     pub mode: VpnConnectMode,
@@ -70,651 +1127,233 @@ pub struct VpnRequest {
     pub preferred_dot_id: Option<i32>,
     pub otp: Option<String>,
     pub reconnect: bool,
-    pub protocol_mode: Option<i32>,
 }
 
-impl From<pb::ConnectTunnelRequest> for VpnRequest {
-    fn from(request: pb::ConnectTunnelRequest) -> Self {
-        let mode = match request.mode {
-            buffa::EnumValue::Known(pb::VpnMode::Split) => VpnConnectMode::Split,
-            buffa::EnumValue::Known(pb::VpnMode::Relay) => VpnConnectMode::Relay,
-            _ => VpnConnectMode::Full,
-        };
-        let protocol_mode = match request.protocol_mode {
-            buffa::EnumValue::Known(pb::ProtocolMode::Udp) => Some(0),
-            buffa::EnumValue::Known(pb::ProtocolMode::Tcp) => Some(1),
-            buffa::EnumValue::Known(pb::ProtocolMode::Auto) => Some(2),
-            _ => None,
-        };
-        Self {
-            mode,
-            export_id: request.export_id,
-            preferred_dot_id: request.preferred_dot_id,
-            otp: request.otp,
-            reconnect: request.reconnect,
-            protocol_mode,
-        }
-    }
-}
-
-/// A live, connected tunnel — the working form recorded on connect.
-///
-/// Kept for `jiff::Timestamp` (handshake age in the supervisor).  Converted to
-/// `PersistedActiveTunnel` when written into the `vpn_state` oneof.
+/// A live, connected tunnel — recorded while the tunnel is up.
 #[derive(Clone, Debug, Default)]
 pub struct ActiveTunnel {
     pub dot_id: i32,
     pub dot_name: String,
     pub endpoint: String,
     pub assigned_ip: String,
-    pub connected_at: Option<Timestamp>,
-    pub last_handshake_at: Option<Timestamp>,
-    pub protocol_mode: Option<i32>,
 }
 
-// =========================================================================
-// DaemonState — thin wrapper around the canonical proto
-// =========================================================================
-
-#[derive(Clone, Debug)]
-pub struct DaemonState {
-    pub proto: persist::PersistedState,
+/// VPN connection state (plain enum, not statig).
+#[derive(Debug, Clone)]
+pub enum VpnState {
+    Disconnected,
+    Connecting {
+        request: VpnRequest,
+    },
+    Configuring {
+        request: VpnRequest,
+    },
+    Connected {
+        request: VpnRequest,
+        tunnel_info: ActiveTunnel,
+    },
+    Reconnecting {
+        request: VpnRequest,
+        attempts: u32,
+    },
+    Failed {
+        request: VpnRequest,
+        error: String,
+        attempts: u32,
+    },
+    Disconnecting {
+        request: VpnRequest,
+    },
 }
 
-impl Default for DaemonState {
-    fn default() -> Self {
-        Self::new()
-    }
+/// VPN state machine with explicit transition methods.
+///
+/// Owns the live [`TunnelSession`] and a [`CancellationToken`] for the
+/// connect/supervise background task.  State transitions are driven by the
+/// daemon's connect loop and supervisor — not by external events — which is
+/// why statig's `&mut self` locking model is not used here.
+pub struct VpnMachine {
+    pub(crate) state: VpnState,
+    pub(crate) api_client: ApiClient,
+    /// The live `WireGuard` tunnel session (present only in `Connected`).
+    pub(crate) tunnel_session: Option<TunnelSession>,
+    /// Cancellation token for the active connect/supervise task.
+    pub(crate) cancel_token: CancellationToken,
 }
 
-impl DaemonState {
+impl VpnMachine {
+    /// Create a new VPN machine in `Disconnected` state.
     #[must_use]
-    pub fn new() -> Self {
-        // Persist only the per-install device id; the rest of the identity is
-        // filled from the built-in Android-profile default on read
-        // (partial-merge-with-default), so the profile tracks the code.
-        let identity = persist::PersistedIdentity {
-            device_id: Some(rustylink_api::ClientIdentity::default().device_id),
-            ..Default::default()
-        };
+    pub fn new(api_client: ApiClient) -> Self {
         Self {
-            proto: persist::PersistedState {
-                version: STATE_VERSION,
-                updated_at: MessageField::some(proto_timestamp(Timestamp::now())),
-                identity: MessageField::some(identity),
-                auth_state: Some(PA::from(persist::PersistedUnconfigured::default())),
+            state: VpnState::Disconnected,
+            api_client,
+            tunnel_session: None,
+            cancel_token: CancellationToken::new(),
+        }
+    }
+
+    // ------- state queries -------
+
+    /// True when a connect may start (no active or in-flight tunnel).
+    #[must_use]
+    pub fn can_connect(&self) -> bool {
+        matches!(self.state, VpnState::Disconnected | VpnState::Failed { .. })
+    }
+
+    /// Current reconnect attempt count.
+    #[must_use]
+    pub fn attempts(&self) -> u32 {
+        match &self.state {
+            VpnState::Reconnecting { attempts, .. } | VpnState::Failed { attempts, .. } => {
+                *attempts
+            }
+            _ => 0,
+        }
+    }
+
+    /// Extract the current VPN request in persisted form (if any).
+    #[must_use]
+    pub fn current_persisted_request(&self) -> Option<crate::persist::PersistedVpnRequest> {
+        let request = match &self.state {
+            VpnState::Connecting { request }
+            | VpnState::Configuring { request }
+            | VpnState::Connected { request, .. }
+            | VpnState::Reconnecting { request, .. }
+            | VpnState::Failed { request, .. }
+            | VpnState::Disconnecting { request } => request,
+            VpnState::Disconnected => return None,
+        };
+        Some(crate::persist::PersistedVpnRequest {
+            mode: request.mode.to_string(),
+            export_id: request.export_id,
+            preferred_dot_id: request.preferred_dot_id,
+            protocol_mode: 0,
+            reconnect: request.reconnect,
+        })
+    }
+
+    // ------- state transitions -------
+
+    /// Transition to `Connecting` with a new request.
+    pub fn set_connecting(&mut self, request: VpnRequest) {
+        self.cancel_token = CancellationToken::new();
+        self.state = VpnState::Connecting { request };
+    }
+
+    /// Transition to `Configuring` (preserves current request).
+    pub fn set_configuring(&mut self) {
+        let request = self.take_request();
+        self.state = VpnState::Configuring { request };
+    }
+
+    /// Transition to `Connected` with tunnel info.
+    pub fn set_connected(&mut self, tunnel_info: ActiveTunnel) {
+        let request = self.take_request();
+        self.state = VpnState::Connected {
+            request,
+            tunnel_info,
+        };
+    }
+
+    /// Transition to `Reconnecting`, incrementing the attempt counter.
+    pub fn set_reconnecting(&mut self) {
+        let request = self.take_request();
+        let attempts = self.attempts().saturating_add(1);
+        self.state = VpnState::Reconnecting { request, attempts };
+    }
+
+    /// Transition to `Failed` with an error message.
+    pub fn set_failed(&mut self, error: String) {
+        let request = self.take_request();
+        let attempts = self.attempts();
+        self.state = VpnState::Failed {
+            request,
+            error,
+            attempts,
+        };
+    }
+
+    /// Transition to `Disconnecting`.
+    pub fn set_disconnecting(&mut self) {
+        let request = self.take_request();
+        self.state = VpnState::Disconnecting { request };
+    }
+
+    /// Transition to `Disconnected`, dropping any tunnel session.
+    pub fn set_disconnected(&mut self) {
+        self.tunnel_session = None;
+        self.state = VpnState::Disconnected;
+    }
+
+    // ------- proto projection -------
+
+    /// Project the current VPN state to an RPC [`Tunnel`](pb::Tunnel) message.
+    #[must_use]
+    pub fn to_tunnel_proto(&self) -> pb::Tunnel {
+        match &self.state {
+            VpnState::Disconnected => pb::Tunnel {
+                state: pb::tunnel::State::Disconnected.into(),
+                ..Default::default()
+            },
+            VpnState::Connecting { .. } => pb::Tunnel {
+                state: pb::tunnel::State::Connecting.into(),
+                ..Default::default()
+            },
+            VpnState::Configuring { .. } => pb::Tunnel {
+                state: pb::tunnel::State::Configuring.into(),
+                ..Default::default()
+            },
+            VpnState::Connected { tunnel_info, .. } => pb::Tunnel {
+                state: pb::tunnel::State::Connected.into(),
+                dot_id: tunnel_info.dot_id,
+                dot_name: tunnel_info.dot_name.clone(),
+                endpoint: tunnel_info.endpoint.clone(),
+                assigned_ip: tunnel_info.assigned_ip.clone(),
+                ..Default::default()
+            },
+            VpnState::Reconnecting { attempts, .. } => pb::Tunnel {
+                state: pb::tunnel::State::Reconnecting.into(),
+                reconnect_attempts: *attempts,
+                ..Default::default()
+            },
+            VpnState::Failed {
+                error, attempts, ..
+            } => pb::Tunnel {
+                state: pb::tunnel::State::Failed.into(),
+                error: error.clone(),
+                reconnect_attempts: *attempts,
+                ..Default::default()
+            },
+            VpnState::Disconnecting { .. } => pb::Tunnel {
+                state: pb::tunnel::State::Disconnecting.into(),
                 ..Default::default()
             },
         }
     }
 
-    // ------- persistence -------
+    // ------- private helpers -------
 
-    pub fn load_or_default(path: &Path) -> Result<Self> {
-        if !path.exists() {
-            return Ok(Self::new());
+    /// Extract the request from the current state, falling back to a default.
+    fn take_request(&mut self) -> VpnRequest {
+        match std::mem::replace(&mut self.state, VpnState::Disconnected) {
+            VpnState::Disconnected => default_vpn_request(),
+            VpnState::Connecting { request }
+            | VpnState::Configuring { request }
+            | VpnState::Connected { request, .. }
+            | VpnState::Reconnecting { request, .. }
+            | VpnState::Failed { request, .. }
+            | VpnState::Disconnecting { request } => request,
         }
-        let bytes = fs::read(path).context(ReadSnafu {
-            path: path.to_path_buf(),
-        })?;
-        let proto: persist::PersistedState =
-            serde_json::from_slice(&bytes).context(ParseSnafu {
-                path: path.to_path_buf(),
-            })?;
-        Ok(Self { proto })
-    }
-
-    pub fn save(&mut self, path: &Path) -> Result<()> {
-        self.proto.updated_at = MessageField::some(proto_timestamp(Timestamp::now()));
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).context(CreateDirSnafu {
-                path: parent.to_path_buf(),
-            })?;
-        }
-        let bytes = serde_json::to_vec_pretty(&self.proto).context(SerializeSnafu)?;
-        let tmp_path = path.with_extension("json.tmp");
-        let mut tmp = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&tmp_path)
-            .context(WriteSnafu {
-                path: tmp_path.clone(),
-            })?;
-        tmp.write_all(&bytes).context(WriteSnafu {
-            path: tmp_path.clone(),
-        })?;
-        tmp.sync_all().context(WriteSnafu {
-            path: tmp_path.clone(),
-        })?;
-        drop(tmp);
-        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600)).context(WriteSnafu {
-            path: tmp_path.clone(),
-        })?;
-        fs::rename(&tmp_path, path).context(WriteSnafu {
-            path: path.to_path_buf(),
-        })
-    }
-
-    // ------- projections (proto-to-proto From impls in the proto crate) -------
-
-    #[must_use]
-    pub fn to_session(&self) -> pb::Session {
-        pb::Session::from(&self.proto)
-    }
-
-    #[must_use]
-    pub fn to_tunnel(&self) -> pb::Tunnel {
-        pb::Tunnel::from(&self.proto)
-    }
-
-    #[must_use]
-    pub fn to_configuration(&self) -> pb::Configuration {
-        pb::Configuration::from(&self.proto)
-    }
-
-    // ------- top-level config accessors -------
-
-    #[must_use]
-    pub fn auto_reconnect_on_start(&self) -> bool {
-        self.proto.auto_reconnect_on_start
-    }
-
-    pub fn set_auto_reconnect_on_start(&mut self, value: bool) {
-        self.proto.auto_reconnect_on_start = value;
-    }
-
-    #[must_use]
-    pub fn outbound_interface_name(&self) -> Option<String> {
-        self.proto
-            .outbound_interface
-            .as_option()
-            .and_then(|o| match &o.selector {
-                Some(pb::outbound_interface::Selector::Name(name)) if !name.is_empty() => {
-                    Some(name.clone())
-                }
-                _ => None,
-            })
-    }
-
-    pub fn set_outbound_interface_name(&mut self, name: Option<String>) {
-        let selector = match name {
-            Some(n) if !n.is_empty() => pb::outbound_interface::Selector::Name(n),
-            _ => pb::outbound_interface::Selector::from(
-                buffa_types::google::protobuf::Empty::default(),
-            ),
-        };
-        self.proto.outbound_interface = MessageField::some(pb::OutboundInterface {
-            selector: Some(selector),
-            ..Default::default()
-        });
-    }
-
-    // ------- auth-state queries -------
-
-    #[must_use]
-    pub fn configured_base(&self) -> Option<&persist::PersistedConfiguredBase> {
-        match self.proto.auth_state.as_ref()? {
-            PA::Unconfigured(_) => None,
-            PA::Configured(d) => d.base.as_option(),
-            PA::Authenticating(d) => d.base.as_option(),
-            PA::Authenticated(d) => d.base.as_option(),
-            PA::Expired(d) => d.base.as_option(),
-        }
-    }
-
-    fn configured_base_mut(&mut self) -> Option<&mut persist::PersistedConfiguredBase> {
-        match self.proto.auth_state.as_mut()? {
-            PA::Unconfigured(_) => None,
-            PA::Configured(d) => d.base.as_option_mut(),
-            PA::Authenticating(d) => d.base.as_option_mut(),
-            PA::Authenticated(d) => d.base.as_option_mut(),
-            PA::Expired(d) => d.base.as_option_mut(),
-        }
-    }
-
-    #[must_use]
-    pub fn authenticated(&self) -> Option<&persist::PersistedAuthenticated> {
-        match self.proto.auth_state.as_ref()? {
-            PA::Authenticated(d) => Some(&**d),
-            _ => None,
-        }
-    }
-
-    fn authenticated_mut(&mut self) -> Option<&mut persist::PersistedAuthenticated> {
-        match self.proto.auth_state.as_mut()? {
-            PA::Authenticated(d) => Some(&mut **d),
-            _ => None,
-        }
-    }
-
-    #[must_use]
-    pub fn is_authenticated(&self) -> bool {
-        matches!(self.proto.auth_state.as_ref(), Some(PA::Authenticated(_)))
-    }
-
-    #[must_use]
-    pub fn is_v1(&self) -> bool {
-        matches!(
-            self.configured_base().map(|b| b.login_api.as_known()),
-            Some(Some(persist::PersistedLoginApi::V1))
-        )
-    }
-
-    pub fn set_login_api(&mut self, v1: bool) {
-        if let Some(base) = self.configured_base_mut() {
-            base.login_api = if v1 {
-                persist::PersistedLoginApi::V1
-            } else {
-                persist::PersistedLoginApi::Legacy
-            }
-            .into();
-        }
-    }
-
-    #[must_use]
-    pub fn oauth_state_value(&self) -> Option<String> {
-        match self.proto.auth_state.as_ref()? {
-            PA::Authenticating(d) => d.oauth.as_option().and_then(|o| o.state.clone()),
-            _ => None,
-        }
-    }
-
-    // ------- auth-state transitions (the state machine) -------
-
-    /// Tenant configured after activation: promote Unconfigured → Configured,
-    /// or update the base of an already-configured state in place.
-    pub fn set_tenant_configured(
-        &mut self, tenant: persist::PersistedTenant, signing: persist::PersistedSigning,
-    ) {
-        if matches!(self.proto.auth_state, Some(PA::Unconfigured(_)) | None) {
-            self.proto.auth_state = Some(PA::from(persist::PersistedConfigured {
-                base: MessageField::some(make_base(tenant, signing, None)),
-                ..Default::default()
-            }));
-        } else if let Some(base) = self.configured_base_mut() {
-            base.tenant = MessageField::some(tenant);
-            base.signing = MessageField::some(signing);
-        }
-    }
-
-    /// Replace the full cookie set (Authenticating or Authenticated).
-    pub fn set_cookies(&mut self, cookies: HashMap<String, String>) {
-        match self.proto.auth_state.as_mut() {
-            Some(PA::Authenticating(d)) => d.cookies = cookies,
-            Some(PA::Authenticated(d)) => d.cookies = cookies,
-            _ => {}
-        }
-    }
-
-    pub fn set_csrf_token(&mut self, token: Option<String>) {
-        match self.proto.auth_state.as_mut() {
-            Some(PA::Authenticating(d)) => d.csrf_token = token,
-            Some(PA::Authenticated(d)) => d.csrf_token = token,
-            _ => {}
-        }
-    }
-
-    pub fn set_signing(&mut self, config: persist::PersistedSigning) {
-        if let Some(base) = self.configured_base_mut() {
-            base.signing = MessageField::some(config);
-        }
-    }
-
-    /// Set OAuth state + pending challenge, promoting Configured →
-    /// Authenticating if necessary.
-    pub fn set_oauth(&mut self, alias_key: String, state: String, code_verifier: String) {
-        let challenge = oauth_pending_challenge(&alias_key, &state);
-        let oauth = persist::PersistedOauth {
-            alias_key: Some(alias_key),
-            state: Some(state),
-            code_verifier: Some(code_verifier),
-            ..Default::default()
-        };
-        if let Some(PA::Authenticating(d)) = self.proto.auth_state.as_mut() {
-            d.oauth = MessageField::some(oauth);
-            d.pending_challenge = MessageField::some(challenge);
-        } else {
-            self.proto.auth_state = match self.proto.auth_state.take() {
-                Some(PA::Configured(d)) => Some(PA::from(persist::PersistedAuthenticating {
-                    base: d.base,
-                    oauth: MessageField::some(oauth),
-                    pending_challenge: MessageField::some(challenge),
-                    ..Default::default()
-                })),
-                other => other,
-            };
-        }
-    }
-
-    pub fn clear_oauth(&mut self) {
-        if let Some(PA::Authenticating(d)) = self.proto.auth_state.as_mut() {
-            d.oauth = MessageField::some(persist::PersistedOauth::default());
-        }
-    }
-
-    /// Session expired: Authenticated/Authenticating → Expired (keep base).
-    pub fn expire(&mut self) {
-        self.proto.auth_state = match self.proto.auth_state.take() {
-            Some(PA::Authenticated(d)) => Some(PA::from(persist::PersistedExpired {
-                base: d.base,
-                ..Default::default()
-            })),
-            Some(PA::Authenticating(d)) => Some(PA::from(persist::PersistedExpired {
-                base: d.base,
-                ..Default::default()
-            })),
-            other => other,
-        };
-    }
-
-    /// Logged out: drop session, fall back to Configured (or Unconfigured).
-    pub fn logout(&mut self) {
-        self.proto.auth_state = Some(match self.proto.auth_state.take() {
-            None | Some(PA::Unconfigured(_)) => PA::from(persist::PersistedUnconfigured::default()),
-            Some(other) => into_base(other).map_or_else(
-                || PA::from(persist::PersistedUnconfigured::default()),
-                |base| {
-                    PA::from(persist::PersistedConfigured {
-                        base,
-                        ..Default::default()
-                    })
-                },
-            ),
-        });
-    }
-
-    /// Set the pending challenge (login step), promoting Configured →
-    /// Authenticating if necessary.
-    pub fn set_pending_challenge(&mut self, challenge: pb::PendingChallenge) {
-        if let Some(PA::Authenticating(d)) = self.proto.auth_state.as_mut() {
-            d.pending_challenge = MessageField::some(challenge);
-        } else {
-            self.proto.auth_state = match self.proto.auth_state.take() {
-                Some(PA::Configured(d)) => Some(PA::from(persist::PersistedAuthenticating {
-                    base: d.base,
-                    pending_challenge: MessageField::some(challenge),
-                    ..Default::default()
-                })),
-                other => other,
-            };
-        }
-    }
-
-    /// Login succeeded: Authenticating/Configured → Authenticated (Disconnected
-    /// VPN), preserving the session credentials when present.
-    pub fn complete_login(&mut self) {
-        self.proto.auth_state = match self.proto.auth_state.take() {
-            Some(PA::Authenticating(d)) => Some(PA::from(persist::PersistedAuthenticated {
-                base: d.base,
-                cookies: d.cookies,
-                csrf_token: d.csrf_token,
-                knock_token: d.knock_token,
-                totp: d.totp,
-                vpn_state: Some(PV::from(persist::PersistedVpnDisconnected::default())),
-                ..Default::default()
-            })),
-            Some(PA::Configured(d)) => Some(PA::from(persist::PersistedAuthenticated {
-                base: d.base,
-                vpn_state: Some(PV::from(persist::PersistedVpnDisconnected::default())),
-                ..Default::default()
-            })),
-            other => other,
-        };
-    }
-
-    // ------- TOTP -------
-
-    #[must_use]
-    pub fn totp(&self) -> Option<&persist::PersistedTotp> {
-        match self.proto.auth_state.as_ref()? {
-            PA::Authenticating(d) => d.totp.as_option(),
-            PA::Authenticated(d) => d.totp.as_option(),
-            _ => None,
-        }
-    }
-
-    #[must_use]
-    pub fn needs_totp(&self) -> bool {
-        matches!(self.proto.auth_state.as_ref(), Some(PA::Authenticated(d)) if d.totp.is_unset())
-    }
-
-    pub fn set_totp(&mut self, totp: persist::PersistedTotp) {
-        match self.proto.auth_state.as_mut() {
-            Some(PA::Authenticating(d)) => d.totp = MessageField::some(totp),
-            Some(PA::Authenticated(d)) => d.totp = MessageField::some(totp),
-            _ => {}
-        }
-    }
-
-    // ------- VPN-state transitions (nested in Authenticated) -------
-
-    fn vpn_state(&self) -> Option<&PV> {
-        self.authenticated().and_then(|d| d.vpn_state.as_ref())
-    }
-
-    fn set_vpn(&mut self, next: PV) {
-        if let Some(d) = self.authenticated_mut() {
-            d.vpn_state = Some(next);
-        }
-    }
-
-    fn current_vpn_request(&self) -> Option<persist::PersistedVpnRequest> {
-        self.vpn_state().and_then(persisted_request)
-    }
-
-    fn vpn_attempts(&self) -> u32 {
-        match self.vpn_state() {
-            Some(PV::VpnReconnecting(d)) => d.reconnect_attempts,
-            Some(PV::VpnFailed(d)) => d.reconnect_attempts,
-            _ => 0,
-        }
-    }
-
-    /// The live VPN request, if any (read as a working `VpnRequest`).
-    #[must_use]
-    pub fn vpn_request(&self) -> Option<VpnRequest> {
-        self.current_vpn_request().map(vpn_request_from_proto)
-    }
-
-    /// True when a connect may start (no active or in-flight tunnel).
-    #[must_use]
-    pub fn vpn_can_connect(&self) -> bool {
-        matches!(
-            self.vpn_state(),
-            None | Some(PV::VpnDisconnected(_) | PV::VpnFailed(_))
-        )
-    }
-
-    pub fn vpn_set_connecting(&mut self, request: &VpnRequest) {
-        self.set_vpn(PV::from(persist::PersistedVpnConnecting {
-            request: MessageField::some(vpn_request_to_proto(request)),
-            ..Default::default()
-        }));
-    }
-
-    pub fn vpn_set_configuring(&mut self) {
-        let request = self
-            .current_vpn_request()
-            .unwrap_or_else(default_request_proto);
-        self.set_vpn(PV::from(persist::PersistedVpnConfiguring {
-            request: MessageField::some(request),
-            ..Default::default()
-        }));
-    }
-
-    pub fn vpn_set_connected(&mut self, active: &ActiveTunnel) {
-        let request = self
-            .current_vpn_request()
-            .unwrap_or_else(default_request_proto);
-        self.set_vpn(PV::from(persist::PersistedVpnConnected {
-            request: MessageField::some(request),
-            active: MessageField::some(active_to_proto(active)),
-            ..Default::default()
-        }));
-    }
-
-    pub fn vpn_set_reconnecting(&mut self) {
-        let request = self
-            .current_vpn_request()
-            .unwrap_or_else(default_request_proto);
-        let attempts = self.vpn_attempts().saturating_add(1);
-        self.set_vpn(PV::from(persist::PersistedVpnReconnecting {
-            request: MessageField::some(request),
-            reconnect_attempts: attempts,
-            ..Default::default()
-        }));
-    }
-
-    pub fn vpn_set_disconnecting(&mut self) {
-        let request = self
-            .current_vpn_request()
-            .unwrap_or_else(default_request_proto);
-        self.set_vpn(PV::from(persist::PersistedVpnDisconnecting {
-            request: MessageField::some(request),
-            ..Default::default()
-        }));
-    }
-
-    pub fn vpn_set_disconnected(&mut self) {
-        self.set_vpn(PV::from(persist::PersistedVpnDisconnected::default()));
-    }
-
-    pub fn vpn_set_failed(&mut self, error: String) {
-        let request = self
-            .current_vpn_request()
-            .unwrap_or_else(default_request_proto);
-        self.set_vpn(PV::from(persist::PersistedVpnFailed {
-            request: MessageField::some(request),
-            error,
-            reconnect_attempts: 0,
-            ..Default::default()
-        }));
     }
 }
 
-// =========================================================================
-// Free helpers
-// =========================================================================
-
-fn make_base(
-    tenant: persist::PersistedTenant, signing: persist::PersistedSigning,
-    login_api: Option<persist::PersistedLoginApi>,
-) -> persist::PersistedConfiguredBase {
-    persist::PersistedConfiguredBase {
-        tenant: MessageField::some(tenant),
-        signing: MessageField::some(signing),
-        login_api: login_api
-            .unwrap_or(persist::PersistedLoginApi::Unspecified)
-            .into(),
-        ..Default::default()
-    }
-}
-
-fn into_base(auth: PA) -> Option<MessageField<persist::PersistedConfiguredBase>> {
-    match auth {
-        PA::Unconfigured(_) => None,
-        PA::Configured(d) => Some(d.base),
-        PA::Authenticating(d) => Some(d.base),
-        PA::Authenticated(d) => Some(d.base),
-        PA::Expired(d) => Some(d.base),
-    }
-}
-
-fn oauth_pending_challenge(alias_key: &str, state: &str) -> pb::PendingChallenge {
-    pb::PendingChallenge {
-        challenge: Some(
-            pb::OauthChallenge {
-                alias_key: alias_key.to_string(),
-                state: state.to_string(),
-                poll_token: String::new(),
-                ..Default::default()
-            }
-            .into(),
-        ),
-        ..Default::default()
-    }
-}
-
-fn persisted_request(vpn: &PV) -> Option<persist::PersistedVpnRequest> {
-    match vpn {
-        PV::VpnDisconnected(_) => None,
-        PV::VpnConnecting(d) => d.request.as_option().cloned(),
-        PV::VpnConfiguring(d) => d.request.as_option().cloned(),
-        PV::VpnConnected(d) => d.request.as_option().cloned(),
-        PV::VpnReconnecting(d) => d.request.as_option().cloned(),
-        PV::VpnFailed(d) => d.request.as_option().cloned(),
-        PV::VpnDisconnecting(d) => d.request.as_option().cloned(),
-    }
-}
-
-fn default_request_proto() -> persist::PersistedVpnRequest {
-    persist::PersistedVpnRequest {
-        mode: pb::VpnMode::Full.into(),
+fn default_vpn_request() -> VpnRequest {
+    VpnRequest {
+        mode: VpnConnectMode::Full,
         export_id: 0,
         preferred_dot_id: None,
         otp: None,
         reconnect: true,
-        protocol_mode: None,
-        ..Default::default()
-    }
-}
-
-fn vpn_request_to_proto(r: &VpnRequest) -> persist::PersistedVpnRequest {
-    persist::PersistedVpnRequest {
-        mode: vpn_mode_to_proto(r.mode).into(),
-        export_id: r.export_id,
-        preferred_dot_id: r.preferred_dot_id,
-        otp: r.otp.clone(),
-        reconnect: r.reconnect,
-        protocol_mode: r.protocol_mode,
-        ..Default::default()
-    }
-}
-
-fn vpn_request_from_proto(p: persist::PersistedVpnRequest) -> VpnRequest {
-    let mode = match p.mode.as_known() {
-        Some(pb::VpnMode::Split) => VpnConnectMode::Split,
-        Some(pb::VpnMode::Relay) => VpnConnectMode::Relay,
-        _ => VpnConnectMode::Full,
-    };
-    VpnRequest {
-        mode,
-        export_id: p.export_id,
-        preferred_dot_id: p.preferred_dot_id,
-        otp: p.otp,
-        reconnect: p.reconnect,
-        protocol_mode: p.protocol_mode,
-    }
-}
-
-#[must_use]
-pub fn vpn_mode_to_proto(mode: VpnConnectMode) -> pb::VpnMode {
-    match mode {
-        VpnConnectMode::Full => pb::VpnMode::Full,
-        VpnConnectMode::Split => pb::VpnMode::Split,
-        VpnConnectMode::Relay => pb::VpnMode::Relay,
-    }
-}
-
-fn active_to_proto(a: &ActiveTunnel) -> persist::PersistedActiveTunnel {
-    persist::PersistedActiveTunnel {
-        dot_id: a.dot_id,
-        dot_name: a.dot_name.clone(),
-        endpoint: a.endpoint.clone(),
-        assigned_ip: a.assigned_ip.clone(),
-        connected_at: a.connected_at.map(proto_timestamp).into(),
-        last_handshake_at: a.last_handshake_at.map(proto_timestamp).into(),
-        protocol_mode: a.protocol_mode,
-        ..Default::default()
-    }
-}
-
-fn proto_timestamp(timestamp: Timestamp) -> buffa_types::google::protobuf::Timestamp {
-    buffa_types::google::protobuf::Timestamp {
-        seconds: timestamp.as_second(),
-        nanos: timestamp.subsec_nanosecond(),
-        ..Default::default()
     }
 }

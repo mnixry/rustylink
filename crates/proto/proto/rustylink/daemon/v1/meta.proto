@@ -2,23 +2,13 @@ syntax = "proto3";
 
 package rustylink.daemon.v1;
 
-import "google/protobuf/timestamp.proto";
-import "rustylink/daemon/v1/configuration.proto";
-import "rustylink/daemon/v1/session.proto";
-import "rustylink/daemon/v1/tunnel.proto";
+// ---------------------------------------------------------------------------
+// MetaService RPCs — ping only. WatchState has been removed.
+// ---------------------------------------------------------------------------
 
 message PingRequest {}
 
 message PingResponse {
   string version = 1;
   int64 uptime_seconds = 2;
-}
-
-message WatchStateRequest {}
-
-message WatchStateResponse {
-  Session session = 1;
-  Tunnel tunnel = 2;
-  Configuration configuration = 3;
-  google.protobuf.Timestamp updated_at = 4;
 }

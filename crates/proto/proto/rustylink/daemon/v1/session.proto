@@ -2,31 +2,31 @@ syntax = "proto3";
 
 package rustylink.daemon.v1;
 
-import "rustylink/daemon/v1/configuration.proto";
+// ---------------------------------------------------------------------------
+// Session — fine-grained state enum aligned with statig `AuthMachine` states
+// ---------------------------------------------------------------------------
 
 message Session {
   enum State {
     STATE_UNSPECIFIED = 0;
     STATE_UNCONFIGURED = 1;
     STATE_CONFIGURED = 2;
-    STATE_AUTHENTICATING = 3;
-    STATE_AUTHENTICATED = 4;
-    STATE_EXPIRED = 5;
+    STATE_AWAITING_OTP = 3;
+    STATE_AWAITING_MFA = 4;
+    STATE_AWAITING_OAUTH = 5;
+    STATE_AWAITING_DEVICE_LOGIN = 6;
+    STATE_AUTHENTICATED = 7;
   }
 
   State state = 1;
   string tenant_name = 2;
   string base_url = 3;
-  PendingChallenge pending_challenge = 4;
-  UserInfo user = 5;
-}
 
-message PendingChallenge {
-  oneof challenge {
-    OtpChallenge otp = 1;
-    MfaChallenge mfa = 2;
-    OauthChallenge oauth = 3;
-  }
+  // State-specific challenge data (present based on state)
+  optional OtpChallenge otp_challenge = 10;
+  optional MfaChallenge mfa_challenge = 11;
+  optional OauthChallenge oauth_challenge = 12;
+  optional DeviceLoginChallenge device_login_challenge = 13;
 }
 
 message OtpChallenge {
@@ -47,6 +47,16 @@ message OauthChallenge {
   string state = 2;
   string poll_token = 3;
 }
+
+message DeviceLoginChallenge {
+  string login_url = 1;
+  string alias_key = 2;
+  string poll_token = 3;
+}
+
+// ---------------------------------------------------------------------------
+// AuthService RPCs — request/response messages
+// ---------------------------------------------------------------------------
 
 message GetSessionRequest {}
 
@@ -169,5 +179,24 @@ message LogoutRequest {
 }
 
 message LogoutResponse {
+  Session session = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Device login (QR code / headless flow)
+// ---------------------------------------------------------------------------
+
+message StartDeviceLoginRequest {
+  string alias_key = 1;
+}
+
+message StartDeviceLoginResponse {
+  Session session = 1;
+  string login_url = 2;
+}
+
+message CompleteDeviceLoginRequest {}
+
+message CompleteDeviceLoginResponse {
   Session session = 1;
 }

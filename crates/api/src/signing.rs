@@ -340,38 +340,6 @@ fn encode_http_sign_header(
     .encode_to_vec()
 }
 
-// ---------------------------------------------------------------------------
-// Proto bridge: PersistedSigning -> SigningConfig (read-side view; the daemon
-// produces PersistedSigning directly, so no reverse conversion is needed).
-// ---------------------------------------------------------------------------
-
-use rustylink_proto::proto::rustylink::daemon::persist::v1 as persist;
-
-impl From<&persist::PersistedSigning> for SigningConfig {
-    fn from(p: &persist::PersistedSigning) -> Self {
-        Self {
-            enabled: p.enabled,
-            root_key_version: p.root_key_version,
-            signing_input_params: p.signing_input_params,
-            algorithms: p.algorithms.clone(),
-            rules: p
-                .rules
-                .iter()
-                .map(|r| SigningRuleConfig {
-                    urls: r.urls.clone(),
-                    enable_signing: r.enable_signing,
-                    signing_input_params: r.signing_input_params,
-                    max_time_desync: r.max_time_desync,
-                })
-                .collect(),
-            activation_code: p.activation_code.clone(),
-            device_id: p.device_id.clone(),
-            hmac_key_base64: p.hmac_key_base64.clone(),
-            shared_secret: p.shared_secret.clone(),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use base64::{Engine as _, engine::general_purpose::STANDARD};

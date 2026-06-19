@@ -23,6 +23,7 @@ message Configuration {
   DeviceIdentity device_identity = 2;
   SecurityReport security_report = 3;
   bool auto_reconnect_on_start = 4;
+  OutboundInterface dns_interface = 5;
 }
 
 message OutboundInterface {
@@ -70,4 +71,26 @@ message UpdateConfigurationRequest {
 
 message UpdateConfigurationResponse {
   Configuration configuration = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Network interfaces — list available interfaces for user selection
+// ---------------------------------------------------------------------------
+
+message NetworkInterface {
+  string name = 1;
+  uint32 index = 2;
+  bool is_up = 3;
+  bool is_loopback = 4;
+  bool has_gateway = 5;
+  bool is_default = 6;
+  repeated string ipv4_addrs = 7;
+  repeated string ipv6_addrs = 8;
+}
+
+message ListNetworkInterfacesRequest {}
+
+message ListNetworkInterfacesResponse {
+  repeated NetworkInterface interfaces = 1;
+  string auto_selected = 2;
 }

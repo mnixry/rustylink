@@ -1,14 +1,11 @@
 use rustylink_api::{
-    BaseResponse, DotEndpoint, FetchOtpRequest, GetLoginSettingRequest, GetTenantConfigRequest,
-    GetUserInfoRequest, GetVpnLocationsRequest, GetVpnSettingRequest, LoginSetting, OtpProvision,
-    SendableRequest, TenantConfig, TenantEndpoint, UserInfo, VpnConnRequest, VpnConnResponse,
-    VpnDot, VpnReportRequest, VpnSetting,
+    ApiClient, BaseResponse, DotEndpoint, FetchOtpRequest, GetLoginSettingRequest,
+    GetTenantConfigRequest, GetUserInfoRequest, GetVpnLocationsRequest, GetVpnSettingRequest,
+    LoginSetting, OtpProvision, ResponseMeta, SendableRequest, TenantConfig, UserInfo,
+    VpnConnRequest, VpnConnResponse, VpnDot, VpnReportRequest, VpnSetting,
 };
-use rustylink_proto::proto::rustylink::daemon::persist::v1 as persist;
 use snafu::prelude::*;
 use strum::{Display, EnumIter, EnumString, FromRepr, IntoStaticStr};
-
-use crate::{AppContext, state::StateChange};
 
 const MAX_DOT_ATTEMPTS: usize = 3;
 const MAX_CONFIG_ATTEMPTS_PER_DOT: usize = 3;
@@ -55,17 +52,13 @@ pub struct VpnConfigResult {
     pub dot: VpnDot,
     pub endpoint: DotEndpoint,
     pub response: BaseResponse<VpnConnResponse>,
+    /// The [`ResponseMeta`] from the successful VPN config call.
+    pub meta: ResponseMeta,
 }
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
 pub enum Error {
-    #[snafu(display("application context operation failed"))]
-    Context {
-        #[snafu(source(from(crate::context::Error, Box::new)))]
-        source: Box<crate::context::Error>,
-    },
-
     #[snafu(display("API operation failed"))]
     Api {
         #[snafu(source(from(rustylink_api::Error, Box::new)))]
@@ -100,118 +93,126 @@ impl VpnConnectMode {
 }
 
 // ---------------------------------------------------------------------------
-// Helper to collect meta changes
+// Signing config update — pure data extracted from TenantConfig
 // ---------------------------------------------------------------------------
 
-fn collect_meta_changes(meta: &rustylink_api::ResponseMeta) -> Vec<StateChange> {
-    let mut changes = Vec::new();
-    if let Some(cookies) = &meta.cookies {
-        changes.push(StateChange::CookiesUpdated {
-            cookies: cookies.to_map(),
-        });
-    }
-    if let Some(csrf) = &meta.csrf_token {
-        changes.push(StateChange::CsrfTokenUpdated {
-            token: Some(csrf.clone()),
-        });
-    }
-    if meta.is_force_logout {
-        changes.push(StateChange::SessionExpired);
-    }
-    changes
+/// A signing rule extracted from the tenant config API response.
+#[derive(Clone, Debug, Default)]
+pub struct SigningRuleUpdate {
+    pub urls: Vec<String>,
+    pub enable_signing: bool,
+    pub signing_input_params: u64,
+    pub max_time_desync: Option<u64>,
+}
+
+/// Updated signing configuration extracted from a [`TenantConfig`] response.
+///
+/// The caller is responsible for merging this into its own persisted signing
+/// state.
+#[derive(Clone, Debug, Default)]
+pub struct SigningConfigUpdate {
+    pub enabled: bool,
+    pub algorithms: Vec<String>,
+    pub rules: Vec<SigningRuleUpdate>,
+}
+
+/// Build an updated signing configuration from a [`TenantConfig`] response.
+///
+/// Returns `None` when `data` has no signing config.
+#[must_use]
+pub fn extract_signing_config_update(
+    current_enabled: bool, data: &TenantConfig,
+) -> Option<SigningConfigUpdate> {
+    let config = data.signing_config.as_ref()?;
+    Some(SigningConfigUpdate {
+        enabled: config.enable.unwrap_or(current_enabled),
+        algorithms: config.algorithms.clone().unwrap_or_default(),
+        rules: config
+            .rules
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|rule| SigningRuleUpdate {
+                urls: rule.urls.clone().unwrap_or_default(),
+                enable_signing: rule.enable_signing.unwrap_or(false),
+                signing_input_params: rule
+                    .signing_input_params
+                    .and_then(|value| u64::try_from(value).ok())
+                    .unwrap_or_default(),
+                max_time_desync: rule
+                    .max_time_desync
+                    .and_then(|value| u64::try_from(value).ok()),
+            })
+            .collect(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// TOTP config — pure data for callers to persist
+// ---------------------------------------------------------------------------
+
+/// TOTP provisioning data suitable for local persistence.
+///
+/// Contains the `otpauth://` URI and the server clock offset so codes can be
+/// generated offline for auto-reconnect.
+#[derive(Clone, Debug, Default)]
+pub struct TotpConfig {
+    pub url: String,
+    pub time_diff_seconds: i64,
 }
 
 // ---------------------------------------------------------------------------
 // Profile / settings
 // ---------------------------------------------------------------------------
 
-pub async fn user_info(ctx: &AppContext) -> Result<(BaseResponse<UserInfo>, Vec<StateChange>)> {
-    let client = ctx.tenant_client().context(ContextSnafu)?;
+pub async fn user_info(client: &ApiClient) -> Result<(BaseResponse<UserInfo>, ResponseMeta)> {
     let (response, meta) = GetUserInfoRequest
         .send_with_meta(client)
         .await
         .context(ApiSnafu)?;
-    Ok((response, collect_meta_changes(&meta)))
+    Ok((response, meta))
 }
 
 pub async fn tenant_config(
-    ctx: &AppContext,
-) -> Result<(BaseResponse<TenantConfig>, Vec<StateChange>)> {
-    let client = ctx.tenant_client().context(ContextSnafu)?;
+    client: &ApiClient,
+) -> Result<(BaseResponse<TenantConfig>, ResponseMeta)> {
     let (response, meta) = GetTenantConfigRequest
         .send_with_meta(client)
         .await
         .context(ApiSnafu)?;
-    let mut changes = collect_meta_changes(&meta);
-    if let Some(data) = &response.data
-        && let Some(signing) = build_signing_config_update(ctx, data)
-    {
-        changes.push(StateChange::SigningConfigUpdated { config: signing });
-    }
-    Ok((response, changes))
+    Ok((response, meta))
 }
 
 pub async fn login_setting(
-    ctx: &AppContext,
-) -> Result<(BaseResponse<LoginSetting>, Vec<StateChange>)> {
-    let client = ctx.tenant_client().context(ContextSnafu)?;
+    client: &ApiClient,
+) -> Result<(BaseResponse<LoginSetting>, ResponseMeta)> {
     let (response, meta) = GetLoginSettingRequest
         .send_with_meta(client)
         .await
         .context(ApiSnafu)?;
-    Ok((response, collect_meta_changes(&meta)))
-}
-
-fn build_signing_config_update(
-    ctx: &AppContext, data: &TenantConfig,
-) -> Option<persist::PersistedSigning> {
-    let config = data.signing_config.as_ref()?;
-    let mut signing = ctx.signing_proto().cloned().unwrap_or_default();
-    signing.enabled = config.enable.unwrap_or(signing.enabled);
-    signing.algorithms = config.algorithms.clone().unwrap_or_default();
-    signing.rules = config
-        .rules
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .map(|rule| persist::PersistedSigningRule {
-            urls: rule.urls.clone().unwrap_or_default(),
-            enable_signing: rule.enable_signing.unwrap_or(false),
-            signing_input_params: rule
-                .signing_input_params
-                .and_then(|value| u64::try_from(value).ok())
-                .unwrap_or_default(),
-            max_time_desync: rule
-                .max_time_desync
-                .and_then(|value| u64::try_from(value).ok()),
-            ..Default::default()
-        })
-        .collect();
-    Some(signing)
+    Ok((response, meta))
 }
 
 // ---------------------------------------------------------------------------
 // VPN settings / locations
 // ---------------------------------------------------------------------------
 
-pub async fn vpn_setting(ctx: &AppContext) -> Result<(BaseResponse<VpnSetting>, Vec<StateChange>)> {
-    let client = ctx.tenant_client().context(ContextSnafu)?;
+pub async fn vpn_setting(client: &ApiClient) -> Result<(BaseResponse<VpnSetting>, ResponseMeta)> {
     let (response, meta) = GetVpnSettingRequest
         .send_with_meta(client)
         .await
         .context(ApiSnafu)?;
-    Ok((response, collect_meta_changes(&meta)))
+    Ok((response, meta))
 }
 
 pub async fn vpn_locations(
-    ctx: &AppContext,
-) -> Result<(BaseResponse<Vec<VpnDot>>, Vec<StateChange>)> {
-    let client = ctx.tenant_client().context(ContextSnafu)?;
+    client: &ApiClient,
+) -> Result<(BaseResponse<Vec<VpnDot>>, ResponseMeta)> {
     let (response, meta) = GetVpnLocationsRequest
         .send_with_meta(client)
         .await
         .context(ApiSnafu)?;
-    Ok((response, collect_meta_changes(&meta)))
+    Ok((response, meta))
 }
 
 // ---------------------------------------------------------------------------
@@ -219,32 +220,30 @@ pub async fn vpn_locations(
 // ---------------------------------------------------------------------------
 
 pub async fn vpn_conn(
-    ctx: &AppContext, base_url_override: Option<&str>, request: &VpnConnRequest,
-) -> Result<(BaseResponse<VpnConnResponse>, Vec<StateChange>)> {
-    let client = match base_url_override {
-        Some(base_url) => {
-            let endpoint = TenantEndpoint::new(base_url).context(ApiSnafu)?;
-            ctx.client_for_endpoint(&endpoint)
-        }
-        None => ctx.tenant_client().context(ContextSnafu)?.clone(),
-    };
+    client: &ApiClient, request: &VpnConnRequest,
+) -> Result<(BaseResponse<VpnConnResponse>, ResponseMeta)> {
     let (response, meta) = request
         .clone()
-        .send_with_meta(&client)
-        .await
-        .context(ApiSnafu)?;
-    Ok((response, collect_meta_changes(&meta)))
-}
-
-pub async fn vpn_config_from_dot_list(
-    ctx: &AppContext, request: &VpnConfigRequest,
-) -> Result<(VpnConfigResult, Vec<StateChange>)> {
-    let client = ctx.tenant_client().context(ContextSnafu)?;
-    let (locations, meta) = GetVpnLocationsRequest
         .send_with_meta(client)
         .await
         .context(ApiSnafu)?;
-    let mut all_changes = collect_meta_changes(&meta);
+    Ok((response, meta))
+}
+
+/// Fetch the dot list, select a suitable dot, and negotiate a VPN config.
+///
+/// `build_dot_client` is a callback the caller provides to construct an
+/// [`ApiClient`] pointing at a particular dot endpoint.  This keeps the core
+/// crate free of client-construction concerns (cookie injection, signing
+/// middleware, etc.).
+pub async fn vpn_config_from_dot_list(
+    tenant_client: &ApiClient, request: &VpnConfigRequest,
+    build_dot_client: impl Fn(&DotEndpoint) -> ApiClient,
+) -> Result<VpnConfigResult> {
+    let (locations, _list_meta) = GetVpnLocationsRequest
+        .send_with_meta(tenant_client)
+        .await
+        .context(ApiSnafu)?;
     let dots = locations.data.clone().context(MissingVpnDotListDataSnafu)?;
     if dots.is_empty() {
         return NoVpnDotsSnafu.fail();
@@ -273,7 +272,7 @@ pub async fn vpn_config_from_dot_list(
     for dot in candidates {
         let use_vpn_ip_for_api = dot.should_use_vpn_ip_for_config_api(!request.not_auto);
         let endpoint = DotEndpoint::from_dot(&dot, use_vpn_ip_for_api).context(ApiSnafu)?;
-        let dot_client = ctx.dot_client(&endpoint);
+        let dot_client = build_dot_client(&endpoint);
         let body = VpnConnRequest {
             mode: Some(request.mode.android_name()),
             public_key: request.public_key.clone(),
@@ -291,16 +290,13 @@ pub async fn vpn_config_from_dot_list(
             );
             match body.clone().send_with_meta(&dot_client).await {
                 Ok((response, dot_meta)) => {
-                    all_changes.extend(collect_meta_changes(&dot_meta));
                     response.data.as_ref().context(MissingVpnConfigDataSnafu)?;
-                    return Ok((
-                        VpnConfigResult {
-                            dot,
-                            endpoint,
-                            response,
-                        },
-                        all_changes,
-                    ));
+                    return Ok(VpnConfigResult {
+                        dot,
+                        endpoint,
+                        response,
+                        meta: dot_meta,
+                    });
                 }
                 Err(source) => {
                     tracing::warn!(
@@ -328,16 +324,14 @@ pub async fn vpn_config_from_dot_list(
 }
 
 pub async fn report_vpn(
-    ctx: &AppContext, dot: &VpnDot, request: &VpnReportRequest,
-) -> Result<(BaseResponse<String>, Vec<StateChange>)> {
-    let endpoint = DotEndpoint::from_dot(dot, false).context(ApiSnafu)?;
-    let dot_client = ctx.dot_client(&endpoint);
+    client: &ApiClient, request: &VpnReportRequest,
+) -> Result<(BaseResponse<String>, ResponseMeta)> {
     let (response, meta) = request
         .clone()
-        .send_with_meta(&dot_client)
+        .send_with_meta(client)
         .await
         .context(ApiSnafu)?;
-    Ok((response, collect_meta_changes(&meta)))
+    Ok((response, meta))
 }
 
 /// Fetch the tenant TOTP provisioning from `POST /api/v2/p/otp`.
@@ -347,32 +341,27 @@ pub async fn report_vpn(
 /// wall-clock `timestamp`.  We persist the URI and the derived clock offset so
 /// codes can be generated locally for auto-reconnect.  Returns `Ok((None, _))`
 /// when the tenant has no OTP requirement (empty `url`).
-pub async fn fetch_totp(
-    ctx: &AppContext,
-) -> Result<(Option<persist::PersistedTotp>, Vec<StateChange>)> {
-    let client = ctx.tenant_client().context(ContextSnafu)?;
+pub async fn fetch_totp(client: &ApiClient) -> Result<(Option<TotpConfig>, ResponseMeta)> {
     let (response, meta) = FetchOtpRequest
         .send_with_meta(client)
         .await
         .context(ApiSnafu)?;
-    let changes = collect_meta_changes(&meta);
     let config = response.data.and_then(totp_from_provision);
-    Ok((config, changes))
+    Ok((config, meta))
 }
 
-/// Build a [`persist::PersistedTotp`] from the provisioning payload, deriving
+/// Build a [`TotpConfig`] from the provisioning payload, deriving
 /// the server clock offset from its `timestamp` (server − local).
-fn totp_from_provision(provision: OtpProvision) -> Option<persist::PersistedTotp> {
+fn totp_from_provision(provision: OtpProvision) -> Option<TotpConfig> {
     let url = (!provision.url.is_empty()).then_some(provision.url)?;
     let now = jiff::Timestamp::now().as_second();
     let time_diff_seconds = match provision.timestamp {
         ts if ts > 0 => ts - now,
         _ => 0,
     };
-    Some(persist::PersistedTotp {
+    Some(TotpConfig {
         url,
         time_diff_seconds,
-        ..Default::default()
     })
 }
 
@@ -383,7 +372,7 @@ fn totp_from_provision(provision: OtpProvision) -> Option<persist::PersistedTotp
 /// algorithm/digits/period and tolerate short/non-standard tenant secrets
 /// (matching the Android client, which does not enforce the RFC minimum).
 #[must_use]
-pub fn generate_totp(config: &persist::PersistedTotp, now_unix: i64) -> Option<String> {
+pub fn generate_totp(config: &TotpConfig, now_unix: i64) -> Option<String> {
     let corrected = u64::try_from(now_unix + config.time_diff_seconds).ok()?;
     totp_rs::TOTP::from_url_unchecked(&config.url)
         .ok()

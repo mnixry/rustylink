@@ -7,10 +7,11 @@ import "rustylink/daemon/v1/meta.proto";
 import "rustylink/daemon/v1/session.proto";
 import "rustylink/daemon/v1/tunnel.proto";
 
-service RustylinkService {
-  rpc Ping(PingRequest) returns (PingResponse);
-  rpc WatchState(WatchStateRequest) returns (stream WatchStateResponse);
+// ---------------------------------------------------------------------------
+// Three separate services — split from the monolithic RustylinkService
+// ---------------------------------------------------------------------------
 
+service AuthService {
   rpc GetSession(GetSessionRequest) returns (GetSessionResponse);
   rpc Activate(ActivateRequest) returns (ActivateResponse);
   rpc Login(LoginRequest) returns (LoginResponse);
@@ -22,14 +23,24 @@ service RustylinkService {
   rpc ListThirdPartyProviders(ListThirdPartyProvidersRequest) returns (ListThirdPartyProvidersResponse);
   rpc StartThirdPartyLogin(StartThirdPartyLoginRequest) returns (StartThirdPartyLoginResponse);
   rpc CompleteThirdPartyLogin(CompleteThirdPartyLoginRequest) returns (CompleteThirdPartyLoginResponse);
+  rpc StartDeviceLogin(StartDeviceLoginRequest) returns (StartDeviceLoginResponse);
+  rpc CompleteDeviceLogin(CompleteDeviceLoginRequest) returns (CompleteDeviceLoginResponse);
   rpc Logout(LogoutRequest) returns (LogoutResponse);
+}
 
+service VpnService {
   rpc GetTunnel(GetTunnelRequest) returns (GetTunnelResponse);
   rpc ConnectTunnel(ConnectTunnelRequest) returns (ConnectTunnelResponse);
   rpc DisconnectTunnel(DisconnectTunnelRequest) returns (DisconnectTunnelResponse);
   rpc ListVpnLocations(ListVpnLocationsRequest) returns (ListVpnLocationsResponse);
+  rpc ProbeDotLatency(ProbeDotLatencyRequest) returns (ProbeDotLatencyResponse);
+  rpc WatchTunnel(WatchTunnelRequest) returns (stream WatchTunnelResponse);
+}
 
+service MetaService {
+  rpc Ping(PingRequest) returns (PingResponse);
   rpc GetUserInfo(GetUserInfoRequest) returns (GetUserInfoResponse);
   rpc GetConfiguration(GetConfigurationRequest) returns (GetConfigurationResponse);
   rpc UpdateConfiguration(UpdateConfigurationRequest) returns (UpdateConfigurationResponse);
+  rpc ListNetworkInterfaces(ListNetworkInterfacesRequest) returns (ListNetworkInterfacesResponse);
 }
