@@ -1,6 +1,7 @@
 import { Navigate } from "react-router"
 import { AppHeader } from "@/components/app-header"
 import { FullScreenLoader } from "@/components/full-screen-loader"
+import { AccountSection } from "@/features/account/account-section"
 import { SettingsSection } from "@/features/settings/settings-section"
 import { ConnectCard } from "@/features/vpn/connect-card"
 import { LocationsSection } from "@/features/vpn/locations-section"
@@ -31,6 +32,7 @@ function Dashboard() {
         <ConnectCard />
         <LocationsSection />
         <SettingsSection />
+        <AccountSection />
       </main>
     </div>
   )
