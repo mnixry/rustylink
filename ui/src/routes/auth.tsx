@@ -1,8 +1,17 @@
-// Placeholder — replaced by the state-driven auth wizard in the next stage.
+import { Navigate } from "react-router"
+import { FullScreenLoader } from "@/components/full-screen-loader"
+import { AuthWizard } from "@/features/auth/auth-wizard"
+import { Session_State } from "@/gen/rustylink/daemon/v1/session_pb"
+import { useSession } from "@/hooks/use-session"
+
 export function AuthRoute() {
-  return (
-    <div className="flex min-h-svh items-center justify-center p-6 text-muted-foreground">
-      Authentication wizard
-    </div>
-  )
+  const { data, isLoading } = useSession()
+
+  if (isLoading || !data?.session) {
+    return <FullScreenLoader />
+  }
+  if (data.session.state === Session_State.AUTHENTICATED) {
+    return <Navigate to="/" replace />
+  }
+  return <AuthWizard session={data.session} />
 }
