@@ -43,6 +43,8 @@ pub struct OAuthPending {
     pub oauth_state: String,
     pub poll_token: String,
     pub pkce_verifier: String,
+    /// The fully-built PKCE authorize URL the user must open.
+    pub url: String,
 }
 
 /// Pending device login flow parameters (QR/headless login).
@@ -676,12 +678,19 @@ impl AuthMachine {
         }
     }
 
-    async fn handle_start_oauth(&mut self, alias_key: &str, redirect_uri: &str) -> Response<State> {
+    async fn handle_start_oauth(
+        &mut self, alias_key: &str, _redirect_uri: &str,
+    ) -> Response<State> {
         let Some(client) = self.build_tenant_client() else {
             self.last_error = Some("no tenant configured".into());
             return Handled;
         };
-        // Fetch provider list to find the auth URL for this alias.
+        // Fetch provider list. The returned `login_url` is already a complete,
+        // PKCE-bound authorize URL (with the tenant's redirect/return URL — the
+        // `corplink://` app scheme — embedded in its state), tied to the
+        // `code_challenge` that `third_party_login_links` generated. We must keep
+        // the matching `code_verifier` for the callback rather than building a
+        // fresh URL.
         let links_result = rustylink_core::auth::third_party_login_links(&client).await;
         let (links, meta) = match links_result {
             Ok((links, meta)) => (links, meta),
@@ -692,34 +701,32 @@ impl AuthMachine {
         };
         self.merge_meta(&meta);
 
-        let auth_url = links
+        let provider = links
             .response
             .data
             .unwrap_or_default()
             .into_iter()
-            .find(|info| info.alias_key.as_deref() == Some(alias_key))
-            .and_then(|info| info.login_url.or(info.url));
-        let Some(auth_url) = auth_url else {
+            .find(|info| {
+                info.alias_key.as_deref() == Some(alias_key)
+                    || info.alias.as_deref() == Some(alias_key)
+            });
+        let Some(provider) = provider else {
             self.last_error = Some(format!("unknown provider alias `{alias_key}`"));
             return Handled;
         };
+        let Some(login_url) = provider.login_url.or(provider.url) else {
+            self.last_error = Some(format!("provider `{alias_key}` has no login url"));
+            return Handled;
+        };
 
-        match rustylink_core::auth::start_oauth(&auth_url, alias_key.to_owned(), None, redirect_uri)
-        {
-            Ok(oauth_start) => {
-                self.oauth_pending = Some(OAuthPending {
-                    alias_key: oauth_start.alias_key,
-                    oauth_state: oauth_start.state,
-                    poll_token: String::new(),
-                    pkce_verifier: oauth_start.code_verifier,
-                });
-                Transition(State::awaiting_oauth())
-            }
-            Err(error) => {
-                self.last_error = Some(error.to_string());
-                Handled
-            }
-        }
+        self.oauth_pending = Some(OAuthPending {
+            alias_key: alias_key.to_owned(),
+            oauth_state: provider.state.unwrap_or_default(),
+            poll_token: provider.token.unwrap_or_default(),
+            pkce_verifier: links.code_verifier,
+            url: login_url,
+        });
+        Transition(State::awaiting_oauth())
     }
 
     async fn handle_complete_oauth(

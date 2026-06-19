@@ -339,7 +339,7 @@ impl AuthService for AuthServiceImpl {
             .auth
             .oauth_pending
             .as_ref()
-            .map_or_else(Default::default, |p| (String::new(), p.oauth_state.clone()));
+            .map_or_else(Default::default, |p| (p.url.clone(), p.oauth_state.clone()));
         drop(inner);
         Response::ok(pb::StartThirdPartyLoginResponse {
             auth_url,
