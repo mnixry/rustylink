@@ -17,23 +17,17 @@ import {
   listThirdPartyProviders,
   login,
   requestLoginCode,
-  startThirdPartyLogin,
+  startDeviceLogin,
   verifyLoginCode,
 } from "@/gen/rustylink/daemon/v1/daemon-AuthService_connectquery"
 import type { Session } from "@/gen/rustylink/daemon/v1/session_pb"
-import { useApplySession, useRefreshSession } from "@/hooks/use-session"
+import { useApplySession } from "@/hooks/use-session"
 import { errorMessage } from "@/lib/errors"
 import { useAuthScratch } from "./auth-context"
 import { AuthShell } from "./auth-shell"
 
-// The daemon builds OAuth authorize URLs whose redirect targets the app's
-// custom scheme (corplink://). Browsers can't follow that, so the user copies
-// the code from the redirected URL and pastes it on the OAuth step.
-const REDIRECT_URI = "corplink://login/callback"
-
 export function LoginStep({ session }: { session: Session }) {
   const applySession = useApplySession()
-  const refreshSession = useRefreshSession()
   const { account, password, setAccount, setPassword } = useAuthScratch()
   const [codeType, setCodeType] = useState("mobile")
   const [code, setCode] = useState("")
@@ -53,14 +47,11 @@ export function LoginStep({ session }: { session: Session }) {
     onSuccess: (res) => onSession(res.session),
     onError,
   })
-  const oauthMut = useMutation(startThirdPartyLogin, {
-    onSuccess: async (res) => {
-      if (res.authUrl) {
-        window.open(res.authUrl, "_blank", "noopener")
-      }
-      // StartThirdPartyLogin returns no session; refetch to reach AWAITING_OAUTH.
-      await refreshSession()
-    },
+  // Third-party providers use the device/QR poll flow (corplink-rs style):
+  // StartDeviceLogin returns an AWAITING_DEVICE_LOGIN session, advancing the
+  // wizard to the QR step which polls until the user approves.
+  const deviceMut = useMutation(startDeviceLogin, {
+    onSuccess: (res) => onSession(res.session),
     onError,
   })
 
@@ -200,12 +191,9 @@ export function LoginStep({ session }: { session: Session }) {
               <Button
                 key={provider.aliasKey}
                 variant="outline"
-                disabled={oauthMut.isPending}
+                disabled={deviceMut.isPending}
                 onClick={() =>
-                  oauthMut.mutate({
-                    aliasKey: provider.aliasKey,
-                    redirectUri: REDIRECT_URI,
-                  })
+                  deviceMut.mutate({ aliasKey: provider.aliasKey })
                 }
               >
                 {provider.name || provider.aliasKey}

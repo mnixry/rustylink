@@ -1,8 +1,9 @@
 import { useMutation } from "@connectrpc/connect-query"
-import { ArrowSquareOutIcon } from "@phosphor-icons/react"
+import { ArrowSquareOutIcon, SpinnerIcon } from "@phosphor-icons/react"
 import { QRCodeSVG } from "qrcode.react"
+import { useEffect, useRef } from "react"
 import { toast } from "sonner"
-import { Button } from "@/components/ui/button"
+import { Button, buttonVariants } from "@/components/ui/button"
 import {
   completeDeviceLogin,
   logout,
@@ -18,6 +19,8 @@ export function DeviceLoginStep({ session }: { session: Session }) {
   const loginUrl = challenge?.loginUrl ?? ""
 
   const onError = (err: unknown) => toast.error(errorMessage(err))
+  // CompleteDeviceLogin polls /api/tpslogin/token/check server-side (up to 2
+  // minutes) and returns the authenticated session once the user approves.
   const complete = useMutation(completeDeviceLogin, {
     onSuccess: (res) => res.session && applySession(res.session),
     onError,
@@ -27,17 +30,34 @@ export function DeviceLoginStep({ session }: { session: Session }) {
     onError,
   })
 
+  // Start the poll automatically when the step appears.
+  const startPoll = complete.mutate
+  const started = useRef(false)
+  useEffect(() => {
+    if (started.current) {
+      return
+    }
+    started.current = true
+    startPoll({})
+  }, [startPoll])
+
   return (
     <AuthShell
       tenant={session.tenantName}
       title="Scan to sign in"
-      description="Scan this code with the mobile app, then confirm. This page updates automatically."
+      description="Scan this code with the provider's mobile app, or open the link below. This page completes automatically once you approve."
     >
       <div className="flex flex-col items-center gap-4">
         {loginUrl ? (
-          <div className="rounded-lg bg-white p-4">
-            <QRCodeSVG value={loginUrl} size={180} />
-          </div>
+          <a
+            href={loginUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="rounded-lg bg-white p-4 transition-opacity hover:opacity-90"
+            aria-label="Open sign-in link"
+          >
+            <QRCodeSVG value={loginUrl} size={184} />
+          </a>
         ) : null}
 
         {loginUrl ? (
@@ -45,23 +65,35 @@ export function DeviceLoginStep({ session }: { session: Session }) {
             href={loginUrl}
             target="_blank"
             rel="noopener noreferrer"
-            className="text-primary inline-flex items-center gap-1 text-sm hover:underline"
+            className={buttonVariants({
+              variant: "outline",
+              className: "w-full",
+            })}
           >
             <ArrowSquareOutIcon className="size-4" weight="duotone" />
             Open sign-in link
           </a>
         ) : null}
 
-        <Button
-          type="button"
-          className="w-full"
-          disabled={complete.isPending}
-          onClick={() => complete.mutate({})}
-        >
-          {complete.isPending
-            ? "Waiting for approval…"
-            : "I've approved on my device"}
-        </Button>
+        <div className="text-muted-foreground flex items-center gap-2 text-sm">
+          {complete.isPending ? (
+            <>
+              <SpinnerIcon className="size-4 animate-spin" weight="duotone" />
+              Waiting for approval…
+            </>
+          ) : complete.isError ? (
+            <Button
+              variant="ghost"
+              onClick={() => complete.mutate({})}
+              className="text-foreground"
+            >
+              Retry — waiting timed out
+            </Button>
+          ) : (
+            "Approve the sign-in in the provider's app."
+          )}
+        </div>
+
         <Button
           type="button"
           variant="ghost"
