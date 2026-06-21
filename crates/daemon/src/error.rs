@@ -63,19 +63,19 @@ pub enum InternalError {
     #[snafu(display("tunnel error: {message}"))]
     Tunnel { message: String },
 
-    #[snafu(display("state persistence failed"))]
+    #[snafu(display("state persistence failed: {source}"))]
     Persist {
         #[snafu(source(from(crate::persist::Error, Box::new)))]
         source: Box<crate::persist::Error>,
     },
 
-    #[snafu(display("authentication flow error"))]
+    #[snafu(display("authentication flow error: {source}"))]
     Auth {
         #[snafu(source(from(rustylink_core::auth::Error, Box::new)))]
         source: Box<rustylink_core::auth::Error>,
     },
 
-    #[snafu(display("VPN flow error"))]
+    #[snafu(display("VPN flow error: {source}"))]
     Vpn {
         #[snafu(source(from(rustylink_core::vpn::Error, Box::new)))]
         source: Box<rustylink_core::vpn::Error>,
@@ -88,61 +88,40 @@ pub enum InternalError {
 
 /// The error returned by every RPC handler: an expected [`RpcFault`] or an
 /// opaque [`InternalError`].
-#[derive(Debug)]
+///
+/// Both variants are `#[snafu(transparent)]`: `Display` and `Error::source`
+/// delegate to the inner error (no redundant wrapper in the chain), and
+/// `transparent` generates the `From<RpcFault>` / `From<InternalError>`
+/// conversions the handlers rely on.
+#[derive(Debug, Snafu)]
 pub enum DaemonError {
-    Fault(RpcFault),
-    Internal(InternalError),
+    #[snafu(transparent)]
+    Fault { source: RpcFault },
+    #[snafu(transparent)]
+    Internal { source: InternalError },
 }
 
 pub type Result<T, E = DaemonError> = std::result::Result<T, E>;
 
-impl std::fmt::Display for DaemonError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Fault(fault) => write!(f, "{fault}"),
-            Self::Internal(internal) => write!(f, "{internal}"),
-        }
-    }
-}
-
-impl std::error::Error for DaemonError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Fault(fault) => fault.source(),
-            Self::Internal(internal) => internal.source(),
-        }
-    }
-}
-
-impl From<RpcFault> for DaemonError {
-    fn from(fault: RpcFault) -> Self {
-        Self::Fault(fault)
-    }
-}
-
-impl From<InternalError> for DaemonError {
-    fn from(error: InternalError) -> Self {
-        Self::Internal(error)
-    }
-}
-
 impl From<crate::persist::Error> for DaemonError {
     fn from(error: crate::persist::Error) -> Self {
-        Self::Internal(InternalError::Persist {
-            source: Box::new(error),
-        })
+        Self::Internal {
+            source: InternalError::Persist {
+                source: Box::new(error),
+            },
+        }
     }
 }
 
 impl From<rustylink_core::auth::Error> for DaemonError {
     fn from(error: rustylink_core::auth::Error) -> Self {
         auth_api(&error).and_then(classify_api).map_or_else(
-            || {
-                Self::Internal(InternalError::Auth {
+            || Self::Internal {
+                source: InternalError::Auth {
                     source: Box::new(error),
-                })
+                },
             },
-            Self::Fault,
+            |fault| Self::Fault { source: fault },
         )
     }
 }
@@ -150,12 +129,12 @@ impl From<rustylink_core::auth::Error> for DaemonError {
 impl From<rustylink_core::vpn::Error> for DaemonError {
     fn from(error: rustylink_core::vpn::Error) -> Self {
         vpn_api(&error).and_then(classify_api).map_or_else(
-            || {
-                Self::Internal(InternalError::Vpn {
+            || Self::Internal {
+                source: InternalError::Vpn {
                     source: Box::new(error),
-                })
+                },
             },
-            Self::Fault,
+            |fault| Self::Fault { source: fault },
         )
     }
 }
@@ -206,11 +185,11 @@ fn vpn_api(error: &rustylink_core::vpn::Error) -> Option<&ApiError> {
 impl From<DaemonError> for ConnectError {
     fn from(error: DaemonError) -> Self {
         match error {
-            DaemonError::Fault(fault) => {
+            DaemonError::Fault { source: fault } => {
                 tracing::debug!(%fault, "rpc fault");
                 Self::new(fault.code(), fault.to_string())
             }
-            DaemonError::Internal(internal) => {
+            DaemonError::Internal { source: internal } => {
                 tracing::error!(error = ?internal, "internal rpc failure");
                 Self::new(ErrorCode::Internal, "internal error")
             }

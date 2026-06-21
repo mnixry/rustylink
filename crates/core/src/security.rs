@@ -7,7 +7,7 @@ use snafu::prelude::*;
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
 pub enum Error {
-    #[snafu(display("API operation failed"))]
+    #[snafu(display("API operation failed: {source}"))]
     Api {
         #[snafu(source(from(rustylink_api::Error, Box::new)))]
         source: Box<rustylink_api::Error>,

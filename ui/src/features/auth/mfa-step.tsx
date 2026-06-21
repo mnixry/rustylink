@@ -1,6 +1,8 @@
 import { useMutation } from "@connectrpc/connect-query"
-import { type FormEvent, useState } from "react"
+import { standardSchemaResolver } from "@hookform/resolvers/standard-schema"
+import { Controller, useForm } from "react-hook-form"
 import { toast } from "sonner"
+import { z } from "zod"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -22,16 +24,25 @@ import { errorMessage } from "@/lib/errors"
 import { useAuthScratch } from "./auth-context"
 import { AuthShell } from "./auth-shell"
 
+const schema = z
+  .object({
+    method: z.string().min(1),
+    code: z.string(),
+  })
+  .refine(
+    (values) => values.method === "password" || values.code.trim().length > 0,
+    {
+      message: "Enter the verification code",
+      path: ["code"],
+    }
+  )
+type Values = z.infer<typeof schema>
+
 export function MfaStep({ session }: { session: Session }) {
   const challenge = session.mfaChallenge
   const { account, password } = useAuthScratch()
   const applySession = useApplySession()
   const authList = challenge?.authList ?? []
-  const [method, setMethod] = useState(
-    challenge?.mfaType || authList[0] || "otp"
-  )
-  const [code, setCode] = useState("")
-  const isPassword = method === "password"
 
   const onError = (err: unknown) => toast.error(errorMessage(err))
   const verify = useMutation(verifyMfa, {
@@ -47,15 +58,30 @@ export function MfaStep({ session }: { session: Session }) {
     onError,
   })
 
-  const onSubmit = (e: FormEvent<HTMLFormElement>) => {
-    e.preventDefault()
+  const {
+    control,
+    register,
+    handleSubmit,
+    watch,
+    formState: { errors },
+  } = useForm<Values>({
+    resolver: standardSchemaResolver(schema),
+    defaultValues: {
+      method: challenge?.mfaType || authList[0] || "otp",
+      code: "",
+    },
+  })
+  const method = watch("method")
+  const isPassword = method === "password"
+
+  const onSubmit = handleSubmit((values) =>
     verify.mutate({
-      mfaType: method,
+      mfaType: values.method,
       account,
-      code: isPassword ? undefined : code,
-      password: isPassword ? password : undefined,
+      code: values.method === "password" ? undefined : values.code,
+      password: values.method === "password" ? password : undefined,
     })
-  }
+  )
 
   return (
     <AuthShell
@@ -67,18 +93,27 @@ export function MfaStep({ session }: { session: Session }) {
         {authList.length > 1 ? (
           <div className="space-y-2">
             <Label htmlFor="mfa-method">Method</Label>
-            <Select value={method} onValueChange={(v) => setMethod(v ?? "")}>
-              <SelectTrigger id="mfa-method" className="w-full">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {authList.map((item) => (
-                  <SelectItem key={item} value={item}>
-                    {item}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            <Controller
+              control={control}
+              name="method"
+              render={({ field }) => (
+                <Select
+                  value={field.value}
+                  onValueChange={(v) => field.onChange(v ?? "")}
+                >
+                  <SelectTrigger id="mfa-method" className="w-full">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {authList.map((item) => (
+                      <SelectItem key={item} value={item}>
+                        {item}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              )}
+            />
           </div>
         ) : null}
 
@@ -94,17 +129,15 @@ export function MfaStep({ session }: { session: Session }) {
               autoFocus
               inputMode="numeric"
               autoComplete="one-time-code"
-              value={code}
-              onChange={(e) => setCode(e.target.value)}
+              {...register("code")}
             />
+            {errors.code ? (
+              <p className="text-destructive text-sm">{errors.code.message}</p>
+            ) : null}
           </div>
         )}
 
-        <Button
-          type="submit"
-          className="w-full"
-          disabled={verify.isPending || (!isPassword && !code)}
-        >
+        <Button type="submit" className="w-full" disabled={verify.isPending}>
           {verify.isPending ? "Verifying…" : "Verify"}
         </Button>
 

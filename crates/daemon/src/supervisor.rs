@@ -12,7 +12,7 @@
 
 use std::time::Duration;
 
-use rustylink_tunnel::{ReconnectEvent, TunnelSession};
+use rustylink_tunnel::{ProtocolMode, ReconnectEvent, TunnelSession};
 use tokio_util::sync::CancellationToken;
 
 /// How often to poll the WG handshake age and the network state.
@@ -54,11 +54,11 @@ fn interface_present(name: &str) -> bool {
     default_net::get_interfaces().iter().any(|i| i.name == name)
 }
 
-fn handshake_threshold(protocol_mode: Option<i32>) -> Duration {
+fn handshake_threshold(protocol_mode: Option<ProtocolMode>) -> Duration {
     let secs = match protocol_mode {
-        Some(1) => HANDSHAKE_TIMEOUT_TCP,
-        Some(2) => HANDSHAKE_TIMEOUT_DUAL,
-        _ => HANDSHAKE_TIMEOUT_UDP,
+        Some(ProtocolMode::FeilianTcp) => HANDSHAKE_TIMEOUT_TCP,
+        Some(ProtocolMode::Dual) => HANDSHAKE_TIMEOUT_DUAL,
+        Some(ProtocolMode::Udp) | None => HANDSHAKE_TIMEOUT_UDP,
     };
     Duration::from_secs(secs)
 }
@@ -68,7 +68,7 @@ fn handshake_threshold(protocol_mode: Option<i32>) -> Duration {
 /// `report` is invoked on the report interval; it returns `Ok(true)` if the
 /// server signalled a force-logout/kickout.
 pub async fn run<F, Fut>(
-    session: &mut TunnelSession, protocol_mode: Option<i32>, outbound: Option<String>,
+    session: &mut TunnelSession, protocol_mode: Option<ProtocolMode>, outbound: Option<String>,
     cancel: CancellationToken, mut report: F,
 ) -> SupervisorOutcome
 where

@@ -143,7 +143,17 @@ export function SettingsSection() {
             }
           >
             <SelectTrigger className="w-full">
-              <SelectValue />
+              <SelectValue>
+                {(value) =>
+                  !value || value === AUTO
+                    ? `Automatic${
+                        interfaces.data?.autoSelected
+                          ? ` (${interfaces.data.autoSelected})`
+                          : ""
+                      }`
+                    : value
+                }
+              </SelectValue>
             </SelectTrigger>
             <SelectContent>
               <SelectItem value={AUTO}>
@@ -175,7 +185,9 @@ export function SettingsSection() {
             }
           >
             <SelectTrigger className="w-full">
-              <SelectValue />
+              <SelectValue>
+                {(value) => (!value || value === AUTO ? "Automatic" : value)}
+              </SelectValue>
             </SelectTrigger>
             <SelectContent>
               <SelectItem value={AUTO}>Automatic</SelectItem>

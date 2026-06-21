@@ -9,10 +9,17 @@ use connectrpc::{RequestContext, Response, ServiceRequest, ServiceResult};
 use rustylink_proto::proto::rustylink::daemon::{v1 as pb, v1::AuthService};
 
 use crate::{
-    daemon::{Daemon, nonempty_or},
+    daemon::{Daemon, DefaultOrExt as _},
     error::{DaemonError, RpcFault},
     state::{AuthEvent, State},
 };
+
+/// Default `login_scene` for the corplink/FeiLian login flow.
+///
+/// Every Android login fragment hardcodes `"feilian"` (e.g.
+/// `loginByPwd("feilian", …)`, `verifyCode("feilian", …)`); the server only
+/// sends/verifies codes for a known scene, so this must match.
+const DEFAULT_LOGIN_SCENE: &str = "feilian";
 
 /// Wrapper around [`Daemon`] implementing the `AuthService` trait.
 #[derive(Clone)]
@@ -50,9 +57,11 @@ impl AuthServiceImpl {
         inner.auth.last_error.as_ref().map_or_else(
             || Ok(()),
             |error| {
-                Err(DaemonError::Fault(RpcFault::InvalidArgument {
-                    message: error.clone(),
-                }))
+                Err(DaemonError::Fault {
+                    source: RpcFault::InvalidArgument {
+                        message: error.clone(),
+                    },
+                })
             },
         )
     }
@@ -105,7 +114,7 @@ impl AuthService for AuthServiceImpl {
                 };
                 inner.auth.handle(&merge).await;
                 if let Some(data) = setting.data.as_ref()
-                    && data.v1_login.unwrap_or(false)
+                    && data.is_v1()
                 {
                     let version_event = AuthEvent::SetLoginApiVersion {
                         version: crate::persist::LoginApiVersion::V1,
@@ -130,8 +139,8 @@ impl AuthService for AuthServiceImpl {
         let event = AuthEvent::Login {
             account: request.account.to_string(),
             password: request.password.to_string(),
-            login_scene: nonempty_or(request.login_scene, "login"),
-            account_type: nonempty_or(request.account_type, "account"),
+            login_scene: request.login_scene.non_default_or(DEFAULT_LOGIN_SCENE).to_owned(),
+            account_type: request.account_type.non_default_or("account").to_owned(),
         };
         {
             let mut inner = self.daemon.inner.lock().await;
@@ -155,9 +164,9 @@ impl AuthService for AuthServiceImpl {
         self.daemon.require_configured().await?;
         let event = AuthEvent::SendLoginCode {
             account: request.account.to_string(),
-            login_type: request.login_type.to_string(),
-            login_scene: nonempty_or(request.login_scene, "login"),
-            account_type: nonempty_or(request.account_type, "account"),
+            login_type: request.login_type.as_known().unwrap_or_default().wire().to_owned(),
+            login_scene: request.login_scene.non_default_or(DEFAULT_LOGIN_SCENE).to_owned(),
+            account_type: request.account_type.non_default_or("account").to_owned(),
         };
         {
             let mut inner = self.daemon.inner.lock().await;
@@ -180,9 +189,9 @@ impl AuthService for AuthServiceImpl {
         let event = AuthEvent::VerifyLoginCode {
             account: request.account.to_string(),
             code: request.code.to_string(),
-            login_type: request.login_type.to_string(),
-            login_scene: nonempty_or(request.login_scene, "login"),
-            account_type: nonempty_or(request.account_type, "account"),
+            login_type: request.login_type.as_known().unwrap_or_default().wire().to_owned(),
+            login_scene: request.login_scene.non_default_or(DEFAULT_LOGIN_SCENE).to_owned(),
+            account_type: request.account_type.non_default_or("account").to_owned(),
         };
         {
             let mut inner = self.daemon.inner.lock().await;
@@ -206,7 +215,7 @@ impl AuthService for AuthServiceImpl {
         let event = AuthEvent::SendMfaCode {
             mfa_type: request.mfa_type.to_string(),
             account: request.account.to_string(),
-            login_scene: nonempty_or(request.login_scene, "login"),
+            login_scene: request.login_scene.non_default_or(DEFAULT_LOGIN_SCENE).to_owned(),
         };
         {
             let mut inner = self.daemon.inner.lock().await;
@@ -229,7 +238,7 @@ impl AuthService for AuthServiceImpl {
             account: request.account.to_string(),
             code: request.code.map(ToOwned::to_owned),
             password: request.password.map(ToOwned::to_owned),
-            login_scene: nonempty_or(request.login_scene, "login"),
+            login_scene: request.login_scene.non_default_or(DEFAULT_LOGIN_SCENE).to_owned(),
         };
         {
             let mut inner = self.daemon.inner.lock().await;
@@ -251,7 +260,7 @@ impl AuthService for AuthServiceImpl {
     ) -> ServiceResult<pb::SkipPendingChallengeResponse> {
         self.daemon.require_configured().await?;
         let event = AuthEvent::SkipChallenge {
-            login_scene: nonempty_or(request.login_scene, "login"),
+            login_scene: request.login_scene.non_default_or(DEFAULT_LOGIN_SCENE).to_owned(),
         };
         {
             let mut inner = self.daemon.inner.lock().await;

@@ -15,3 +15,17 @@ enum ProtocolMode {
   PROTOCOL_MODE_TCP = 2;
   PROTOCOL_MODE_AUTO = 3;
 }
+
+// Channel used to deliver a login verification code.
+//
+// This set is exhaustive per the Android client: a login code is sent either
+// by SMS (`LoginV2FeilianMobileFragment` -> login_type "mobile") or by email
+// (`LoginV2FeilianEmailFragment` -> login_type "email"). Modeling it as an
+// enum keeps the daemon and UI from passing arbitrary free-form strings.
+enum LoginCodeType {
+  LOGIN_CODE_TYPE_UNSPECIFIED = 0;
+  // SMS text message (wire value "mobile").
+  LOGIN_CODE_TYPE_MOBILE = 1;
+  // Email (wire value "email").
+  LOGIN_CODE_TYPE_EMAIL = 2;
+}

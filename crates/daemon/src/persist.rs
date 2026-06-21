@@ -26,34 +26,34 @@ use crate::token;
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
 pub enum Error {
-    #[snafu(display("failed to read {}", path.display()))]
+    #[snafu(display("failed to read {}: {source}", path.display()))]
     Read {
         path: PathBuf,
         source: std::io::Error,
     },
 
-    #[snafu(display("failed to write {}", path.display()))]
+    #[snafu(display("failed to write {}: {source}", path.display()))]
     Write {
         path: PathBuf,
         source: std::io::Error,
     },
 
-    #[snafu(display("failed to create directory {}", path.display()))]
+    #[snafu(display("failed to create directory {}: {source}", path.display()))]
     CreateDir {
         path: PathBuf,
         source: std::io::Error,
     },
 
-    #[snafu(display("failed to parse {}", path.display()))]
+    #[snafu(display("failed to parse {}: {source}", path.display()))]
     Parse {
         path: PathBuf,
         source: serde_json::Error,
     },
 
-    #[snafu(display("failed to serialize data"))]
+    #[snafu(display("failed to serialize data: {source}"))]
     Serialize { source: serde_json::Error },
 
-    #[snafu(display("failed to delete {}", path.display()))]
+    #[snafu(display("failed to delete {}: {source}", path.display()))]
     Delete {
         path: PathBuf,
         source: std::io::Error,
@@ -88,24 +88,91 @@ pub struct DaemonConfig {
     pub auto_reconnect: bool,
 }
 
-/// Device identity overrides persisted with the daemon config.
+/// The persisted device identity.
 ///
-/// Fields left as `None` inherit from the built-in Android-profile default
-/// in [`ClientIdentity::default()`](rustylink_api::ClientIdentity::default).
+/// A complete identity (after [`ensure_full`](DeviceIdentityConfig::ensure_full))
+/// mirrors [`ClientIdentity`](rustylink_api::ClientIdentity). Optional fields
+/// left unset are merged from the built-in Android-profile default on load.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DeviceIdentityConfig {
     /// A stable, per-install device identifier (SHA-256 of the machine UID).
     pub device_id: String,
-    /// OS name override (e.g. `"android"`).
+    /// OS name (e.g. `"Android"`).
     pub os: Option<String>,
-    /// OS version override (e.g. `"35"`).
+    /// OS version (e.g. `"35"`).
     pub os_version: Option<String>,
-    /// App version override (e.g. `"3.2.16"`).
+    /// App version (e.g. `"3.2.16"`).
     pub app_version: Option<String>,
-    /// Device brand override (e.g. `"Google"`).
+    /// Device brand (e.g. `"Google"`).
     pub brand: Option<String>,
-    /// Device model override (e.g. `"Pixel 8"`).
+    /// Device model (e.g. `"Pixel 8"`).
     pub model: Option<String>,
+    /// Build number (e.g. `"2008"`).
+    pub build_number: Option<String>,
+    /// OS security-patch date (e.g. `"2026-01-01"`).
+    pub os_version_patch: Option<String>,
+    /// Client source identifier (e.g. `"FeiLian"`).
+    pub client_source: Option<String>,
+    /// UI language (e.g. `"en"`).
+    pub language: Option<String>,
+    /// HTTP `User-Agent` string.
+    pub user_agent: Option<String>,
+}
+
+impl DeviceIdentityConfig {
+    /// True when the device id and every identity field is populated.
+    #[must_use]
+    pub fn is_full(&self) -> bool {
+        !self.device_id.trim().is_empty()
+            && [
+                &self.os,
+                &self.os_version,
+                &self.app_version,
+                &self.brand,
+                &self.model,
+                &self.build_number,
+                &self.os_version_patch,
+                &self.client_source,
+                &self.language,
+                &self.user_agent,
+            ]
+            .into_iter()
+            .all(|field| field.as_deref().is_some_and(|value| !value.trim().is_empty()))
+    }
+
+    /// Ensure every field is populated by merging a freshly-generated full
+    /// default identity (with a stable device id) into any missing field.
+    ///
+    /// Returns `true` when anything was filled, so the caller can overwrite the
+    /// persisted config with the now-complete identity.
+    pub fn ensure_full(&mut self) -> bool {
+        if self.is_full() {
+            return false;
+        }
+        let default = rustylink_api::ClientIdentity::default();
+        if self.device_id.trim().is_empty() {
+            self.device_id = default.device_id;
+        }
+        merge_field(&mut self.os, default.os);
+        merge_field(&mut self.os_version, default.os_version);
+        merge_field(&mut self.app_version, default.app_version);
+        merge_field(&mut self.brand, default.brand);
+        merge_field(&mut self.model, default.model);
+        merge_field(&mut self.build_number, default.build_number);
+        merge_field(&mut self.os_version_patch, default.os_version_patch);
+        merge_field(&mut self.client_source, default.client_source);
+        merge_field(&mut self.language, default.language);
+        merge_field(&mut self.user_agent, default.user_agent);
+        true
+    }
+}
+
+/// Set `slot` from `default` when it is unset or blank.
+fn merge_field(slot: &mut Option<String>, default: String) {
+    if slot.as_deref().is_none_or(|value| value.trim().is_empty()) {
+        *slot = Some(default);
+    }
 }
 
 impl Default for DaemonConfig {
@@ -113,13 +180,11 @@ impl Default for DaemonConfig {
         let plain_token = token::generate_token();
         let token_hash = token::hash_token(&plain_token).unwrap_or_default();
 
-        let default_identity = rustylink_api::ClientIdentity::default();
         Self {
             token_hash,
-            identity: DeviceIdentityConfig {
-                device_id: default_identity.device_id,
-                ..DeviceIdentityConfig::default()
-            },
+            // Identity is completed by `DeviceIdentityConfig::ensure_full` on
+            // load, which generates the device id and merges the full profile.
+            identity: DeviceIdentityConfig::default(),
             outbound_interface: None,
             dns_interface: None,
             auto_reconnect: false,

@@ -14,7 +14,7 @@ use snafu::prelude::*;
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
 pub enum Error {
-    #[snafu(display("API operation failed"))]
+    #[snafu(display("API operation failed: {source}"))]
     Api {
         #[snafu(source(from(rustylink_api::Error, Box::new)))]
         source: Box<rustylink_api::Error>,
@@ -23,7 +23,7 @@ pub enum Error {
     #[snafu(display("no OAuth verifier is stored; run login oauth-start first"))]
     MissingOAuthVerifier,
 
-    #[snafu(display("invalid URL `{value}`"))]
+    #[snafu(display("invalid URL `{value}`: {source}"))]
     InvalidUrl {
         value: String,
         source: url::ParseError,

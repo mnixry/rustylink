@@ -90,7 +90,9 @@ message WatchTunnelResponse {
 }
 
 // ---------------------------------------------------------------------------
-// ProbeDotLatency — client-side ICMP latency probing for dot selection
+// ProbeDotLatency — client-side latency probing for dot selection.
+// Latency is the round-trip of a TCP connect to the dot's API server, measured
+// through the picked outbound interface (the same one the tunnel binds to).
 // ---------------------------------------------------------------------------
 
 message ProbeDotLatencyRequest {}
@@ -102,6 +104,7 @@ message ProbeDotLatencyResponse {
 message DotLatency {
   int32 dot_id = 1;
   string dot_name = 2;
+  // Round-trip latency in ms to the dot's API server (0 when unreachable).
   int32 latency_ms = 3;
   bool reachable = 4;
 }

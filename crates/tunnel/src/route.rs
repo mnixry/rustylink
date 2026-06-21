@@ -6,22 +6,22 @@ use strum::{Display, EnumIter, EnumString};
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
 pub enum Error {
-    #[snafu(display("route manager setup failed"))]
+    #[snafu(display("route manager setup failed: {source}"))]
     RouteManager { source: std::io::Error },
 
-    #[snafu(display("invalid route CIDR `{cidr}`"))]
+    #[snafu(display("invalid route CIDR `{cidr}`: {source}"))]
     InvalidRoute {
         cidr: String,
         source: ipnetwork::IpNetworkError,
     },
 
-    #[snafu(display("failed to add route `{route}`"))]
+    #[snafu(display("failed to add route `{route}`: {source}"))]
     AddRoute {
         route: String,
         source: std::io::Error,
     },
 
-    #[snafu(display("failed to delete route `{route}`"))]
+    #[snafu(display("failed to delete route `{route}`: {source}"))]
     DeleteRoute {
         route: String,
         source: std::io::Error,

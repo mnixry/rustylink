@@ -5,6 +5,8 @@
 //! `Daemon::disconnect_tunnel`; the RPC handlers add proto framing.
 
 use connectrpc::{RequestContext, Response, ServiceRequest, ServiceResult, ServiceStream};
+use std::time::Duration;
+
 use rustylink_core::vpn::VpnConnectMode;
 use rustylink_proto::proto::rustylink::daemon::{v1 as pb, v1::VpnService};
 use tokio_stream::{StreamExt as _, wrappers::WatchStream};
@@ -50,7 +52,7 @@ impl VpnService for VpnServiceImpl {
     async fn connect_tunnel(
         &self, _ctx: RequestContext, request: ServiceRequest<'_, pb::ConnectTunnelRequest>,
     ) -> ServiceResult<pb::ConnectTunnelResponse> {
-        let vpn_request = vpn_request_from_proto(&request);
+        let vpn_request = VpnRequest::from(&request);
         let tunnel = self.daemon.connect_tunnel(vpn_request).await?;
         Response::ok(pb::ConnectTunnelResponse {
             tunnel: tunnel.into(),
@@ -136,6 +138,10 @@ impl VpnService for VpnServiceImpl {
         }
         let dots = resp.data.unwrap_or_default();
 
+        // Probe through the picked outbound interface (configured or default),
+        // so the measured latency reflects the tunnel's actual egress path.
+        let outbound = self.daemon.resolve_outbound_interface().await;
+
         // Probe each dot in parallel using a JoinSet.
         let mut join_set = tokio::task::JoinSet::new();
         for dot in &dots {
@@ -146,13 +152,19 @@ impl VpnService for VpnServiceImpl {
                 .api_port
                 .and_then(|p| u16::try_from(p).ok())
                 .unwrap_or(latency::DEFAULT_API_PORT);
+            let outbound = outbound.clone();
             join_set.spawn(async move {
-                let rtt =
-                    latency::probe_tcp_latency(&host, port, latency::DEFAULT_PROBE_TIMEOUT).await;
+                let rtt = latency::probe_latency(
+                    &host,
+                    port,
+                    outbound.as_ref(),
+                    latency::DEFAULT_PROBE_TIMEOUT,
+                )
+                .await;
                 pb::DotLatency {
                     dot_id,
                     dot_name,
-                    latency_ms: rtt.map_or(0, |d| i32::try_from(d.as_millis()).unwrap_or(i32::MAX)),
+                    latency_ms: duration_ms(rtt, 0),
                     reachable: rtt.is_some(),
                     ..Default::default()
                 }
@@ -193,18 +205,29 @@ impl VpnService for VpnServiceImpl {
 // Proto → domain conversion
 // ---------------------------------------------------------------------------
 
-fn vpn_request_from_proto(request: &ServiceRequest<'_, pb::ConnectTunnelRequest>) -> VpnRequest {
-    let mode = match request.mode.as_known() {
-        Some(pb::VpnMode::Split) => VpnConnectMode::Split,
-        Some(pb::VpnMode::Relay) => VpnConnectMode::Relay,
-        _ => VpnConnectMode::Full,
-    };
-    let otp = request.otp.filter(|s| !s.is_empty()).map(ToOwned::to_owned);
-    VpnRequest {
-        mode,
-        export_id: request.export_id,
-        preferred_dot_id: request.preferred_dot_id,
-        otp,
-        reconnect: request.reconnect,
+impl From<&ServiceRequest<'_, pb::ConnectTunnelRequest>> for VpnRequest {
+    fn from(request: &ServiceRequest<'_, pb::ConnectTunnelRequest>) -> Self {
+        let mode = match request.mode.as_known() {
+            Some(pb::VpnMode::Split) => VpnConnectMode::Split,
+            Some(pb::VpnMode::Relay) => VpnConnectMode::Relay,
+            _ => VpnConnectMode::Full,
+        };
+        let otp = request.otp.filter(|s| !s.is_empty()).map(ToOwned::to_owned);
+        Self {
+            mode,
+            export_id: request.export_id,
+            preferred_dot_id: request.preferred_dot_id,
+            otp,
+            reconnect: request.reconnect,
+        }
     }
+}
+
+/// Convert an optional probe duration to whole milliseconds for the wire,
+/// using `fallback` when absent (`0` for the effective latency, `-1` for a
+/// component probe that got no response).
+fn duration_ms(value: Option<Duration>, fallback: i32) -> i32 {
+    value.map_or(fallback, |d| {
+        i32::try_from(d.as_millis()).unwrap_or(i32::MAX)
+    })
 }

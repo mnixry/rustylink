@@ -33,7 +33,7 @@ const MAX_DNS_PACKET: usize = 4096;
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
 pub enum Error {
-    #[snafu(display("failed to bind DNS proxy listener at {bind_addr}"))]
+    #[snafu(display("failed to bind DNS proxy listener at {bind_addr}: {source}"))]
     BindProxy {
         bind_addr: SocketAddr,
         source: io::Error,

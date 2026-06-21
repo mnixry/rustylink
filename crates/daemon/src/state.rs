@@ -18,10 +18,11 @@
 //! state.
 
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use jiff::Timestamp;
 use rustylink_api::{
-    ApiClient, ApiHooks, ClientIdentity, LoginV2Result, MatchEndpoint, ResponseMeta,
+    ApiClient, ApiHooks, ClientIdentity, CookieJar, LoginV2Result, MatchEndpoint, ResponseMeta,
     SessionCookies, SigningConfig, SigningContext, TenantEndpoint,
 };
 use rustylink_core::vpn::VpnConnectMode;
@@ -72,8 +73,9 @@ pub struct AuthMachine {
     pub(crate) tenant: Option<TenantConfig>,
     /// Signing / HMAC configuration (set after activation).
     pub(crate) signing: Option<PersistedSigningConfig>,
-    /// HTTP session cookies (`name → value`).
-    pub(crate) cookies: BTreeMap<String, String>,
+    /// HTTP session cookies, shared as a live jar with every [`ApiClient`]
+    /// built from this machine's hooks (Android-style `CookieJar`).
+    pub(crate) cookies: CookieJar,
     /// CSRF token from `Set-Cookie: csrf-token=…`.
     pub(crate) csrf_token: Option<String>,
     /// Knock token for API request decoration.
@@ -175,6 +177,15 @@ pub enum AuthEvent {
     StoreTotp { config: Option<PersistedTotpConfig> },
     /// Update the detected login API version.
     SetLoginApiVersion { version: LoginApiVersion },
+
+    /// Restore the session state from already-loaded credentials at startup.
+    ///
+    /// Credentials are only persisted for an authenticated session, so a
+    /// restored machine with a tenant + session cookies transitions straight
+    /// to `Authenticated` (otherwise `Configured`). Without this, a restored
+    /// session would sit in the initial `Unconfigured` state and the UI would
+    /// ask the user to log in again (e.g. after `--rotate-token`).
+    RestoreSession,
 }
 
 // ---------------------------------------------------------------------------
@@ -203,6 +214,7 @@ impl AuthMachine {
                 )
                 .await
             }
+            AuthEvent::RestoreSession => self.handle_restore_session(),
             other => self.handle_passthrough(other),
         }
     }
@@ -418,8 +430,10 @@ impl AuthMachine {
                 cookies,
                 csrf_token,
             } => {
-                for (name, value) in cookies {
-                    self.cookies.insert(name.clone(), value.clone());
+                if let Ok(mut jar) = self.cookies.lock() {
+                    for (name, value) in cookies {
+                        jar.values.insert(name.clone(), value.clone());
+                    }
                 }
                 if let Some(csrf) = csrf_token {
                     self.csrf_token = Some(csrf.clone());
@@ -436,6 +450,26 @@ impl AuthMachine {
             }
             _ => Handled,
         }
+    }
+
+    /// Restore the session state at startup from already-loaded credentials.
+    ///
+    /// Credentials are only persisted for an authenticated session, so a
+    /// restored machine with a tenant + session cookies transitions to
+    /// `Authenticated`; a tenant without cookies falls back to `Configured`;
+    /// with no tenant it stays `Unconfigured`.
+    fn handle_restore_session(&self) -> Response<State> {
+        if self.tenant.is_none() {
+            return Handled;
+        }
+        if self
+            .cookies
+            .lock()
+            .map_or(true, |jar| jar.values.is_empty())
+        {
+            return Transition(State::configured());
+        }
+        Transition(State::authenticated())
     }
 
     async fn handle_activate(
@@ -846,9 +880,11 @@ impl AuthMachine {
 
     /// Merge cookies and CSRF token from an API response into shared storage.
     pub fn merge_meta(&mut self, meta: &ResponseMeta) {
-        if let Some(cookies) = &meta.cookies {
+        if let Some(cookies) = &meta.cookies
+            && let Ok(mut jar) = self.cookies.lock()
+        {
             for (name, value) in &cookies.values {
-                self.cookies.insert(name.clone(), value.clone());
+                jar.values.insert(name.clone(), value.clone());
             }
         }
         if let Some(csrf) = &meta.csrf_token {
@@ -891,7 +927,7 @@ impl AuthMachine {
             } => {
                 session.otp_challenge = pb::OtpChallenge {
                     masked_target: masked_target.clone(),
-                    login_type: login_type.clone(),
+                    login_type: pb::LoginCodeType::from(login_type.as_str()).into(),
                     ..Default::default()
                 }
                 .into();
@@ -951,7 +987,11 @@ impl AuthMachine {
         Some(PersistedCredentials {
             tenant,
             signing,
-            cookies: self.cookies.clone(),
+            cookies: self
+                .cookies
+                .lock()
+                .map(|jar| jar.values.clone())
+                .unwrap_or_default(),
             csrf_token: self.csrf_token.clone(),
             knock_token: self.knock_token.clone(),
             totp: self.totp.clone(),
@@ -987,7 +1027,9 @@ impl AuthMachine {
             identity,
             tenant: Some(creds.tenant),
             signing: Some(creds.signing),
-            cookies: creds.cookies,
+            cookies: Arc::new(Mutex::new(SessionCookies {
+                values: creds.cookies,
+            })),
             csrf_token: creds.csrf_token,
             knock_token: creds.knock_token,
             totp: creds.totp,
@@ -1014,9 +1056,7 @@ impl AuthMachine {
 
         ApiHooks {
             identity: self.identity.clone(),
-            cookies: SessionCookies {
-                values: self.cookies.clone(),
-            },
+            cookies: self.cookies.clone(),
             csrf_token: self.csrf_token.clone(),
             knock_token: self.knock_token.clone(),
             signer: SigningContext::new(signing_config),
@@ -1026,7 +1066,9 @@ impl AuthMachine {
     /// Clear session-specific data (cookies, tokens), keeping tenant +
     /// signing config intact.
     fn clear_session(&mut self) {
-        self.cookies.clear();
+        if let Ok(mut jar) = self.cookies.lock() {
+            jar.values.clear();
+        }
         self.csrf_token = None;
         self.knock_token = None;
         self.totp = None;
@@ -1082,12 +1124,19 @@ fn route_login_next(result: Option<&LoginV2Result>) -> Response<State> {
         }
 
         // OTP / verify_code / other verification challenge.
-        let masked = next
-            .mobile
-            .clone()
-            .or_else(|| next.email.clone())
-            .unwrap_or_default();
-        return Transition(State::awaiting_otp(masked, action.to_owned()));
+        //
+        // The `login_type` we store is the delivery *channel* (mobile vs.
+        // email), not the action verb: the UI echoes it back when verifying or
+        // resending, and the upstream code endpoints expect `mobile`/`email`.
+        // Derive it from whichever masked target the server returned.
+        let masked_mobile = next.mobile.clone().filter(|value| !value.is_empty());
+        let masked_email = next.email.clone().filter(|value| !value.is_empty());
+        let (masked, login_type) = match (masked_mobile, masked_email) {
+            (Some(mobile), _) => (mobile, "mobile".to_owned()),
+            (None, Some(email)) => (email, "email".to_owned()),
+            (None, None) => (String::new(), "mobile".to_owned()),
+        };
+        return Transition(State::awaiting_otp(masked, login_type));
     }
 
     // ③ No explicit success AND no `.next` — treat as authenticated

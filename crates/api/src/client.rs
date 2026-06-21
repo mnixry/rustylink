@@ -1,4 +1,7 @@
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
 
 use jiff::Timestamp;
 use reqwest::{
@@ -14,7 +17,7 @@ use url::Url;
 
 use crate::{
     identity::ClientIdentity,
-    models::{ApiResponse, BaseResponse, SendableRequest, VpnDot},
+    models::{ApiResponse, BaseResponse, IpDelayRoutingPolicy, SendableRequest, VpnDot},
     signing::SigningContext,
 };
 
@@ -23,28 +26,28 @@ pub const DEFAULT_MATCH_BASE_URL: &str = "https://corplink.volcengine.cn";
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
 pub enum Error {
-    #[snafu(display("invalid base URL `{value}`"))]
+    #[snafu(display("invalid base URL `{value}`: {source}"))]
     InvalidBaseUrl {
         value: String,
         source: url::ParseError,
     },
 
-    #[snafu(display("failed to build HTTP client"))]
+    #[snafu(display("failed to build HTTP client: {source}"))]
     BuildHttpClient { source: reqwest::Error },
 
-    #[snafu(display("failed to encode API request body"))]
+    #[snafu(display("failed to encode API request body: {source}"))]
     Encode { source: serde_json::Error },
 
-    #[snafu(display("failed to build API request"))]
+    #[snafu(display("failed to build API request: {source}"))]
     BuildRequest { source: reqwest::Error },
 
-    #[snafu(display("API request failed"))]
+    #[snafu(display("API request failed: {source}"))]
     Request { source: reqwest::Error },
 
     #[snafu(display("request middleware failed: {message}"))]
     MiddlewareFailed { message: String },
 
-    #[snafu(display("response decode failed: {source}; content: {content}"))]
+    #[snafu(display("failed to decode response (content: {content}): {source}"))]
     Decode {
         source: serde_json::Error,
         content: String,
@@ -56,24 +59,24 @@ pub enum Error {
         content: String,
     },
 
-    #[snafu(display("failed to build header `{name}`"))]
+    #[snafu(display("failed to build header `{name}`: {source}"))]
     HeaderValue {
         name: String,
         source: reqwest::header::InvalidHeaderValue,
     },
 
-    #[snafu(display("failed to build header name `{name}`"))]
+    #[snafu(display("failed to build header name `{name}`: {source}"))]
     HeaderName {
         name: String,
         source: reqwest::header::InvalidHeaderName,
     },
 
-    #[snafu(display("failed to sign request"))]
+    #[snafu(display("failed to sign request: {source}"))]
     SignRequest {
         source: crate::signing::SigningError,
     },
 
-    #[snafu(display("failed to encrypt password"))]
+    #[snafu(display("failed to encrypt password: {source}"))]
     EncryptPassword {
         source: crate::signing::PasswordCipherError,
     },
@@ -122,6 +125,37 @@ impl SessionCookies {
     }
 }
 
+/// A shared, mutable cookie jar.
+///
+/// Like the Android client's `CookieJar`, this accumulates `Set-Cookie`
+/// mutations across every request made by any [`ApiClient`] that shares it, so
+/// cookies set mid-flow (e.g. `vpn-token` from `/api/vpn/list`) are present on
+/// later requests (e.g. the dot's `/vpn/conn`). All clients built from one
+/// [`ApiHooks`] share the same jar.
+pub type CookieJar = Arc<Mutex<SessionCookies>>;
+
+/// Merge `Set-Cookie` headers from a response into a [`CookieJar`].
+fn absorb_set_cookies(jar: &CookieJar, headers: &HeaderMap) {
+    let updates: Vec<(String, String)> = headers
+        .get_all(SET_COOKIE)
+        .iter()
+        .filter_map(|value| {
+            let raw = value.to_str().ok()?;
+            let (name, rest) = raw.split_once('=')?;
+            let cookie_value = rest.split(';').next().unwrap_or_default();
+            Some((name.trim().to_string(), cookie_value.trim().to_string()))
+        })
+        .collect();
+    if updates.is_empty() {
+        return;
+    }
+    if let Ok(mut jar) = jar.lock() {
+        for (name, value) in updates {
+            jar.values.insert(name, value);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Response metadata — extracted from HTTP response headers
 // ---------------------------------------------------------------------------
@@ -152,7 +186,7 @@ pub struct ResponseMeta {
 #[derive(Clone, Debug)]
 pub struct ApiHooks {
     pub identity: ClientIdentity,
-    pub cookies: SessionCookies,
+    pub cookies: CookieJar,
     pub csrf_token: Option<String>,
     pub knock_token: Option<String>,
     pub signer: SigningContext,
@@ -160,6 +194,11 @@ pub struct ApiHooks {
 
 impl ApiHooks {
     fn base_headers(&self) -> Result<HeaderMap> {
+        let cookies = self
+            .cookies
+            .lock()
+            .map(|jar| jar.clone())
+            .unwrap_or_default();
         let mut headers = HeaderMap::new();
         let accept_language = if self.identity.language.contains("zh") {
             "zh-CN"
@@ -179,18 +218,23 @@ impl ApiHooks {
             })?,
         );
 
-        if let Some(cookie_header) = cookie_header(&self.cookies) {
-            headers.insert(
-                COOKIE,
-                HeaderValue::from_str(&cookie_header).context(HeaderValueSnafu {
-                    name: "Cookie".to_string(),
-                })?,
-            );
-        }
+        // Cookie header: session cookies plus the always-present device
+        // identity cookies. Android's `CookieJarImpl.loadAllCookie` injects
+        // `device_id`/`device_name` on *every* request (to all hosts), so the
+        // login binds the session to a device. The issued session token then
+        // carries a non-empty `did`; `/vpn/conn` rejects a session whose `did`
+        // is empty with a misleading "session expired" error.
+        let cookie_value = device_cookie_header(&cookies, &self.identity);
+        headers.insert(
+            COOKIE,
+            HeaderValue::from_str(&cookie_value).context(HeaderValueSnafu {
+                name: "Cookie".to_string(),
+            })?,
+        );
         if let Some(csrf) = self
             .csrf_token
             .as_deref()
-            .or_else(|| self.cookies.values.get("csrf-token").map(String::as_str))
+            .or_else(|| cookies.values.get("csrf-token").map(String::as_str))
         {
             headers.insert(
                 HeaderName::from_static("csrf-token"),
@@ -207,7 +251,7 @@ impl ApiHooks {
                 })?,
             );
         }
-        if let Some(vpn_token) = self.cookies.values.get("vpn-token") {
+        if let Some(vpn_token) = cookies.values.get("vpn-token") {
             headers.insert(
                 HeaderName::from_static("jwt-token"),
                 HeaderValue::from_str(vpn_token).context(HeaderValueSnafu {
@@ -289,7 +333,11 @@ impl Middleware for SigningMiddleware {
     ) -> reqwest_middleware::Result<reqwest::Response> {
         self.decorate(&mut request)
             .map_err(reqwest_middleware::Error::middleware)?;
-        next.run(request, extensions).await
+        let response = next.run(request, extensions).await?;
+        // Absorb any Set-Cookie mutations into the shared jar so later requests
+        // (including ones to other hosts, e.g. the dot config call) carry them.
+        absorb_set_cookies(&self.hooks.cookies, response.headers());
+        Ok(response)
     }
 }
 
@@ -379,13 +427,15 @@ impl TenantEndpoint {
 
 impl DotEndpoint {
     pub fn from_dot(dot: &VpnDot, use_vpn_ip_for_api: bool) -> Result<Self> {
-        let api_host = dot.api_host().context(MissingVpnDotFieldSnafu {
-            field: "apiIp/ip4Domain/fastIp",
+        // WireGuard endpoint uses the VPN host (ip4Domain ?: ip); the config
+        // API uses the API host (ip4Domain ?: fastIp ?: apiIp ?: ip).
+        let vpn_host = dot.vpn_host().context(MissingVpnDotFieldSnafu {
+            field: "ip/ip4Domain",
         })?;
         let api_host_for_conn =
             dot.config_api_host(use_vpn_ip_for_api)
                 .context(MissingVpnDotFieldSnafu {
-                    field: "apiIp/ip4Domain/fastIp",
+                    field: "apiIp/ip4Domain/fastIp/ip",
                 })?;
         let api_port = dot
             .api_port
@@ -395,7 +445,7 @@ impl DotEndpoint {
             .context(MissingVpnDotFieldSnafu { field: "vpn_port" })?;
         Ok(Self {
             api_base_url: url_from_host_port("https", api_host_for_conn, api_port)?,
-            wireguard_endpoint: url_from_host_port("udp", api_host, vpn_port)?,
+            wireguard_endpoint: url_from_host_port("udp", vpn_host, vpn_port)?,
         })
     }
 }
@@ -433,7 +483,7 @@ impl ApiClient {
         endpoint: &impl ApiEndpoint, pool: reqwest::Client, hooks: ApiHooks,
     ) -> Self {
         let base_url = endpoint.base_url().clone();
-        let request_cookies = hooks.cookies.clone();
+        let request_cookies = hooks.cookies.lock().map(|jar| jar.clone()).unwrap_or_default();
         let http = ClientBuilder::new(pool)
             .with(SigningMiddleware::new(hooks))
             .build();
@@ -514,14 +564,35 @@ impl ApiClient {
 // VpnDot helpers (unchanged)
 // ---------------------------------------------------------------------------
 
+/// Android VPN mode ids carried on a dot's `mode` field and the requested
+/// connect mode (kept in sync with `rustylink_core::vpn::VpnConnectMode`).
+const MODE_FULL: i32 = 0;
+const MODE_SPLIT: i32 = 1;
+const MODE_RELAY: i32 = 2;
+
 impl VpnDot {
     #[must_use]
     pub fn api_host(&self) -> Option<&str> {
+        // Mirrors Android `VpnDotBean.getApiIp()` (ip4Domain ?: fastIp ?: apiIp)
+        // with a final fallback to the VPN IP (`ip`) — many deployments only
+        // populate `ip` and rely on it for the API host too (the app's
+        // `setApiIp` backfills it the same way).
         self.ip4_domain
             .as_deref()
             .filter(|value| !value.is_empty())
             .or_else(|| self.fast_ip.as_deref().filter(|value| !value.is_empty()))
             .or_else(|| self.api_ip.as_deref().filter(|value| !value.is_empty()))
+            .or_else(|| self.ip.as_deref().filter(|value| !value.is_empty()))
+    }
+
+    /// Host for the `WireGuard` endpoint — the IPv4 domain override, else the
+    /// VPN IP (`ip`). Mirrors Android `VpnDotBean.getVpnIp()`.
+    #[must_use]
+    pub fn vpn_host(&self) -> Option<&str> {
+        self.ip4_domain
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .or_else(|| self.ip.as_deref().filter(|value| !value.is_empty()))
     }
 
     #[must_use]
@@ -541,9 +612,9 @@ impl VpnDot {
         if is_auto_location || self.ip.as_deref().is_none_or(str::is_empty) {
             return false;
         }
-        self.ip_delay_routing_policy.as_ref().is_some_and(|policy| {
-            policy.is_operator.unwrap_or(false) && policy.policy_type == Some(1)
-        })
+        self.ip_delay_routing_policy
+            .as_ref()
+            .is_some_and(IpDelayRoutingPolicy::is_operator_routing)
     }
 
     #[must_use]
@@ -555,7 +626,14 @@ impl VpnDot {
 
     #[must_use]
     pub fn supports_android_mode(&self, requested_mode: i32) -> bool {
-        !matches!((self.mode, requested_mode), (Some(2), 1) | (Some(1), 0))
+        // Android VPN mode ids (shared with `VpnConnectMode`): 0 = Full,
+        // 1 = Split, 2 = Relay. A node only serves requests at or above its own
+        // capability tier, so a Relay node can't serve Split and a Split node
+        // can't serve Full.
+        !matches!(
+            (self.mode, requested_mode),
+            (Some(MODE_RELAY), MODE_SPLIT) | (Some(MODE_SPLIT), MODE_FULL)
+        )
     }
 
     #[must_use]
@@ -630,18 +708,37 @@ fn map_middleware_error(error: reqwest_middleware::Error) -> Error {
     }
 }
 
-fn cookie_header(cookies: &SessionCookies) -> Option<String> {
-    if cookies.values.is_empty() {
-        return None;
+/// Build the `Cookie` header value: the session cookies followed by the device
+/// identity cookies (`device_id`/`device_name`).
+///
+/// The device cookies mirror Android's `CookieJarImpl`, which appends them to
+/// every request. Sending them at login is what binds the session to a device
+/// (`did`); `/vpn/conn` requires that binding.
+fn device_cookie_header(cookies: &SessionCookies, identity: &ClientIdentity) -> String {
+    let mut parts: Vec<String> = cookies
+        .values
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect();
+    parts.push(format!("device_id={}", identity.device_id));
+    parts.push(format!("device_name={}", device_name_cookie_value(identity)));
+    parts.join("; ")
+}
+
+/// A cookie-safe device name derived from the identity model (spaces replaced),
+/// e.g. `"Pixel 8"` → `"Pixel-8"`. Falls back to `"rustylink"` when empty.
+fn device_name_cookie_value(identity: &ClientIdentity) -> String {
+    let name: String = identity
+        .model
+        .chars()
+        .map(|c| if c.is_ascii_whitespace() { '-' } else { c })
+        .filter(|c| !matches!(c, ';' | ',' | '='))
+        .collect();
+    if name.trim().is_empty() {
+        "rustylink".to_string()
+    } else {
+        name
     }
-    Some(
-        cookies
-            .values
-            .iter()
-            .map(|(name, value)| format!("{name}={value}"))
-            .collect::<Vec<_>>()
-            .join("; "),
-    )
 }
 
 /// Extract metadata from response headers: cookies, CSRF token, Date header.
@@ -747,12 +844,35 @@ mod tests {
         }))
         .expect("dot");
 
-        let endpoint = DotEndpoint::from_dot(&dot, true).expect("endpoint");
+        let endpoint = DotEndpoint::from_dot(&dot, false).expect("endpoint");
+
+        // Config API uses the API host (apiIp); WireGuard uses the VPN IP.
+        assert_eq!(endpoint.api_base_url.as_str(), "https://api.example:8443/");
+        assert_eq!(
+            endpoint.wireguard_endpoint.as_str(),
+            "udp://10.0.0.12:51820/"
+        );
+    }
+
+    #[test]
+    fn dot_endpoint_falls_back_to_ip_when_only_ip_present() {
+        // Many deployments only populate `ip` (no apiIp/fastIp/ip4Domain); both
+        // the API host and the WireGuard endpoint must fall back to it.
+        let dot = serde_json::from_value::<VpnDot>(json!({
+            "ip": "10.0.0.12",
+            "api_port": 8443,
+            "vpn_port": 51820
+        }))
+        .expect("dot");
+
+        let endpoint = DotEndpoint::from_dot(&dot, false).expect("endpoint");
 
         assert_eq!(endpoint.api_base_url.as_str(), "https://10.0.0.12:8443/");
         assert_eq!(
             endpoint.wireguard_endpoint.as_str(),
-            "udp://api.example:51820/"
+            "udp://10.0.0.12:51820/"
         );
+        assert_eq!(dot.api_host(), Some("10.0.0.12"));
+        assert_eq!(dot.vpn_host(), Some("10.0.0.12"));
     }
 }

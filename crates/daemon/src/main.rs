@@ -29,6 +29,7 @@ use connectrpc::Router as ConnectRouter;
 use rustylink_proto::proto::rustylink::daemon::v1::{
     AuthServiceExt as _, MetaServiceExt as _, VpnServiceExt as _,
 };
+use snafu::prelude::*;
 use tower::ServiceBuilder;
 use tower_http::{
     cors::CorsLayer,
@@ -65,8 +66,9 @@ struct Args {
     rotate_token: bool,
 }
 
+#[snafu::report]
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), InitError> {
     let args = Args::parse();
 
     fmt()
@@ -80,16 +82,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let credential_path = args.credential_path.unwrap_or_else(default_credential_path);
 
     tracing::info!(path = %config_path.display(), "loading daemon config");
-    let mut config = DaemonConfig::load_or_default(&config_path).await?;
+    let mut config = DaemonConfig::load_or_default(&config_path)
+        .await
+        .context(LoadConfigSnafu {
+            path: config_path.clone(),
+        })?;
+
+    // Complete the persisted device identity: generate a full one (with a
+    // device id) on first run, or merge missing fields into a partial one,
+    // then overwrite the config below with the complete identity.
+    if config.identity.ensure_full() {
+        tracing::info!("completed device identity in daemon config");
+    }
 
     // Ensure a bearer token exists (first run or rotation).
     let token_hash = ensure_token(&mut config, args.rotate_token)?;
-    config.save(&config_path).await?;
+    config.save(&config_path).await.context(SaveConfigSnafu {
+        path: config_path.clone(),
+    })?;
 
     tracing::info!(path = %credential_path.display(), "loading credentials");
-    let credentials = PersistedCredentials::load(&credential_path).await?;
+    let credentials = PersistedCredentials::load(&credential_path)
+        .await
+        .context(LoadCredentialsSnafu {
+            path: credential_path.clone(),
+        })?;
 
     let daemon = Daemon::new(config, config_path, credential_path, credentials);
+
+    // Recognise a restored, previously-authenticated session before anything
+    // queries the auth state (otherwise it stays Unconfigured).
+    daemon.restore_auth_state().await;
 
     // Auto-resume: if we were connected before shutdown and auto-reconnect
     // is enabled, re-establish the tunnel.
@@ -149,11 +172,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .layer(PropagateRequestIdLayer::x_request_id()),
     );
 
-    let listener = tokio::net::TcpListener::bind(args.listen).await?;
+    let listener = tokio::net::TcpListener::bind(args.listen)
+        .await
+        .context(BindListenerSnafu { listen: args.listen })?;
     tracing::info!(addr = %args.listen, "rustylinkd listening");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
-        .await?;
+        .await
+        .context(ServeSnafu)?;
 
     tracing::info!("rustylinkd shut down cleanly");
     Ok(())
@@ -162,14 +188,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Ensure a bearer token exists, returning its argon2 hash.  On first run or
 /// `--rotate-token` a fresh token is generated, printed once to stderr, and its
 /// hash stored in `config`; otherwise the existing hash is returned unchanged.
-fn ensure_token(
-    config: &mut DaemonConfig, rotate: bool,
-) -> Result<String, Box<dyn std::error::Error>> {
+fn ensure_token(config: &mut DaemonConfig, rotate: bool) -> Result<String, InitError> {
     if !config.token_hash.is_empty() && !rotate {
         return Ok(config.token_hash.clone());
     }
     let plain_token = token::generate_token();
-    let hash = token::hash_token(&plain_token).ok_or("failed to hash bearer token")?;
+    let hash = token::hash_token(&plain_token).context(HashTokenSnafu)?;
     config.token_hash.clone_from(&hash);
     eprintln!("─────────────────────────────────────────────────────────────");
     eprintln!("  rustylinkd bearer token (shown once — store it securely):");
@@ -213,4 +237,40 @@ async fn shutdown_signal() {
         () = ctrl_c => tracing::info!("received SIGINT"),
         () = terminate => tracing::info!("received SIGTERM"),
     }
+}
+
+/// Fatal errors raised while starting the daemon, before the RPC server begins
+/// serving. Surfaced from `main` via [`snafu::Report`] (`#[snafu::report]`) for
+/// a clean, fully-sourced error stack instead of a `Box<dyn Error>` debug dump.
+#[derive(Debug, Snafu)]
+enum InitError {
+    #[snafu(display("failed to load daemon config from {}: {source}", path.display()))]
+    LoadConfig {
+        path: PathBuf,
+        source: persist::Error,
+    },
+
+    #[snafu(display("failed to save daemon config to {}: {source}", path.display()))]
+    SaveConfig {
+        path: PathBuf,
+        source: persist::Error,
+    },
+
+    #[snafu(display("failed to load credentials from {}: {source}", path.display()))]
+    LoadCredentials {
+        path: PathBuf,
+        source: persist::Error,
+    },
+
+    #[snafu(display("failed to hash the generated bearer token"))]
+    HashToken,
+
+    #[snafu(display("failed to bind the RPC listener to {listen}: {source}"))]
+    BindListener {
+        listen: SocketAddr,
+        source: std::io::Error,
+    },
+
+    #[snafu(display("the RPC server terminated unexpectedly: {source}"))]
+    Serve { source: std::io::Error },
 }

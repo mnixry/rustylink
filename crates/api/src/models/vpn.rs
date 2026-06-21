@@ -39,6 +39,10 @@ pub struct VpnSetting {
     pub vpn_status: Option<i32>,
     #[serde(rename = "admin_enable", alias = "adminEnable")]
     pub admin_enable: Option<bool>,
+    /// Tenant VPN domain. Dots are reached by IP but present a TLS cert valid
+    /// for this domain; the client validates the cert against it.
+    /// (Android: `VpnSettingBean.vpn_domain`, used by the dot hostname verifier.)
+    pub vpn_domain: Option<String>,
     pub raw: Option<JsonObject>,
 }
 
@@ -98,6 +102,18 @@ pub struct IpDelayRoutingPolicy {
     pub is_operator: Option<bool>,
     #[serde(alias = "policyType")]
     pub policy_type: Option<i32>,
+}
+
+impl IpDelayRoutingPolicy {
+    /// `policy_type` value that marks operator-specific IP-delay routing.
+    pub const OPERATOR: i32 = 1;
+
+    /// Whether this policy selects operator IP-delay routing — the signal used
+    /// to decide whether the dot's VPN IP should be used for the config API.
+    #[must_use]
+    pub fn is_operator_routing(&self) -> bool {
+        self.is_operator.unwrap_or(false) && self.policy_type == Some(Self::OPERATOR)
+    }
 }
 
 #[skip_serializing_none]
@@ -162,6 +178,25 @@ pub struct VpnReportRequest {
 
 impl_json_request!(VpnReportRequest, POST, "/vpn/report", BaseResponse<String>);
 
+/// `/vpn/report` event type. The Android client posts `100` periodically while
+/// connected and `101` once on disconnect.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(i32)]
+pub enum VpnReportType {
+    /// Periodic keepalive while connected.
+    Connected = 100,
+    /// Sent once on disconnect / teardown.
+    Disconnected = 101,
+}
+
+impl VpnReportType {
+    /// The numeric value rendered as the wire string (`"100"` / `"101"`).
+    #[must_use]
+    pub fn wire(self) -> String {
+        (self as i32).to_string()
+    }
+}
+
 #[skip_serializing_none]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -175,7 +210,7 @@ pub struct VpnConnResponse {
     pub ip: String,
     #[serde(default)]
     pub ipv6: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_flexible_opt_i32")]
     pub ip_mask: Option<i32>,
     pub public_key: String,
     #[serde(default)]
@@ -187,6 +222,37 @@ pub struct VpnConnResponse {
     pub setting: VpnConnSetting,
     #[serde(default)]
     pub raw: Option<JsonObject>,
+}
+
+/// Deserialize an optional `i32` that the server may encode as a JSON string
+/// (e.g. `ip_mask: "24"`), a number, or null. Mirrors the Android client's
+/// `optInt`, which coerces a string field to an integer.
+fn deserialize_flexible_opt_i32<'de, D>(deserializer: D) -> Result<Option<i32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    match Option::<serde_json::Value>::deserialize(deserializer)? {
+        Some(serde_json::Value::Number(number)) => {
+            Ok(number.as_i64().and_then(|value| i32::try_from(value).ok()))
+        }
+        Some(serde_json::Value::String(text)) => Ok(text.trim().parse::<i32>().ok()),
+        _ => Ok(None),
+    }
+}
+
+/// Deserialize an optional string, tolerating the server sending a non-string
+/// (e.g. a map for `vpn_dynamic_domain_route_split`). Mirrors the Android
+/// client's `optString`, which yields an empty/absent value for non-strings.
+fn deserialize_flexible_opt_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    match Option::<serde_json::Value>::deserialize(deserializer)? {
+        Some(serde_json::Value::String(text)) => Ok(Some(text)),
+        _ => Ok(None),
+    }
 }
 
 #[skip_serializing_none]
@@ -207,19 +273,19 @@ pub struct VpnConnSetting {
     pub v6_route_full: Option<Vec<String>>,
     #[serde(default)]
     pub v6_route_split: Option<Vec<String>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_flexible_opt_string")]
     pub vpn_dynamic_domain_route_split: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_flexible_opt_string")]
     pub v6_vpn_dynamic_domain_route_split: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_flexible_opt_string")]
     pub vpn_wildcard_dynamic_domain_route_split: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_flexible_opt_string")]
     pub suffix_wildcard_dynamic_domain_route_split: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_flexible_opt_string")]
     pub dynamic_domain: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_flexible_opt_string")]
     pub central_dns: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_flexible_opt_string")]
     pub ip_nats: Option<String>,
 }
 

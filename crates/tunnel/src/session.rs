@@ -34,24 +34,24 @@ pub enum Error {
     #[snafu(display("invalid tunnel config: {reason}"))]
     InvalidConfig { reason: String },
 
-    #[snafu(display("route manager failed"))]
+    #[snafu(display("route manager failed: {source}"))]
     Route { source: crate::route::Error },
 
-    #[snafu(display("TUN device setup failed"))]
+    #[snafu(display("TUN device setup failed: {source}"))]
     TunDevice {
         source: gotatun::tun::tun_async_device::Error,
     },
 
-    #[snafu(display("DNS hijack setup failed"))]
+    #[snafu(display("DNS hijack setup failed: {source}"))]
     Dns { source: crate::dns::Error },
 
-    #[snafu(display("outbound interface selection failed"))]
+    #[snafu(display("outbound interface selection failed: {source}"))]
     Outbound { source: crate::outbound::Error },
 
-    #[snafu(display("gotatun device setup failed"))]
+    #[snafu(display("gotatun device setup failed: {source}"))]
     Device { source: gotatun::device::Error },
 
-    #[snafu(display("failed to resolve WireGuard endpoint `{endpoint}`"))]
+    #[snafu(display("failed to resolve WireGuard endpoint `{endpoint}`: {source}"))]
     ResolveEndpoint {
         endpoint: String,
         source: std::io::Error,
@@ -63,7 +63,7 @@ pub enum Error {
     #[snafu(display("invalid WireGuard key `{name}`"))]
     InvalidKey { name: &'static str },
 
-    #[snafu(display("invalid route CIDR `{cidr}`"))]
+    #[snafu(display("invalid route CIDR `{cidr}`: {source}"))]
     InvalidRoute {
         cidr: String,
         source: ipnetwork::IpNetworkError,
@@ -133,7 +133,7 @@ enum TunnelTransport {
 
 #[derive(Clone, Copy, Debug, Display, EnumIter, Eq, FromRepr, PartialEq)]
 #[repr(i32)]
-enum ProtocolMode {
+pub enum ProtocolMode {
     Udp        = 0,
     FeilianTcp = 1,
     Dual       = 2,

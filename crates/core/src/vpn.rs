@@ -59,7 +59,7 @@ pub struct VpnConfigResult {
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
 pub enum Error {
-    #[snafu(display("API operation failed"))]
+    #[snafu(display("API operation failed: {source}"))]
     Api {
         #[snafu(source(from(rustylink_api::Error, Box::new)))]
         source: Box<rustylink_api::Error>,
@@ -232,14 +232,32 @@ pub async fn vpn_conn(
 
 /// Fetch the dot list, select a suitable dot, and negotiate a VPN config.
 ///
+/// Dot (access-point) selection mirrors the outbound-interface resolution
+/// model:
+///
+/// * **Pinned** — when `request.preferred_dot_id` is `Some`, only that dot is
+///   considered (the caller explicitly chose a node; we stick to it).
+/// * **Auto** — when `preferred_dot_id` is `None`, all dots that support the
+///   requested mode are ranked by measured latency via `rank_dots`, and the
+///   fastest-responding nodes are tried first.
+///
 /// `build_dot_client` is a callback the caller provides to construct an
 /// [`ApiClient`] pointing at a particular dot endpoint.  This keeps the core
 /// crate free of client-construction concerns (cookie injection, signing
 /// middleware, etc.).
-pub async fn vpn_config_from_dot_list(
+///
+/// `rank_dots` is a callback that orders candidate dots best-first (e.g. by
+/// latency probing).  It is invoked **only** in the auto case with more than
+/// one candidate; keeping it in the caller lets the runtime-bound probing live
+/// in the daemon while this crate stays runtime-agnostic.
+pub async fn vpn_config_from_dot_list<RankFut>(
     tenant_client: &ApiClient, request: &VpnConfigRequest,
     build_dot_client: impl Fn(&DotEndpoint) -> ApiClient,
-) -> Result<VpnConfigResult> {
+    rank_dots: impl FnOnce(Vec<VpnDot>) -> RankFut,
+) -> Result<VpnConfigResult>
+where
+    RankFut: std::future::Future<Output = Vec<VpnDot>>,
+{
     let (locations, _list_meta) = GetVpnLocationsRequest
         .send_with_meta(tenant_client)
         .await
@@ -249,6 +267,7 @@ pub async fn vpn_config_from_dot_list(
         return NoVpnDotsSnafu.fail();
     }
 
+    let pinned = request.preferred_dot_id.is_some();
     let mut candidates = dots
         .into_iter()
         .filter(|dot| {
@@ -265,6 +284,12 @@ pub async fn vpn_config_from_dot_list(
             mode: request.mode.android_name(),
         }
         .fail();
+    }
+
+    // Auto selection: with no pinned dot, probe and order candidates so the
+    // lowest-latency node is attempted first. A pinned dot is used as-is.
+    if !pinned && candidates.len() > 1 {
+        candidates = rank_dots(candidates).await;
     }
 
     candidates.truncate(MAX_DOT_ATTEMPTS);

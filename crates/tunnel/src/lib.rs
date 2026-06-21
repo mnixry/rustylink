@@ -11,5 +11,5 @@ pub use error::{Error, Result};
 pub use outbound::{BoundUdpSocketFactory, OutboundInterface};
 pub use reconnect::{ReconnectController, ReconnectDecision, ReconnectEvent, ReconnectPolicy};
 pub use route::{RoutePlan, RouteRule};
-pub use session::{LocalTunnelParams, TunnelConfig, TunnelSession, TunnelStatus};
+pub use session::{LocalTunnelParams, ProtocolMode, TunnelConfig, TunnelSession, TunnelStatus};
 pub use transport::FeilianTcpTransportFactory;

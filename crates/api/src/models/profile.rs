@@ -37,9 +37,18 @@ impl_empty_request!(
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LoginSetting {
-    #[serde(rename = "v1Login", alias = "v1_login")]
-    pub v1_login: Option<bool>,
+    /// Login flow version. `"v1"` selects the `/api/v1/login/*` endpoints.
+    /// (Android: `LoginSettingBean.login_version`, `isV1Login()`.)
+    pub login_version: Option<String>,
     pub raw: Option<JsonObject>,
+}
+
+impl LoginSetting {
+    /// Whether the tenant uses the v1 login flow (`login_version == "v1"`).
+    #[must_use]
+    pub fn is_v1(&self) -> bool {
+        self.login_version.as_deref() == Some("v1")
+    }
 }
 
 #[skip_serializing_none]

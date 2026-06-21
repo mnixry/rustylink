@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package rustylink.daemon.v1;
 
+import "rustylink/daemon/v1/types.proto";
+
 // ---------------------------------------------------------------------------
 // Session — fine-grained state enum aligned with statig `AuthMachine` states
 // ---------------------------------------------------------------------------
@@ -31,7 +33,7 @@ message Session {
 
 message OtpChallenge {
   string masked_target = 1;
-  string login_type = 2;
+  LoginCodeType login_type = 2;
 }
 
 message MfaChallenge {
@@ -88,7 +90,7 @@ message LoginResponse {
 
 message RequestLoginCodeRequest {
   string account = 1;
-  string login_type = 2;
+  LoginCodeType login_type = 2;
   string login_scene = 3;
   string account_type = 4;
 }
@@ -100,7 +102,7 @@ message RequestLoginCodeResponse {
 message VerifyLoginCodeRequest {
   string account = 1;
   string code = 2;
-  string login_type = 3;
+  LoginCodeType login_type = 3;
   string login_scene = 4;
   string account_type = 5;
 }

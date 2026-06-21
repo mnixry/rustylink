@@ -9,16 +9,21 @@
 //! VPN connect/disconnect logic lives here as Daemon methods — the background
 //! connect loop, supervisor, reconnect, and reporting.
 
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+use std::{
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
+    sync::Arc,
+};
 
 use rustylink_api::{
-    ApiClient, ClientIdentity, DotEndpoint, UserInfo, VpnConnResponse, VpnDot, VpnReportRequest,
+    ApiClient, ApiHooks, ClientIdentity, DotEndpoint, UserInfo, VpnConnResponse, VpnDot,
+    VpnReportRequest, VpnReportType,
 };
 use rustylink_core::vpn::{VpnConfigRequest, VpnConfigResult, VpnConnectMode};
 use rustylink_proto::proto::rustylink::daemon::v1 as pb;
 use rustylink_tunnel::{
-    LocalTunnelParams, ReconnectController, ReconnectDecision, ReconnectEvent, ReconnectPolicy,
-    TunnelConfig, TunnelSession,
+    LocalTunnelParams, OutboundInterface, ProtocolMode, ReconnectController, ReconnectDecision,
+    ReconnectEvent, ReconnectPolicy, TunnelConfig, TunnelSession,
 };
 use snafu::prelude::*;
 use statig::prelude::*;
@@ -98,7 +103,7 @@ impl Daemon {
                 identity,
                 tenant: None,
                 signing: None,
-                cookies: BTreeMap::default(),
+                cookies: Arc::new(std::sync::Mutex::new(rustylink_api::SessionCookies::default())),
                 csrf_token: None,
                 knock_token: None,
                 totp: None,
@@ -138,6 +143,21 @@ impl Daemon {
     #[must_use]
     pub fn subscribe_tunnel(&self) -> watch::Receiver<pb::Tunnel> {
         self.vpn_watch_rx.clone()
+    }
+
+    /// Resolve the picked outbound interface (the configured one, or the
+    /// system default) used to bind tunnel and latency-probe sockets.
+    ///
+    /// Returns `None` when no usable interface is found, in which case sockets
+    /// use the OS default routing.
+    pub(crate) async fn resolve_outbound_interface(&self) -> Option<OutboundInterface> {
+        let configured = {
+            let inner = self.inner.lock().await;
+            inner.config.outbound_interface.clone()
+        };
+        OutboundInterface::resolve(configured.as_deref(), None)
+            .ok()
+            .flatten()
     }
 
     // -----------------------------------------------------------------------
@@ -208,6 +228,18 @@ impl Daemon {
     // -----------------------------------------------------------------------
     // Tunnel connect / disconnect
     // -----------------------------------------------------------------------
+
+    /// Restore the auth session state from credentials loaded at startup.
+    ///
+    /// Must be called once after construction: the statig machine always starts
+    /// in `Unconfigured`, so without this a previously-authenticated session
+    /// (restored from `credentials.json`) would not be recognised and the UI
+    /// would prompt for login again (notably after `--rotate-token`).
+    pub async fn restore_auth_state(&self) {
+        let mut inner = self.inner.lock().await;
+        inner.auth.handle(&AuthEvent::RestoreSession).await;
+        drop(inner);
+    }
 
     /// On startup, re-establish the tunnel if it was active and auto-reconnect
     /// is enabled.
@@ -373,6 +405,18 @@ impl Daemon {
                 .build_tenant_client()
                 .ok_or_else(|| DaemonError::from(RpcFault::NotAuthenticated))?
         };
+
+        // Dots are reached by IP but present a TLS cert valid for the tenant's
+        // `vpn_domain`; fetch it so the dot config client validates the cert
+        // against the right name (matching the Android client) rather than the
+        // IP we dial.
+        let vpn_domain = rustylink_core::vpn::vpn_setting(&client)
+            .await
+            .ok()
+            .and_then(|(resp, _meta)| resp.data)
+            .and_then(|setting| setting.vpn_domain)
+            .filter(|domain| !domain.trim().is_empty());
+
         let local_params = LocalTunnelParams::generate();
         let otp = self.compute_otp(request.otp.clone()).await;
 
@@ -392,15 +436,19 @@ impl Daemon {
             let hooks = inner.auth.build_hooks();
             let pool = inner.auth.http_pool.clone();
             drop(inner);
+            let vpn_domain = vpn_domain.clone();
             move |endpoint: &DotEndpoint| {
-                ApiClient::for_endpoint(endpoint, pool.clone(), hooks.clone())
+                build_dot_api_client(endpoint, &pool, &hooks, vpn_domain.as_deref())
             }
         };
 
+        // Auto dot selection probes through the picked outbound interface.
+        let outbound = self.resolve_outbound_interface().await;
         let config_result = rustylink_core::vpn::vpn_config_from_dot_list(
             &client,
             &config_request,
             build_dot_client,
+            move |dots| crate::latency::rank_dots_by_latency(dots, outbound),
         )
         .await
         .map_err(DaemonError::from)?;
@@ -439,14 +487,18 @@ impl Daemon {
         };
 
         // report(100) — connected.
-        let _ = self.send_report(&client, &report, 100).await;
+        let _ = self
+            .send_report(&client, &report, VpnReportType::Connected)
+            .await;
 
         // Supervise until a trigger / cancellation.
         let outcome = self.supervise(&mut session, &client, &report, cancel).await;
 
         // Teardown: stop the device + report(101).
         let _ = session.stop().await;
-        let _ = self.send_report(&client, &report, 101).await;
+        let _ = self
+            .send_report(&client, &report, VpnReportType::Disconnected)
+            .await;
         Ok(outcome)
     }
 
@@ -509,7 +561,7 @@ impl Daemon {
             let inner = self.inner.lock().await;
             inner.config.outbound_interface.clone()
         };
-        let protocol_mode = report.dot.protocol_mode;
+        let protocol_mode = report.dot.protocol_mode.and_then(ProtocolMode::from_repr);
         let report_daemon = self.clone();
         let report_client = client.clone();
         let report = report.clone();
@@ -522,19 +574,23 @@ impl Daemon {
                 let daemon = report_daemon.clone();
                 let client = report_client.clone();
                 let report = report.clone();
-                async move { daemon.send_report(&client, &report, 100).await }
+                async move {
+                    daemon
+                        .send_report(&client, &report, VpnReportType::Connected)
+                        .await
+                }
             },
         )
         .await
     }
 
-    /// Send a `/vpn/report` (type 100 keepalive / 101 disconnect).  Returns
+    /// Send a `/vpn/report` (`Connected` keepalive / `Disconnected`).  Returns
     /// `true` if the server signalled a force-logout (kickout).
     async fn send_report(
-        &self, client: &ApiClient, report: &ReportParams, report_type: i32,
+        &self, client: &ApiClient, report: &ReportParams, report_type: VpnReportType,
     ) -> bool {
         let request = VpnReportRequest {
-            r#type: report_type.to_string(),
+            r#type: report_type.wire(),
             ip: report.assigned_ip.clone(),
             public_key: report.pub_key.clone(),
             mode: report.mode.android_name(),
@@ -557,7 +613,7 @@ impl Daemon {
                 response.is_force_logout()
             }
             Err(error) => {
-                tracing::warn!(%error, report_type, "vpn report failed (non-fatal)");
+                tracing::warn!(%error, ?report_type, "vpn report failed (non-fatal)");
                 false
             }
         }
@@ -630,27 +686,38 @@ impl Daemon {
 // ---------------------------------------------------------------------------
 
 impl DaemonConfig {
-    /// Build a [`ClientIdentity`] from the daemon config, using the built-in
-    /// default for any field not overridden.
+    /// Build a [`ClientIdentity`] from the daemon config.
+    ///
+    /// The persisted identity is completed via
+    /// [`DeviceIdentityConfig::ensure_full`](crate::persist::DeviceIdentityConfig::ensure_full)
+    /// on startup; this still falls back to the built-in default per field for
+    /// robustness (e.g. configs loaded without that step).
     #[must_use]
     pub fn to_client_identity(&self) -> ClientIdentity {
         let default = ClientIdentity::default();
+        let id = &self.identity;
+        let or_default = |value: &Option<String>, fallback: String| {
+            value
+                .clone()
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or(fallback)
+        };
         ClientIdentity {
-            device_id: self.identity.device_id.clone(),
-            os: self.identity.os.clone().unwrap_or(default.os),
-            os_version: self
-                .identity
-                .os_version
-                .clone()
-                .unwrap_or(default.os_version),
-            app_version: self
-                .identity
-                .app_version
-                .clone()
-                .unwrap_or(default.app_version),
-            brand: self.identity.brand.clone().unwrap_or(default.brand),
-            model: self.identity.model.clone().unwrap_or(default.model),
-            ..default
+            device_id: if id.device_id.trim().is_empty() {
+                default.device_id
+            } else {
+                id.device_id.clone()
+            },
+            os: or_default(&id.os, default.os),
+            os_version: or_default(&id.os_version, default.os_version),
+            app_version: or_default(&id.app_version, default.app_version),
+            brand: or_default(&id.brand, default.brand),
+            model: or_default(&id.model, default.model),
+            build_number: or_default(&id.build_number, default.build_number),
+            os_version_patch: or_default(&id.os_version_patch, default.os_version_patch),
+            client_source: or_default(&id.client_source, default.client_source),
+            language: or_default(&id.language, default.language),
+            user_agent: or_default(&id.user_agent, default.user_agent),
         }
     }
 
@@ -690,6 +757,54 @@ impl DaemonConfig {
 // Projection helpers (shared across services)
 // ---------------------------------------------------------------------------
 
+/// Build the API client for a dot's config call.
+///
+/// A dot is reached by IP, but its TLS certificate is issued for the tenant's
+/// `vpn_domain`. To keep full certificate-chain validation (no `unsafe`, no
+/// disabled verification) while matching the Android client — which validates
+/// the cert against `vpn_domain`, not the dialed IP — we address the request to
+/// `https://{vpn_domain}:{port}` and override DNS so that name resolves to the
+/// dot's IP. rustls then validates the chain and the name against `vpn_domain`.
+///
+/// Falls back to a plain client against the original (IP) endpoint when no
+/// `vpn_domain` is known or the host is not a bare IP.
+fn build_dot_api_client(
+    endpoint: &DotEndpoint, pool: &reqwest::Client, hooks: &ApiHooks, vpn_domain: Option<&str>,
+) -> ApiClient {
+    if let Some(domain) = vpn_domain
+        && let Some(host) = endpoint.api_base_url.host_str()
+        && let Ok(ip) = host.parse::<IpAddr>()
+        && let Some(port) = endpoint.api_base_url.port_or_known_default()
+    {
+        let tls_host = tls_host_for(domain);
+        if let Ok(tls_url) = url::Url::parse(&format!("https://{tls_host}:{port}"))
+            && let Ok(client) = reqwest::Client::builder()
+                .resolve(&tls_host, SocketAddr::new(ip, port))
+                .build()
+        {
+            let tls_endpoint = DotEndpoint {
+                api_base_url: tls_url,
+                wireguard_endpoint: endpoint.wireguard_endpoint.clone(),
+            };
+            return ApiClient::for_endpoint(&tls_endpoint, client, hooks.clone());
+        }
+    }
+    ApiClient::for_endpoint(endpoint, pool.clone(), hooks.clone())
+}
+
+/// A concrete hostname for TLS validation, derived from the tenant's
+/// `vpn_domain`.
+///
+/// `vpn_domain` is often a wildcard (e.g. `*.msh.team`) which can't be used as
+/// a URL host / SNI. The leading `*` label is replaced with a concrete label
+/// that still validates against the wildcard certificate (a wildcard matches
+/// any single leftmost label). Concrete domains are used unchanged.
+fn tls_host_for(vpn_domain: &str) -> String {
+    vpn_domain
+        .strip_prefix("*.")
+        .map_or_else(|| vpn_domain.to_owned(), |rest| format!("vpn.{rest}"))
+}
+
 /// Project a core [`UserInfo`] to the wire type.
 pub fn project_user_info(user: Option<UserInfo>) -> pb::UserInfo {
     let user = user.unwrap_or_default();
@@ -715,19 +830,125 @@ pub fn project_vpn_location(dot: VpnDot) -> pb::VpnLocation {
 }
 
 fn mode_from_dot(mode: Option<i32>) -> pb::VpnMode {
-    match mode {
-        Some(0) => pb::VpnMode::Full,
-        Some(1) => pb::VpnMode::Split,
-        Some(2) => pb::VpnMode::Relay,
-        _ => pb::VpnMode::Unspecified,
+    match mode.and_then(VpnConnectMode::from_repr) {
+        Some(VpnConnectMode::Full) => pb::VpnMode::Full,
+        Some(VpnConnectMode::Split) => pb::VpnMode::Split,
+        Some(VpnConnectMode::Relay) => pb::VpnMode::Relay,
+        None => pb::VpnMode::Unspecified,
     }
 }
 
-/// Return `value` if non-empty, otherwise the `default`.
-pub fn nonempty_or(value: &str, default: &str) -> String {
-    if value.is_empty() {
-        default.to_string()
-    } else {
-        value.to_string()
+/// Use a value unless it equals its type's [`Default`].
+///
+/// A small extension trait that replaces ad-hoc `nonempty_or`-style helpers.
+/// For `&str`/`String` the default is empty, so `value.non_default_or(other)`
+/// yields `other` only when `value` is empty.
+pub trait DefaultOrExt: Default + PartialEq + Sized {
+    /// Return `self` when it differs from the type default, else `fallback`.
+    #[must_use]
+    fn non_default_or(self, fallback: Self) -> Self {
+        if self == Self::default() {
+            fallback
+        } else {
+            self
+        }
+    }
+}
+
+impl<T: Default + PartialEq> DefaultOrExt for T {}
+
+#[cfg(test)]
+mod tests {
+    use super::DefaultOrExt;
+
+    #[test]
+    fn non_default_or_falls_back_only_on_default() {
+        assert_eq!("".non_default_or("login"), "login");
+        assert_eq!("scan".non_default_or("login"), "scan");
+        assert_eq!(0_i32.non_default_or(7), 7);
+        assert_eq!(3_i32.non_default_or(7), 3);
+    }
+
+    /// Live, network + real-credentials check (run with
+    /// `cargo test -p rustylinkd -- --ignored --nocapture live_dot_connect`).
+    /// Loads the on-disk session, fetches the dot list, and exercises the dot
+    /// config TLS path — proving the cert validates against `vpn_domain` rather
+    /// than failing `NotValidForName` on the dialed IP.
+    #[tokio::test]
+    #[ignore = "requires network and an authenticated credentials.json"]
+    async fn live_dot_connect() {
+        use rustylink_api::{ClientIdentity, SendableRequest as _, VpnConnRequest};
+
+        use crate::{
+            daemon::build_dot_api_client, persist::PersistedCredentials, state::AuthMachine,
+        };
+
+        let path = dirs::config_dir()
+            .expect("config dir")
+            .join("rustylink")
+            .join("credentials.json");
+        let creds = PersistedCredentials::load(&path)
+            .await
+            .expect("read creds")
+            .expect("credentials.json present");
+
+        let pool = reqwest::Client::new();
+        let machine =
+            AuthMachine::restore_from_credentials(creds, pool.clone(), ClientIdentity::default());
+        let client = machine.build_tenant_client().expect("tenant client");
+        // The tenant client and every dot client share this machine's live
+        // cookie jar, so Set-Cookie mutations propagate automatically.
+        let hooks = machine.build_hooks();
+        let snapshot = |label: &str| {
+            if let Ok(jar) = hooks.cookies.lock() {
+                eprintln!("{label}: {:?}", jar.values.keys().collect::<Vec<_>>());
+            }
+        };
+        snapshot("initial cookies");
+
+        // Authenticated tenant APIs — confirm the session is valid; the shared
+        // jar absorbs any Set-Cookie mutations (e.g. open-time, vpn-token).
+        let (setting, _) = rustylink_core::vpn::vpn_setting(&client)
+            .await
+            .expect("vpn setting");
+        snapshot("after /api/setting");
+        let vpn_domain = setting.data.and_then(|s| s.vpn_domain);
+        eprintln!("vpn_domain = {vpn_domain:?}");
+
+        let (locations, _) = rustylink_core::vpn::vpn_locations(&client)
+            .await
+            .expect("vpn locations");
+        snapshot("after /api/vpn/list");
+        let dots = locations.data.unwrap_or_default();
+        eprintln!("dots = {}", dots.len());
+
+        // With the device_id cookie now sent on every request, /api/vpn/list
+        // re-issues a device-bound `vpn-token` (non-empty `did`), so /vpn/conn
+        // returns the WireGuard config (code 0) instead of "session expired".
+        let mut any_ok = false;
+        for dot in dots.iter().take(2) {
+            let use_vpn_ip = dot.should_use_vpn_ip_for_config_api(false);
+            let Ok(endpoint) = rustylink_api::DotEndpoint::from_dot(dot, use_vpn_ip) else {
+                continue;
+            };
+            let dot_client =
+                build_dot_api_client(&endpoint, &pool, &hooks, vpn_domain.as_deref());
+            let body = VpnConnRequest {
+                mode: Some("Full".to_owned()),
+                public_key: rustylink_tunnel::LocalTunnelParams::generate().local_public_key,
+                otp: None,
+                export_id: dot.id.unwrap_or_default(),
+                sign_token: None,
+                not_auto: Some(true),
+            };
+            match body.send_with_meta(&dot_client).await {
+                Ok((resp, _)) => {
+                    eprintln!("dot {:?}: /vpn/conn code={}", dot.id, resp.code);
+                    any_ok |= resp.code == 0;
+                }
+                Err(error) => eprintln!("dot {:?}: /vpn/conn err = {error}", dot.id),
+            }
+        }
+        assert!(any_ok, "no dot returned a successful /vpn/conn");
     }
 }

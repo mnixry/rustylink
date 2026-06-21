@@ -68,10 +68,10 @@ pub enum SigningError {
     #[snafu(display("no signing secret configured"))]
     MissingSecret,
 
-    #[snafu(display("invalid base64 signing key"))]
+    #[snafu(display("invalid base64 signing key: {source}"))]
     InvalidBase64 { source: base64::DecodeError },
 
-    #[snafu(display("invalid HMAC key"))]
+    #[snafu(display("invalid HMAC key: {source}"))]
     InvalidKey { source: hmac::digest::InvalidLength },
 }
 

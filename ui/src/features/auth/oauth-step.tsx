@@ -1,7 +1,9 @@
 import { useMutation } from "@connectrpc/connect-query"
+import { standardSchemaResolver } from "@hookform/resolvers/standard-schema"
 import { ArrowSquareOutIcon } from "@phosphor-icons/react"
-import { type FormEvent, useState } from "react"
+import { useForm } from "react-hook-form"
 import { toast } from "sonner"
+import { z } from "zod"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -35,10 +37,23 @@ function parseRedirect(
   return { code: trimmed, state: fallbackState }
 }
 
+const schema = z.object({
+  redirect: z.string().trim().min(1, "Paste the redirect URL or code"),
+})
+type Values = z.infer<typeof schema>
+
 export function OauthStep({ session }: { session: Session }) {
   const challenge = session.oauthChallenge
   const applySession = useApplySession()
-  const [value, setValue] = useState("")
+
+  const {
+    register,
+    handleSubmit,
+    formState: { errors },
+  } = useForm<Values>({
+    resolver: standardSchemaResolver(schema),
+    defaultValues: { redirect: "" },
+  })
 
   const onError = (err: unknown) => toast.error(errorMessage(err))
   const complete = useMutation(completeThirdPartyLogin, {
@@ -50,15 +65,17 @@ export function OauthStep({ session }: { session: Session }) {
     onError,
   })
 
-  const onSubmit = (e: FormEvent<HTMLFormElement>) => {
-    e.preventDefault()
-    const { code, state } = parseRedirect(value, challenge?.state ?? "")
+  const onSubmit = handleSubmit((values) => {
+    const { code, state } = parseRedirect(
+      values.redirect,
+      challenge?.state ?? ""
+    )
     complete.mutate({
       aliasKey: challenge?.aliasKey ?? "",
       code,
       state,
     })
-  }
+  })
 
   return (
     <AuthShell
@@ -73,15 +90,15 @@ export function OauthStep({ session }: { session: Session }) {
             id="oauth-redirect"
             autoFocus
             placeholder="corplink://login/callback?code=…&state=…"
-            value={value}
-            onChange={(e) => setValue(e.target.value)}
+            {...register("redirect")}
           />
+          {errors.redirect ? (
+            <p className="text-destructive text-sm">
+              {errors.redirect.message}
+            </p>
+          ) : null}
         </div>
-        <Button
-          type="submit"
-          className="w-full"
-          disabled={complete.isPending || !value.trim()}
-        >
+        <Button type="submit" className="w-full" disabled={complete.isPending}>
           <ArrowSquareOutIcon className="size-4" weight="duotone" />
           {complete.isPending ? "Completing…" : "Complete sign-in"}
         </Button>
