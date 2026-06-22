@@ -177,7 +177,12 @@ pub struct VpnReportRequest {
     pub mode: String,
 }
 
-impl_json_request!(VpnReportRequest, POST, "/vpn/report", BaseResponse<String>);
+impl_json_request!(
+    VpnReportRequest,
+    POST,
+    "/vpn/report",
+    BaseResponse<serde_json::Value>
+);
 
 /// `/vpn/report` event type. The Android client posts `100` periodically while
 /// connected and `101` once on disconnect.
@@ -311,5 +316,15 @@ mod tests {
                 "mode": "Full",
             })
         );
+    }
+
+    #[test]
+    fn vpn_report_response_accepts_untyped_data_payload() {
+        type Response = <VpnReportRequest as crate::models::SendableRequest>::Response;
+
+        serde_json::from_str::<Response>(r#"{"code":0,"data":{"result":"success"}}"#)
+            .expect("decode object payload");
+        serde_json::from_str::<Response>(r#"{"code":0,"data":"success"}"#)
+            .expect("decode string payload");
     }
 }

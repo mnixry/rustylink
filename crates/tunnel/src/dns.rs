@@ -9,7 +9,7 @@ use std::{
 use etherparse::{NetSlice, PacketBuilder, SlicedPacket, TransportSlice};
 use gotatun::{
     packet::{Ip, Packet, PacketBufPool},
-    tun::{IpRecv, IpSend, MtuWatcher, tun_async_device::TunDevice},
+    tun::{IpRecv, IpSend, MtuWatcher},
 };
 use hickory_proto::op::Message as DnsMessage;
 use rustylink_api::VpnConnResponse;
@@ -22,7 +22,7 @@ use tokio::{
 };
 use url::{Host, Url};
 
-use crate::OutboundInterface;
+use crate::{IpTun, OutboundInterface};
 
 const DNS_PORT: u16 = 53;
 const DNS_PROXY_PORT: u16 = 2913;
@@ -79,7 +79,7 @@ pub struct DnsProxyRuntime {
 
 #[derive(Clone)]
 pub struct DnsHijackTun {
-    inner: TunDevice,
+    inner: IpTun,
     hijacker: Option<DnsHijacker>,
 }
 
@@ -254,7 +254,7 @@ impl DnsProxyRuntime {
 impl DnsHijackTun {
     #[must_use]
     pub fn new(
-        inner: TunDevice, plan: &DnsHijackPlan, outbound_interface: Option<OutboundInterface>,
+        inner: IpTun, plan: &DnsHijackPlan, outbound_interface: Option<OutboundInterface>,
     ) -> Self {
         Self {
             inner,

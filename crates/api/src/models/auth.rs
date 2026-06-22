@@ -301,7 +301,7 @@ pub struct LogoutRequest {
 
 #[async_trait::async_trait]
 impl SendableRequest for LogoutRequest {
-    type Response = BaseResponse<CommonStringResult>;
+    type Response = BaseResponse<serde_json::Value>;
 
     const METHOD: reqwest::Method = reqwest::Method::GET;
 
@@ -554,6 +554,16 @@ mod tests {
             response.data.and_then(|data| data.result),
             Some("ok".to_string())
         );
+    }
+
+    #[test]
+    fn logout_response_accepts_android_token_or_result_payload() {
+        type LogoutResponse = <LogoutRequest as SendableRequest>::Response;
+
+        serde_json::from_str::<LogoutResponse>(r#"{"code":0,"data":{"token":"next"}}"#)
+            .expect("decode token payload");
+        serde_json::from_str::<LogoutResponse>(r#"{"code":0,"data":{"result":"success"}}"#)
+            .expect("decode result payload");
     }
 
     #[test]

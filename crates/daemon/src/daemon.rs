@@ -30,6 +30,7 @@ use statig::prelude::*;
 use tokio::{
     sync::{Mutex, watch},
     task::JoinHandle,
+    time::Instant,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -355,11 +356,27 @@ impl Daemon {
     async fn run_connect_loop(self, request: VpnRequest, cancel: CancellationToken) {
         let mut controller =
             ReconnectController::new(ReconnectPolicy::android_compatible_default());
+        let mut forced_protocol = None;
+        let mut last_udp_to_tcp = None;
         loop {
-            match self.connect_once(&request, &cancel).await {
+            match self
+                .connect_once(&request, &cancel, forced_protocol, last_udp_to_tcp)
+                .await
+            {
                 Ok(SupervisorOutcome::Cancelled) => {
                     self.mark_disconnected().await;
                     return;
+                }
+                Ok(SupervisorOutcome::ProtocolSwitch(protocol)) => {
+                    tracing::info!(protocol = ?protocol, "protocol detection requested transport switch");
+                    if protocol == ProtocolMode::FeilianTcp {
+                        last_udp_to_tcp = Some(Instant::now());
+                    }
+                    forced_protocol = Some(protocol);
+                    controller.reset();
+                    if cancel.is_cancelled() {
+                        return;
+                    }
                 }
                 Ok(SupervisorOutcome::ServerKickOut) => {
                     let decision = controller.record(ReconnectEvent::ServerKickOut);
@@ -368,6 +385,10 @@ impl Daemon {
                     }
                 }
                 Ok(SupervisorOutcome::Trigger(event)) => {
+                    if event == ReconnectEvent::NetworkChanged {
+                        forced_protocol = None;
+                        last_udp_to_tcp = None;
+                    }
                     let decision = controller.record(event);
                     if !self.handle_decision(decision, &cancel).await {
                         return;
@@ -392,6 +413,7 @@ impl Daemon {
     /// cancellation.  Tears down the session and reports 101 before returning.
     async fn connect_once(
         &self, request: &VpnRequest, cancel: &CancellationToken,
+        forced_protocol: Option<ProtocolMode>, last_udp_to_tcp: Option<Instant>,
     ) -> Result<SupervisorOutcome> {
         self.vpn_transition(VpnMachine::set_configuring).await;
 
@@ -471,7 +493,7 @@ impl Daemon {
         })?;
 
         let mut session = self
-            .start_session(&config_result, &data, &local_params)
+            .start_session(&config_result, &data, &local_params, forced_protocol)
             .await?;
 
         self.mark_connected(&config_result, &data.ip).await;
@@ -489,7 +511,9 @@ impl Daemon {
             .await;
 
         // Supervise until a trigger / cancellation.
-        let outcome = self.supervise(&mut session, &client, &report, cancel).await;
+        let outcome = self
+            .supervise(&mut session, &client, &report, cancel, last_udp_to_tcp)
+            .await;
 
         // Teardown: stop the device + report(101).
         let _ = session.stop().await;
@@ -503,7 +527,7 @@ impl Daemon {
     /// up.
     async fn start_session(
         &self, config_result: &VpnConfigResult, data: &VpnConnResponse,
-        local_params: &LocalTunnelParams,
+        local_params: &LocalTunnelParams, forced_protocol: Option<ProtocolMode>,
     ) -> Result<TunnelSession> {
         let (outbound_iface, tun_interface) = {
             let inner = self.inner.lock().await;
@@ -513,11 +537,38 @@ impl Daemon {
             )
         };
 
+        let effective_protocol_mode = forced_protocol
+            .filter(|protocol| {
+                match (
+                    config_result
+                        .dot
+                        .protocol_mode
+                        .and_then(ProtocolMode::from_repr),
+                    *protocol,
+                ) {
+                    (Some(ProtocolMode::Dual), ProtocolMode::Udp | ProtocolMode::FeilianTcp)
+                    | (None, ProtocolMode::Udp) => true,
+                    (Some(dot_protocol), requested) => dot_protocol == requested,
+                    _ => false,
+                }
+            })
+            .map(|protocol| protocol as i32)
+            .or(config_result.dot.protocol_mode);
+        if let Some(protocol) = forced_protocol
+            && Some(protocol as i32) == effective_protocol_mode
+        {
+            tracing::info!(
+                protocol = ?protocol,
+                dot_protocol_mode = ?config_result.dot.protocol_mode,
+                "forcing tunnel transport after protocol-detect switch"
+            );
+        }
+
         let mut tunnel_config = TunnelConfig::from_vpn_conn(
             data,
             local_params.clone(),
             config_result.endpoint.wireguard_endpoint.clone(),
-            config_result.dot.protocol_mode,
+            effective_protocol_mode,
             config_result.dot.protocol_detect_enabled(),
         )
         .map_err(|error| {
@@ -559,20 +610,30 @@ impl Daemon {
     /// Run the supervisor over a live session with a periodic `/vpn/report`.
     async fn supervise(
         &self, session: &mut TunnelSession, client: &ApiClient, report: &ReportParams,
-        cancel: &CancellationToken,
+        cancel: &CancellationToken, last_udp_to_tcp: Option<Instant>,
     ) -> SupervisorOutcome {
         let outbound = {
             let inner = self.inner.lock().await;
             inner.config.outbound_interface.clone()
         };
         let protocol_mode = report.dot.protocol_mode.and_then(ProtocolMode::from_repr);
+        let runtime_protocol_mode = session
+            .config
+            .protocol_mode
+            .and_then(ProtocolMode::from_repr);
+        let protocol_detect_options = supervisor::ProtocolDetectOptions {
+            config: report.dot.protocol_detect_config.clone(),
+            dot_protocol_mode: protocol_mode,
+            last_udp_to_tcp,
+        };
         let report_daemon = self.clone();
         let report_client = client.clone();
         let report = report.clone();
         supervisor::run(
             session,
-            protocol_mode,
+            runtime_protocol_mode,
             outbound,
+            protocol_detect_options,
             cancel.clone(),
             move || {
                 let daemon = report_daemon.clone();

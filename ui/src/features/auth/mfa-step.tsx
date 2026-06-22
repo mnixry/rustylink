@@ -67,7 +67,7 @@ export function MfaStep({ session }: { session: Session }) {
   } = useForm<Values>({
     resolver: standardSchemaResolver(schema),
     defaultValues: {
-      method: challenge?.mfaType || authList[0] || "otp",
+      method: authList[0] || challenge?.mfaType || "otp",
       code: "",
     },
   })

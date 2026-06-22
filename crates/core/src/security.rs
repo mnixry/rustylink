@@ -1,6 +1,6 @@
 use rustylink_api::{
-    ApiClient, BaseResponse, JsonObject, ResponseMeta, SecurityReportItem, SecurityReportRequest,
-    SendableRequest,
+    ApiClient, BaseResponse, CommonStringResult, JsonObject, ResponseMeta, SecurityReportItem,
+    SecurityReportRequest, SendableRequest,
 };
 use snafu::prelude::*;
 
@@ -18,7 +18,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub async fn report_security(
     client: &ApiClient, report: &SecurityReportRequest,
-) -> Result<(BaseResponse<String>, ResponseMeta)> {
+) -> Result<(BaseResponse<CommonStringResult>, ResponseMeta)> {
     let (response, meta) = report
         .clone()
         .send_with_meta(client)

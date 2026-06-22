@@ -1,13 +1,12 @@
-use std::net::UdpSocket;
+use std::net::{Ipv4Addr, Ipv6Addr, UdpSocket};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use gotatun::{
     device::{Device, DeviceBuilder, Peer},
     noise::ProtocolIdentifier,
-    tun::tun_async_device::TunDevice,
     x25519::{PublicKey, StaticSecret},
 };
-use ipnetwork::IpNetwork;
+use ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
 use rustylink_api::VpnConnResponse;
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
@@ -17,7 +16,7 @@ use url::{Host, Url};
 
 use crate::{
     BoundUdpSocketFactory, DnsHijackPlan, DnsHijackTun, DnsProxyRuntime,
-    FeilianTcpTransportFactory, OutboundInterface, RoutePlan, route::AppliedRoutes,
+    FeilianTcpTransportFactory, IpTun, OutboundInterface, RoutePlan, route::AppliedRoutes,
 };
 
 const ANDROID_LOCAL_PORT_START: u16 = 12912;
@@ -34,13 +33,45 @@ pub enum Error {
     #[snafu(display("invalid tunnel config: {reason}"))]
     InvalidConfig { reason: String },
 
+    #[snafu(display("invalid tunnel IPv4 address `{value}`: {source}"))]
+    InvalidIpv4Address {
+        value: String,
+        source: std::net::AddrParseError,
+    },
+
+    #[snafu(display("invalid IPv4 prefix length `{prefix}`"))]
+    InvalidIpv4Prefix { prefix: i32 },
+
+    #[snafu(display("invalid tunnel IPv4 network `{address}/{prefix}`: {source}"))]
+    InvalidIpv4Network {
+        address: Ipv4Addr,
+        prefix: u8,
+        source: ipnetwork::IpNetworkError,
+    },
+
+    #[snafu(display("invalid tunnel MTU `{mtu}`"))]
+    InvalidMtu { mtu: i32 },
+
+    #[snafu(display("invalid tunnel IPv6 address `{value}`: {source}"))]
+    InvalidIpv6Address {
+        value: String,
+        source: std::net::AddrParseError,
+    },
+
+    #[snafu(display("invalid tunnel IPv6 network `{value}`: {source}"))]
+    InvalidIpv6Network {
+        value: String,
+        source: ipnetwork::IpNetworkError,
+    },
+
+    #[snafu(display("invalid tunnel IPv6 network `{value}`: expected IPv6"))]
+    InvalidIpv6NetworkFamily { value: String },
+
     #[snafu(display("route manager failed: {source}"))]
     Route { source: crate::route::Error },
 
-    #[snafu(display("TUN device setup failed: {source}"))]
-    TunDevice {
-        source: gotatun::tun::tun_async_device::Error,
-    },
+    #[snafu(display("TUN device creation failed: {source}"))]
+    TunCreate { source: std::io::Error },
 
     #[snafu(display("DNS hijack setup failed: {source}"))]
     Dns { source: crate::dns::Error },
@@ -62,12 +93,6 @@ pub enum Error {
 
     #[snafu(display("invalid WireGuard key `{name}`"))]
     InvalidKey { name: &'static str },
-
-    #[snafu(display("invalid route CIDR `{cidr}`: {source}"))]
-    InvalidRoute {
-        cidr: String,
-        source: ipnetwork::IpNetworkError,
-    },
 
     #[snafu(display("custom WireGuard engine failed: {message}"))]
     WireGuard { message: String },
@@ -191,7 +216,7 @@ impl TunnelConfig {
             protocol_version: conn.protocol_version.clone(),
             protocol_detect_enable,
             outbound_interface: None,
-            route_plan: RoutePlan::from_vpn_conn(conn),
+            route_plan: RoutePlan::from_vpn_conn(conn).context(RouteSnafu)?,
             dns_plan,
         })
     }
@@ -246,18 +271,7 @@ impl TunnelSession {
         )?);
         let peer = tunnel_peer(&self.config, endpoint)?;
 
-        let tun = TunDevice::from_name(&self.config.interface_name).context(TunDeviceSnafu)?;
-        let actual_interface_name = tun.name().context(TunDeviceSnafu)?;
-        if actual_interface_name != self.config.interface_name {
-            tracing::info!(
-                requested_interface = %self.config.interface_name,
-                actual_interface = %actual_interface_name,
-                "TUN device assigned OS interface name"
-            );
-            self.config
-                .interface_name
-                .clone_from(&actual_interface_name);
-        }
+        let (tun, actual_interface_name) = self.open_tun()?;
         let outbound_interface = OutboundInterface::resolve(
             self.config.outbound_interface.as_deref(),
             Some(&actual_interface_name),
@@ -322,14 +336,14 @@ impl TunnelSession {
 
     pub async fn stop(&mut self) -> Result<()> {
         tracing::info!(interface = %self.config.interface_name, "stopping tunnel session");
-        if let Some(device) = self.device.take() {
-            device.stop().await;
-        }
         if let Some(dns_proxy) = self.dns_proxy.take() {
             dns_proxy.stop();
         }
         if let Some(routes) = self.routes.take() {
             routes.remove().await.context(RouteSnafu)?;
+        }
+        if let Some(device) = self.device.take() {
+            device.stop().await;
         }
         self.status = TunnelStatus::Stopped;
         Ok(())
@@ -351,6 +365,109 @@ impl TunnelSession {
             TunnelDevice::Udp(device) => peer_last_handshake(device.peers().await),
             TunnelDevice::FeilianTcp(device) => peer_last_handshake(device.peers().await),
         }
+    }
+
+    fn open_tun(&mut self) -> Result<(IpTun, String)> {
+        let local_addr =
+            self.config
+                .local_addr
+                .parse::<Ipv4Addr>()
+                .context(InvalidIpv4AddressSnafu {
+                    value: self.config.local_addr.clone(),
+                })?;
+        let local_prefix = self.config.local_prefix.unwrap_or(32);
+        let local_prefix = u8::try_from(local_prefix)
+            .ok()
+            .filter(|prefix| *prefix <= 32)
+            .context(InvalidIpv4PrefixSnafu {
+                prefix: local_prefix,
+            })?;
+        let local_network =
+            Ipv4Network::new(local_addr, local_prefix).context(InvalidIpv4NetworkSnafu {
+                address: local_addr,
+                prefix: local_prefix,
+            })?;
+        let mtu = u16::try_from(self.config.mtu)
+            .ok()
+            .filter(|mtu| *mtu > 0)
+            .context(InvalidMtuSnafu {
+                mtu: self.config.mtu,
+            })?;
+
+        let requested_interface_name = self.config.interface_name.clone();
+        let mut tun_builder = tun_rs::DeviceBuilder::new()
+            .ipv4(
+                local_network.ip(),
+                local_network.prefix(),
+                Some(local_network.ip()),
+            )
+            .mtu(mtu);
+        if let Some(local_addr_v6) = self
+            .config
+            .local_addr_v6
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let local_network_v6 = if local_addr_v6.contains('/') {
+                match local_addr_v6
+                    .parse::<IpNetwork>()
+                    .context(InvalidIpv6NetworkSnafu {
+                        value: local_addr_v6.to_string(),
+                    })? {
+                    IpNetwork::V6(network) => network,
+                    IpNetwork::V4(_) => {
+                        return InvalidIpv6NetworkFamilySnafu {
+                            value: local_addr_v6.to_string(),
+                        }
+                        .fail();
+                    }
+                }
+            } else {
+                Ipv6Network::new(
+                    local_addr_v6
+                        .parse::<Ipv6Addr>()
+                        .context(InvalidIpv6AddressSnafu {
+                            value: local_addr_v6.to_string(),
+                        })?,
+                    64,
+                )
+                .context(InvalidIpv6NetworkSnafu {
+                    value: format!("{local_addr_v6}/64"),
+                })?
+            };
+            tun_builder = tun_builder.ipv6(local_network_v6.ip(), local_network_v6.prefix());
+        }
+        if !cfg!(target_os = "macos") || requested_interface_name != "utun" {
+            tun_builder = tun_builder.name(&requested_interface_name);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            tun_builder = tun_builder.associate_route(false).packet_information(false);
+        }
+
+        let tun = IpTun::new(tun_builder.build_async().context(TunCreateSnafu)?)
+            .context(TunCreateSnafu)?;
+        let actual_interface_name = tun.name().to_string();
+        if actual_interface_name != requested_interface_name {
+            if !cfg!(target_os = "macos") || requested_interface_name != "utun" {
+                return InvalidConfigSnafu {
+                    reason: format!(
+                        "requested TUN interface `{requested_interface_name}` but OS assigned `{actual_interface_name}`"
+                    ),
+                }
+                .fail();
+            }
+            tracing::info!(
+                requested_interface = %requested_interface_name,
+                actual_interface = %actual_interface_name,
+                "TUN device assigned OS interface name"
+            );
+            self.config
+                .interface_name
+                .clone_from(&actual_interface_name);
+        }
+        Ok((tun, actual_interface_name))
     }
 }
 
@@ -398,10 +515,10 @@ fn choose_local_port() -> u16 {
 
 fn validate_protocol_mode(config: &TunnelConfig) -> Result<()> {
     if config.protocol_detect_enable {
-        tracing::warn!(
+        tracing::info!(
             protocol_version = ?config.protocol_version,
             protocol_mode = ?config.protocol_mode,
-            "protocol detection switch thresholds are native-app specific; tunnel starts with the dot's advertised transport"
+            "protocol detection enabled; daemon supervisor applies Android-compatible switch thresholds"
         );
     }
     if let Some(mode) = config.protocol_mode
@@ -491,7 +608,7 @@ fn tunnel_peer(config: &TunnelConfig, endpoint: std::net::SocketAddr) -> Result<
         PublicKey::from(decode_key("server_public_key", &config.server_public_key)?);
     let mut peer = Peer::new(server_public_key)
         .with_endpoint(endpoint)
-        .with_allowed_ips(allowed_ips(&config.route_plan)?);
+        .with_allowed_ips(allowed_ips(&config.route_plan));
     peer.keepalive = Some(WIREGUARD_KEEPALIVE_SECS);
     if let Some(preshared_key) = config
         .server_preshared_key
@@ -503,29 +620,29 @@ fn tunnel_peer(config: &TunnelConfig, endpoint: std::net::SocketAddr) -> Result<
     Ok(peer)
 }
 
-fn allowed_ips(route_plan: &RoutePlan) -> Result<Vec<IpNetwork>> {
+fn allowed_ips(route_plan: &RoutePlan) -> Vec<IpNetwork> {
     let mut networks = route_plan
         .rules
         .iter()
-        .map(|rule| {
-            rule.cidr.parse::<IpNetwork>().context(InvalidRouteSnafu {
-                cidr: rule.cidr.clone(),
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
+        .map(|rule| rule.network)
+        .collect::<Vec<_>>();
     if networks.is_empty() {
         networks.push("0.0.0.0/0".parse().expect("static IPv4 CIDR is valid"));
     }
-    Ok(networks)
+    networks
 }
 
 fn decode_key(name: &'static str, value: &str) -> Result<[u8; 32]> {
     let trimmed = value.trim();
-    let bytes = STANDARD
-        .decode(trimmed)
-        .or_else(|_| hex::decode(trimmed))
-        .map_err(|_| InvalidKeySnafu { name }.build())?;
-    bytes
-        .try_into()
-        .map_err(|_| InvalidKeySnafu { name }.build())
+    let bytes = match STANDARD.decode(trimmed) {
+        Ok(bytes) => bytes,
+        Err(_) => match hex::decode(trimmed) {
+            Ok(bytes) => bytes,
+            Err(_) => return InvalidKeySnafu { name }.fail(),
+        },
+    };
+    let Ok(key) = bytes.try_into() else {
+        return InvalidKeySnafu { name }.fail();
+    };
+    Ok(key)
 }

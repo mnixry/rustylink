@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 
-use super::{BaseResponse, JsonObject};
+use super::{BaseResponse, CommonStringResult, JsonObject};
 
 #[skip_serializing_none]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -26,5 +26,26 @@ impl_json_request!(
     SecurityReportRequest,
     POST,
     "/api/security/report",
-    BaseResponse<String>
+    BaseResponse<CommonStringResult>
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::SendableRequest;
+
+    #[test]
+    fn security_report_response_accepts_android_common_string_result() {
+        type Response = <SecurityReportRequest as SendableRequest>::Response;
+
+        let response = serde_json::from_str::<Response>(
+            r#"{"code":0,"action":"","message":"","data":{"result":"success"}}"#,
+        )
+        .expect("decode");
+
+        assert_eq!(
+            response.data.and_then(|data| data.result),
+            Some("success".to_string())
+        );
+    }
+}

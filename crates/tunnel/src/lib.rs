@@ -5,6 +5,7 @@ pub mod reconnect;
 pub mod route;
 pub mod session;
 pub mod transport;
+pub mod tun;
 
 pub use dns::{DnsHijackPlan, DnsHijackTun, DnsProxyRuntime, DnsRule};
 pub use error::{Error, Result};
@@ -13,3 +14,4 @@ pub use reconnect::{ReconnectController, ReconnectDecision, ReconnectEvent, Reco
 pub use route::{RoutePlan, RouteRule};
 pub use session::{LocalTunnelParams, ProtocolMode, TunnelConfig, TunnelSession, TunnelStatus};
 pub use transport::FeilianTcpTransportFactory;
+pub use tun::IpTun;

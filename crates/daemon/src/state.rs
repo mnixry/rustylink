@@ -24,8 +24,7 @@ use rustylink_api::{
     ApiClient, ApiHooks, ClientIdentity, CookieJar, CookieStore, LoginV2Result, MatchEndpoint,
     ResponseMeta, SigningConfig, SigningContext, TenantEndpoint,
 };
-use rustylink_core::vpn::VpnConnectMode;
-use rustylink_core::auth::LoginStep;
+use rustylink_core::{auth::LoginStep, vpn::VpnConnectMode};
 use rustylink_proto::proto::rustylink::daemon::v1 as pb;
 use rustylink_tunnel::TunnelSession;
 use statig::prelude::*;
@@ -818,7 +817,10 @@ impl AuthMachine {
             match rustylink_core::auth::logout(&client, logout_all).await {
                 Ok((_response, meta)) => self.merge_meta(&meta).await,
                 Err(error) => {
-                    tracing::warn!(%error, "server-side logout failed (proceeding locally)");
+                    tracing::debug!(
+                        %error,
+                        "server-side logout failed during best-effort logout; proceeding locally"
+                    );
                 }
             }
         }

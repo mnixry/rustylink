@@ -34,10 +34,7 @@ pub enum Error {
     },
 
     #[snafu(display("failed to build URI `{value}`: {source}"))]
-    BuildUri {
-        value: String,
-        source: http::Error,
-    },
+    BuildUri { value: String, source: http::Error },
 
     #[snafu(display("failed to build HTTP client: {source}"))]
     BuildHttpClient { source: reqwest::Error },

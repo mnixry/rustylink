@@ -21,10 +21,11 @@ socket2.workspace       = true
 strum.workspace         = true
 tokio.workspace         = true
 tracing.workspace       = true
+tun-rs.workspace        = true
 url.workspace           = true
 
 [dependencies.gotatun]
-features = ["device", "tun"]
+features = ["device"]
 git      = "https://github.com/mnixry/gotatun"
 
 [lints]

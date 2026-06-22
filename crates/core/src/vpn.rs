@@ -349,7 +349,7 @@ where
 
 pub async fn report_vpn(
     client: &ApiClient, request: &VpnReportRequest,
-) -> Result<(BaseResponse<String>, ResponseMeta)> {
+) -> Result<(BaseResponse<serde_json::Value>, ResponseMeta)> {
     let (response, meta) = request
         .clone()
         .send_with_meta(client)

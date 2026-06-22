@@ -363,7 +363,7 @@ pub async fn v1_login_skip(
 
 pub async fn logout(
     client: &ApiClient, logout_all: bool,
-) -> Result<(BaseResponse<CommonStringResult>, ResponseMeta)> {
+) -> Result<(BaseResponse<serde_json::Value>, ResponseMeta)> {
     let (response, meta) = LogoutRequest { logout_all }
         .send_with_meta(client)
         .await
@@ -396,13 +396,13 @@ pub enum LoginStep {
     },
 }
 
-/// Decide the next [`LoginStep`] from a [`LoginV2Result`], mirroring the Android
-/// client's routing:
+/// Decide the next [`LoginStep`] from a [`LoginV2Result`], mirroring the
+/// Android client's routing:
 ///
-/// - an explicit `result == "success"` is terminal (authenticated), regardless
-///   of any `next` action;
+/// - Android's v1/v2 flow can return `result == "success"` with a follow-up
+///   `next.action == "2FA"`; that is still an MFA challenge;
 /// - a `goto_link` action (e.g. a password-reset URL) is also authenticated;
-/// - `mfa` / `verify_mfa` actions become an MFA challenge;
+/// - `2FA` / `mfa` / `verify_mfa` actions become an MFA challenge;
 /// - any other `next` action is an OTP challenge, with the delivery channel
 ///   (`mobile`/`email`) derived from whichever masked target the server
 ///   returned;
@@ -412,23 +412,27 @@ pub fn next_login_step(result: Option<&LoginV2Result>) -> LoginStep {
     let Some(result) = result else {
         return LoginStep::Authenticated;
     };
-    if result.result.as_deref() == Some("success") {
-        return LoginStep::Authenticated;
-    }
     let Some(next) = &result.next else {
         return LoginStep::Authenticated;
     };
     let action = next.action.as_deref().unwrap_or_default();
-    if action.eq_ignore_ascii_case("mfa") || action.eq_ignore_ascii_case("verify_mfa") {
+    if is_mfa_action(action) {
+        let auth_list = next.auth_list.clone().unwrap_or_default();
         return LoginStep::AwaitingMfa {
-            mfa_type: action.to_owned(),
-            auth_list: next.auth_list.clone().unwrap_or_default(),
+            mfa_type: auth_list
+                .first()
+                .cloned()
+                .unwrap_or_else(|| action.to_owned()),
+            auth_list,
             can_skip: next.can_skip.unwrap_or(false),
             masked_mobile: next.mobile.clone().unwrap_or_default(),
             masked_email: next.email.clone().unwrap_or_default(),
         };
     }
     if action.eq_ignore_ascii_case("goto_link") || action.eq_ignore_ascii_case("goToLink") {
+        return LoginStep::Authenticated;
+    }
+    if result.result.as_deref() == Some("success") {
         return LoginStep::Authenticated;
     }
     // The stored `login_type` is the delivery channel (mobile vs. email), not
@@ -444,6 +448,12 @@ pub fn next_login_step(result: Option<&LoginV2Result>) -> LoginStep {
         masked_target,
         login_type,
     }
+}
+
+fn is_mfa_action(action: &str) -> bool {
+    action.eq_ignore_ascii_case("2FA")
+        || action.eq_ignore_ascii_case("mfa")
+        || action.eq_ignore_ascii_case("verify_mfa")
 }
 
 // ---------------------------------------------------------------------------
@@ -519,11 +529,36 @@ mod tests {
         assert_eq!(
             next_login_step(Some(&mfa)),
             LoginStep::AwaitingMfa {
-                mfa_type: "mfa".to_owned(),
+                mfa_type: "totp".to_owned(),
                 auth_list: vec!["totp".to_owned()],
                 can_skip: true,
                 masked_mobile: "1***".to_owned(),
                 masked_email: String::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn android_2fa_success_becomes_mfa_challenge() {
+        let mfa = LoginV2Result {
+            result: Some("success".to_owned()),
+            next: Some(LoginV2Next {
+                action: Some("2FA".to_owned()),
+                can_skip: Some(true),
+                auth_list: Some(vec!["otp".to_owned(), "mobile".to_owned()]),
+                mobile: Some("1***".to_owned()),
+                email: Some("u***@example.com".to_owned()),
+                ..Default::default()
+            }),
+        };
+        assert_eq!(
+            next_login_step(Some(&mfa)),
+            LoginStep::AwaitingMfa {
+                mfa_type: "otp".to_owned(),
+                auth_list: vec!["otp".to_owned(), "mobile".to_owned()],
+                can_skip: true,
+                masked_mobile: "1***".to_owned(),
+                masked_email: "u***@example.com".to_owned(),
             }
         );
     }
