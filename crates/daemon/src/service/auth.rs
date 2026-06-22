@@ -1,9 +1,9 @@
 //! `AuthService` — RPC handlers for authentication-related operations.
 //!
 //! Wraps [`Daemon`] and implements the generated `AuthService` trait.  Each
-//! handler extracts parameters from the proto request, dispatches an
-//! [`AuthEvent`] through the statig state machine, and projects the result
-//! back to a proto response.
+//! handler extracts parameters from the proto request, calls the auth
+//! coordinator (which runs the pure `rustylink_core::state::auth` flow and
+//! surfaces errors directly), and projects the result back to a proto response.
 
 use connectrpc::{RequestContext, Response, ServiceRequest, ServiceResult};
 use rustylink_proto::proto::rustylink::daemon::{v1 as pb, v1::AuthService};
@@ -11,7 +11,7 @@ use rustylink_proto::proto::rustylink::daemon::{v1 as pb, v1::AuthService};
 use crate::{
     daemon::{Daemon, DefaultOrExt as _},
     error::{DaemonError, RpcFault},
-    state::{AuthEvent, State},
+    state::AuthState,
 };
 
 /// Default `login_scene` for the corplink/FeiLian login flow.
@@ -36,7 +36,7 @@ impl AuthServiceImpl {
     /// Lock the inner, extract the current session proto.
     async fn current_session(&self) -> pb::Session {
         let inner = self.daemon.inner.lock().await;
-        inner.auth.to_session_proto(inner.auth.state())
+        inner.auth.to_session_proto()
     }
 
     /// After a successful auth event, persist credentials if authenticated
@@ -44,26 +44,11 @@ impl AuthServiceImpl {
     async fn maybe_persist_and_broadcast(&self) {
         let is_authenticated = {
             let inner = self.daemon.inner.lock().await;
-            matches!(inner.auth.state(), State::Authenticated {})
+            matches!(inner.auth.state, AuthState::Authenticated)
         };
         if is_authenticated {
             self.daemon.persist_credentials().await;
         }
-    }
-
-    /// If the auth machine recorded an error, return it as a `DaemonError`.
-    async fn check_last_error(&self) -> Result<(), DaemonError> {
-        let inner = self.daemon.inner.lock().await;
-        inner.auth.last_error.as_ref().map_or_else(
-            || Ok(()),
-            |error| {
-                Err(DaemonError::Fault {
-                    source: RpcFault::InvalidArgument {
-                        message: error.clone(),
-                    },
-                })
-            },
-        )
     }
 }
 
@@ -82,38 +67,27 @@ impl AuthService for AuthServiceImpl {
     async fn activate(
         &self, _ctx: RequestContext, request: ServiceRequest<'_, pb::ActivateRequest>,
     ) -> ServiceResult<pb::ActivateResponse> {
-        let event = AuthEvent::Activate {
-            code: request.code.map(ToOwned::to_owned).unwrap_or_default(),
-            base_url: request.base_url.map(ToOwned::to_owned),
-            backup_url: request.backup_url.map(ToOwned::to_owned),
-            match_base_url: request.match_base_url.map(ToOwned::to_owned),
-        };
+        let code = request.code.map(ToOwned::to_owned).unwrap_or_default();
+        let base_url = request.base_url.map(ToOwned::to_owned);
+        let backup_url = request.backup_url.map(ToOwned::to_owned);
+        let match_base_url = request.match_base_url.map(ToOwned::to_owned);
         {
             let mut inner = self.daemon.inner.lock().await;
-            inner.auth.handle(&event).await;
-            drop(inner);
-        }
-        self.check_last_error().await?;
-        // After activation, also detect login API version (best-effort).
+            inner
+                .auth
+                .activate(
+                    &code,
+                    base_url.as_deref(),
+                    backup_url.as_deref(),
+                    match_base_url.as_deref(),
+                )
+                .await
+        }?;
+        // Activation succeeded; detect the login API version (best-effort).
         {
-            let client = {
-                let inner = self.daemon.inner.lock().await;
-                inner.auth.build_tenant_client()
-            };
-            if let Some(client) = client
-                && let Ok(setting) = rustylink_core::vpn::login_setting(&client).await
-                && let Some(data) = setting.data.as_ref()
-                && data.is_v1()
-            {
-                let mut inner = self.daemon.inner.lock().await;
-                inner
-                    .auth
-                    .handle(&AuthEvent::SetLoginApiVersion {
-                        version: crate::persist::LoginApiVersion::V1,
-                    })
-                    .await;
-                drop(inner);
-            }
+            let mut inner = self.daemon.inner.lock().await;
+            inner.auth.refresh_login_api_version().await;
+            drop(inner);
         }
         self.maybe_persist_and_broadcast().await;
         let session = self.current_session().await;
@@ -127,21 +101,20 @@ impl AuthService for AuthServiceImpl {
         &self, _ctx: RequestContext, request: ServiceRequest<'_, pb::LoginRequest>,
     ) -> ServiceResult<pb::LoginResponse> {
         self.daemon.require_configured().await?;
-        let event = AuthEvent::Login {
-            account: request.account.to_string(),
-            password: request.password.to_string(),
-            login_scene: request
-                .login_scene
-                .non_default_or(DEFAULT_LOGIN_SCENE)
-                .to_owned(),
-            account_type: request.account_type.non_default_or("account").to_owned(),
-        };
+        let account = request.account.to_string();
+        let password = request.password.to_string();
+        let login_scene = request
+            .login_scene
+            .non_default_or(DEFAULT_LOGIN_SCENE)
+            .to_owned();
+        let account_type = request.account_type.non_default_or("account").to_owned();
         {
             let mut inner = self.daemon.inner.lock().await;
-            inner.auth.handle(&event).await;
-            drop(inner);
-        }
-        self.check_last_error().await?;
+            inner
+                .auth
+                .login(&account, &password, &login_scene, &account_type)
+                .await
+        }?;
         // Post-login side effects: TOTP + security report.
         self.post_login().await;
         self.maybe_persist_and_broadcast().await;
@@ -156,28 +129,26 @@ impl AuthService for AuthServiceImpl {
         &self, _ctx: RequestContext, request: ServiceRequest<'_, pb::RequestLoginCodeRequest>,
     ) -> ServiceResult<pb::RequestLoginCodeResponse> {
         self.daemon.require_configured().await?;
-        let event = AuthEvent::SendLoginCode {
-            account: request.account.to_string(),
-            login_type: request
-                .login_type
-                .as_known()
-                .unwrap_or_default()
-                .wire()
-                .to_owned(),
-            login_scene: request
-                .login_scene
-                .non_default_or(DEFAULT_LOGIN_SCENE)
-                .to_owned(),
-            account_type: request.account_type.non_default_or("account").to_owned(),
-        };
+        let account = request.account.to_string();
+        let login_type = request
+            .login_type
+            .as_known()
+            .unwrap_or_default()
+            .wire()
+            .to_owned();
+        let login_scene = request
+            .login_scene
+            .non_default_or(DEFAULT_LOGIN_SCENE)
+            .to_owned();
+        let account_type = request.account_type.non_default_or("account").to_owned();
         {
-            let mut inner = self.daemon.inner.lock().await;
-            inner.auth.handle(&event).await;
-            drop(inner);
-        }
-        self.check_last_error().await?;
-        // SendLoginCode doesn't return a session — return the code (if any).
-        // The state machine doesn't produce a "code" output; return empty.
+            let inner = self.daemon.inner.lock().await;
+            inner
+                .auth
+                .send_login_code(&account, &login_type, &login_scene, &account_type)
+                .await
+        }?;
+        // SendLoginCode doesn't return a session or a code.
         Response::ok(pb::RequestLoginCodeResponse {
             code: String::new(),
             ..Default::default()
@@ -188,27 +159,26 @@ impl AuthService for AuthServiceImpl {
         &self, _ctx: RequestContext, request: ServiceRequest<'_, pb::VerifyLoginCodeRequest>,
     ) -> ServiceResult<pb::VerifyLoginCodeResponse> {
         self.daemon.require_configured().await?;
-        let event = AuthEvent::VerifyLoginCode {
-            account: request.account.to_string(),
-            code: request.code.to_string(),
-            login_type: request
-                .login_type
-                .as_known()
-                .unwrap_or_default()
-                .wire()
-                .to_owned(),
-            login_scene: request
-                .login_scene
-                .non_default_or(DEFAULT_LOGIN_SCENE)
-                .to_owned(),
-            account_type: request.account_type.non_default_or("account").to_owned(),
-        };
+        let account = request.account.to_string();
+        let code = request.code.to_string();
+        let login_type = request
+            .login_type
+            .as_known()
+            .unwrap_or_default()
+            .wire()
+            .to_owned();
+        let login_scene = request
+            .login_scene
+            .non_default_or(DEFAULT_LOGIN_SCENE)
+            .to_owned();
+        let account_type = request.account_type.non_default_or("account").to_owned();
         {
             let mut inner = self.daemon.inner.lock().await;
-            inner.auth.handle(&event).await;
-            drop(inner);
-        }
-        self.check_last_error().await?;
+            inner
+                .auth
+                .verify_login_code(&account, &code, &login_type, &login_scene, &account_type)
+                .await
+        }?;
         self.post_login().await;
         self.maybe_persist_and_broadcast().await;
         let session = self.current_session().await;
@@ -222,20 +192,19 @@ impl AuthService for AuthServiceImpl {
         &self, _ctx: RequestContext, request: ServiceRequest<'_, pb::RequestMfaCodeRequest>,
     ) -> ServiceResult<pb::RequestMfaCodeResponse> {
         self.daemon.require_configured().await?;
-        let event = AuthEvent::SendMfaCode {
-            mfa_type: request.mfa_type.to_string(),
-            account: request.account.to_string(),
-            login_scene: request
-                .login_scene
-                .non_default_or(DEFAULT_LOGIN_SCENE)
-                .to_owned(),
-        };
+        let mfa_type = request.mfa_type.to_string();
+        let account = request.account.to_string();
+        let login_scene = request
+            .login_scene
+            .non_default_or(DEFAULT_LOGIN_SCENE)
+            .to_owned();
         {
-            let mut inner = self.daemon.inner.lock().await;
-            inner.auth.handle(&event).await;
-            drop(inner);
-        }
-        self.check_last_error().await?;
+            let inner = self.daemon.inner.lock().await;
+            inner
+                .auth
+                .send_mfa_code(&mfa_type, &account, &login_scene)
+                .await
+        }?;
         Response::ok(pb::RequestMfaCodeResponse {
             code: String::new(),
             ..Default::default()
@@ -246,22 +215,27 @@ impl AuthService for AuthServiceImpl {
         &self, _ctx: RequestContext, request: ServiceRequest<'_, pb::VerifyMfaRequest>,
     ) -> ServiceResult<pb::VerifyMfaResponse> {
         self.daemon.require_configured().await?;
-        let event = AuthEvent::VerifyMfa {
-            mfa_type: request.mfa_type.to_string(),
-            account: request.account.to_string(),
-            code: request.code.map(ToOwned::to_owned),
-            password: request.password.map(ToOwned::to_owned),
-            login_scene: request
-                .login_scene
-                .non_default_or(DEFAULT_LOGIN_SCENE)
-                .to_owned(),
-        };
+        let mfa_type = request.mfa_type.to_string();
+        let account = request.account.to_string();
+        let code = request.code.map(ToOwned::to_owned);
+        let password = request.password.map(ToOwned::to_owned);
+        let login_scene = request
+            .login_scene
+            .non_default_or(DEFAULT_LOGIN_SCENE)
+            .to_owned();
         {
             let mut inner = self.daemon.inner.lock().await;
-            inner.auth.handle(&event).await;
-            drop(inner);
-        }
-        self.check_last_error().await?;
+            inner
+                .auth
+                .verify_mfa(
+                    &mfa_type,
+                    &account,
+                    code.as_deref(),
+                    password.as_deref(),
+                    &login_scene,
+                )
+                .await
+        }?;
         self.post_login().await;
         self.maybe_persist_and_broadcast().await;
         let session = self.current_session().await;
@@ -275,18 +249,14 @@ impl AuthService for AuthServiceImpl {
         &self, _ctx: RequestContext, request: ServiceRequest<'_, pb::SkipPendingChallengeRequest>,
     ) -> ServiceResult<pb::SkipPendingChallengeResponse> {
         self.daemon.require_configured().await?;
-        let event = AuthEvent::SkipChallenge {
-            login_scene: request
-                .login_scene
-                .non_default_or(DEFAULT_LOGIN_SCENE)
-                .to_owned(),
-        };
+        let login_scene = request
+            .login_scene
+            .non_default_or(DEFAULT_LOGIN_SCENE)
+            .to_owned();
         {
             let mut inner = self.daemon.inner.lock().await;
-            inner.auth.handle(&event).await;
-            drop(inner);
-        }
-        self.check_last_error().await?;
+            inner.auth.skip_challenge(&login_scene).await
+        }?;
         self.post_login().await;
         self.maybe_persist_and_broadcast().await;
         let session = self.current_session().await;
@@ -337,25 +307,15 @@ impl AuthService for AuthServiceImpl {
     ) -> ServiceResult<pb::StartThirdPartyLoginResponse> {
         self.daemon.require_configured().await?;
         let alias_key = request.alias_key.to_string();
-        let redirect_uri = request.redirect_uri.to_string();
-        let event = AuthEvent::StartOAuth {
-            alias_key: alias_key.clone(),
-            redirect_uri,
-        };
-        {
+        let (auth_url, state_value) = {
             let mut inner = self.daemon.inner.lock().await;
-            inner.auth.handle(&event).await;
-            drop(inner);
-        }
-        self.check_last_error().await?;
-        // Extract the OAuth params from the shared storage.
-        let inner = self.daemon.inner.lock().await;
-        let (auth_url, state_value) = inner
-            .auth
-            .oauth_pending
-            .as_ref()
-            .map_or_else(Default::default, |p| (p.url.clone(), p.oauth_state.clone()));
-        drop(inner);
+            inner.auth.start_oauth(&alias_key).await?;
+            inner
+                .auth
+                .oauth_pending
+                .as_ref()
+                .map_or_else(Default::default, |p| (p.url.clone(), p.oauth_state.clone()))
+        };
         Response::ok(pb::StartThirdPartyLoginResponse {
             auth_url,
             state: state_value,
@@ -369,16 +329,12 @@ impl AuthService for AuthServiceImpl {
         request: ServiceRequest<'_, pb::CompleteThirdPartyLoginRequest>,
     ) -> ServiceResult<pb::CompleteThirdPartyLoginResponse> {
         self.daemon.require_configured().await?;
-        let event = AuthEvent::CompleteOAuth {
-            code: request.code.to_string(),
-            state: request.state.to_string(),
-        };
+        let code = request.code.to_string();
+        let state = request.state.to_string();
         {
             let mut inner = self.daemon.inner.lock().await;
-            inner.auth.handle(&event).await;
-            drop(inner);
-        }
-        self.check_last_error().await?;
+            inner.auth.complete_oauth(&code, &state).await
+        }?;
         self.post_login().await;
         self.maybe_persist_and_broadcast().await;
         let session = self.current_session().await;
@@ -392,18 +348,10 @@ impl AuthService for AuthServiceImpl {
         &self, _ctx: RequestContext, request: ServiceRequest<'_, pb::StartDeviceLoginRequest>,
     ) -> ServiceResult<pb::StartDeviceLoginResponse> {
         self.daemon.require_configured().await?;
-        let event = AuthEvent::StartDeviceLogin {
-            alias_key: request.alias_key.to_string(),
-        };
-        {
-            let mut inner = self.daemon.inner.lock().await;
-            inner.auth.handle(&event).await;
-            drop(inner);
-        }
-        self.check_last_error().await?;
-        // Read back the login URL from the pending state.
+        let alias_key = request.alias_key.to_string();
         let login_url = {
-            let inner = self.daemon.inner.lock().await;
+            let mut inner = self.daemon.inner.lock().await;
+            inner.auth.start_device_login(&alias_key).await?;
             inner
                 .auth
                 .device_login_pending
@@ -475,16 +423,10 @@ impl AuthService for AuthServiceImpl {
 
         // The poll succeeded: the session is established via cookies. Finalize
         // (no separate OAuth callback — corplink-rs style).
-        let event = AuthEvent::CompleteDeviceLogin {
-            code: String::new(),
-            state: String::new(),
-        };
         {
             let mut inner = self.daemon.inner.lock().await;
-            inner.auth.handle(&event).await;
-            drop(inner);
+            inner.auth.complete_device_login();
         }
-        self.check_last_error().await?;
         self.post_login().await;
         self.maybe_persist_and_broadcast().await;
         let session = self.current_session().await;
@@ -498,12 +440,9 @@ impl AuthService for AuthServiceImpl {
         &self, _ctx: RequestContext, request: ServiceRequest<'_, pb::LogoutRequest>,
     ) -> ServiceResult<pb::LogoutResponse> {
         self.daemon.require_configured().await?;
-        let event = AuthEvent::Logout {
-            logout_all: request.logout_all,
-        };
         {
             let mut inner = self.daemon.inner.lock().await;
-            inner.auth.handle(&event).await;
+            inner.auth.logout(request.logout_all).await;
             drop(inner);
         }
         // Delete credentials on logout.
@@ -526,7 +465,7 @@ impl AuthServiceImpl {
     async fn post_login(&self) {
         let is_authenticated = {
             let inner = self.daemon.inner.lock().await;
-            matches!(inner.auth.state(), State::Authenticated {})
+            matches!(inner.auth.state, AuthState::Authenticated)
         };
         if !is_authenticated {
             return;
@@ -547,15 +486,10 @@ impl AuthServiceImpl {
         match rustylink_core::vpn::fetch_totp(&client).await {
             Ok(Some(config)) => {
                 let mut inner = self.daemon.inner.lock().await;
-                inner
-                    .auth
-                    .handle(&AuthEvent::StoreTotp {
-                        config: Some(crate::persist::PersistedTotpConfig {
-                            url: config.url,
-                            time_diff_seconds: config.time_diff_seconds,
-                        }),
-                    })
-                    .await;
+                inner.auth.set_totp(Some(crate::persist::PersistedTotpConfig {
+                    url: config.url,
+                    time_diff_seconds: config.time_diff_seconds,
+                }));
                 drop(inner);
             }
             Ok(None) => {}

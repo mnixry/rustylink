@@ -126,6 +126,22 @@ impl From<rustylink_core::auth::Error> for DaemonError {
     }
 }
 
+impl From<rustylink_core::state::auth::Error> for DaemonError {
+    fn from(error: rustylink_core::state::auth::Error) -> Self {
+        use rustylink_core::state::auth::Error as AuthFlow;
+        match error {
+            // Reuse the upstream-API classification for the wrapped call.
+            AuthFlow::Auth { source } => Self::from(*source),
+            // Provider-selection problems are client-actionable bad input.
+            other => Self::Fault {
+                source: RpcFault::InvalidArgument {
+                    message: other.to_string(),
+                },
+            },
+        }
+    }
+}
+
 impl From<rustylink_core::vpn::Error> for DaemonError {
     fn from(error: rustylink_core::vpn::Error) -> Self {
         vpn_api(&error).and_then(classify_api).map_or_else(

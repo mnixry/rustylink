@@ -1,6 +1,6 @@
 //! Daemon core: shared state container for the three RPC services.
 //!
-//! The [`Daemon`] handle wraps `Arc<Mutex<DaemonInner>>` — it holds the statig
+//! The [`Daemon`] handle wraps `Arc<Mutex<DaemonInner>>` — it holds the auth
 //! auth state machine, VPN state machine, daemon config, and a `watch` channel
 //! for tunnel state broadcasts.  It does **not** implement any RPC service
 //! trait; the three service wrappers (`AuthServiceImpl`, `VpnServiceImpl`,
@@ -26,7 +26,6 @@ use rustylink_tunnel::{
     ReconnectEvent, ReconnectPolicy, TunnelConfig, TunnelSession,
 };
 use snafu::prelude::*;
-use statig::prelude::*;
 use tokio::{
     sync::{Mutex, watch},
     task::JoinHandle,
@@ -37,14 +36,14 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     error::{DaemonError, Result, RpcFault, TunnelSnafu},
     persist::{DaemonConfig, LoginApiVersion, PersistedCredentials},
-    state::{ActiveTunnel, AuthEvent, AuthMachine, State, VpnMachine, VpnRequest},
+    state::{ActiveTunnel, AuthMachine, AuthState, VpnMachine, VpnRequest},
     supervisor::{self, SupervisorOutcome},
 };
 
 /// The serialised inner state owned by the daemon.
 pub struct DaemonInner {
-    /// Statig auth state machine.
-    pub(crate) auth: statig::awaitable::StateMachine<AuthMachine>,
+    /// Auth coordinator (pure state + runtime resources).
+    pub(crate) auth: AuthMachine,
     /// VPN state machine (present once auth is available).
     pub(crate) vpn: Option<VpnMachine>,
     /// Daemon configuration (survives logout).
@@ -92,6 +91,7 @@ impl Daemon {
             AuthMachine::restore_from_credentials(creds, http_pool, identity)
         } else {
             AuthMachine {
+                state: AuthState::Unconfigured,
                 http_pool,
                 identity,
                 tenant: None,
@@ -102,15 +102,11 @@ impl Daemon {
                 login_api_version: LoginApiVersion::default(),
                 oauth_pending: None,
                 device_login_pending: None,
-                last_error: None,
             }
         };
 
-        // Wrap in statig state machine (lazily initialized on first handle()).
-        let sm = auth_machine.state_machine();
-
         let inner = DaemonInner {
-            auth: sm,
+            auth: auth_machine,
             vpn: None,
             config,
             config_path,
@@ -156,7 +152,7 @@ impl Daemon {
     /// session (the machine can produce a complete, restorable snapshot).
     pub async fn persist_credentials(&self) {
         let inner = self.inner.lock().await;
-        if !matches!(inner.auth.state(), State::Authenticated {}) {
+        if !matches!(inner.auth.state, AuthState::Authenticated) {
             return;
         }
         let vpn_request = inner
@@ -215,8 +211,8 @@ impl Daemon {
     /// Check that the auth machine is at least configured.
     pub(crate) async fn require_configured(&self) -> Result<()> {
         let inner = self.inner.lock().await;
-        match inner.auth.state() {
-            State::Unconfigured {} => Err(RpcFault::NotConfigured.into()),
+        match inner.auth.state {
+            AuthState::Unconfigured => Err(RpcFault::NotConfigured.into()),
             _ => Ok(()),
         }
     }
@@ -224,21 +220,21 @@ impl Daemon {
     /// Check that the auth machine is authenticated.
     pub(crate) async fn require_authenticated(&self) -> Result<()> {
         let inner = self.inner.lock().await;
-        match inner.auth.state() {
-            State::Authenticated {} => Ok(()),
+        match inner.auth.state {
+            AuthState::Authenticated => Ok(()),
             _ => Err(RpcFault::NotAuthenticated.into()),
         }
     }
 
     /// Restore the auth session state from credentials loaded at startup.
     ///
-    /// Must be called once after construction: the statig machine always starts
+    /// Must be called once after construction: a restored machine always starts
     /// in `Unconfigured`, so without this a previously-authenticated session
     /// (restored from `credentials.json`) would not be recognised and the UI
     /// would prompt for login again (notably after `--rotate-token`).
     pub async fn restore_auth_state(&self) {
         let mut inner = self.inner.lock().await;
-        inner.auth.handle(&AuthEvent::RestoreSession).await;
+        inner.auth.restore_session().await;
         drop(inner);
     }
 
@@ -276,7 +272,7 @@ impl Daemon {
     /// connect + supervise flow runs in a background task.
     pub async fn connect_tunnel(&self, request: VpnRequest) -> Result<pb::Tunnel> {
         let mut inner = self.inner.lock().await;
-        if !matches!(inner.auth.state(), State::Authenticated {}) {
+        if !matches!(inner.auth.state, AuthState::Authenticated) {
             return Err(RpcFault::NotAuthenticated.into());
         }
 

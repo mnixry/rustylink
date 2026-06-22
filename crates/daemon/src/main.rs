@@ -1,6 +1,6 @@
 //! The `rustylinkd` Connect RPC daemon.
 //!
-//! Owns auth state (statig), VPN state, and config; persists them as JSON.
+//! Owns auth state, VPN state, and config; persists them as JSON.
 //! Serves a Connect + gRPC + gRPC-Web endpoint under the `/api` path prefix,
 //! guarded by a bearer token and a restrictive CORS layer. When built with
 //! `--features embed-ui`, the built web UI is embedded and served at `/`.

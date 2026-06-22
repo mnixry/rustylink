@@ -5,7 +5,7 @@ package rustylink.daemon.v1;
 import "rustylink/daemon/v1/types.proto";
 
 // ---------------------------------------------------------------------------
-// Session — fine-grained state enum aligned with statig `AuthMachine` states
+// Session — fine-grained state enum aligned with core `AuthState`
 // ---------------------------------------------------------------------------
 
 message Session {

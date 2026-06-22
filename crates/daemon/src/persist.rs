@@ -235,14 +235,10 @@ pub struct PersistedVpnRequest {
 }
 
 /// Login API version detected from `/api/login/setting`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum LoginApiVersion {
-    /// Legacy login flow (`/api/login`, `/api/login/code/*`, `/api/mfa/*`).
-    #[default]
-    Legacy,
-    /// V1 login flow (`/api/v1/login`, `/api/v1/login/*`).
-    V1,
-}
+///
+/// Defined in `core` as part of the auth state; re-exported here because
+/// [`PersistedCredentials`] serializes it.
+pub use rustylink_core::state::auth::LoginApiVersion;
 
 /// Persisted auth credentials (`credentials.json`).
 ///

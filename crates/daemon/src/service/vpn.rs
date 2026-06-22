@@ -7,7 +7,6 @@
 use std::time::Duration;
 
 use connectrpc::{RequestContext, Response, ServiceRequest, ServiceResult, ServiceStream};
-use rustylink_core::vpn::VpnConnectMode;
 use rustylink_proto::proto::rustylink::daemon::{v1 as pb, v1::VpnService};
 use tokio_stream::{StreamExt as _, wrappers::WatchStream};
 
@@ -15,7 +14,7 @@ use crate::{
     daemon::{Daemon, project_vpn_location},
     error::{DaemonError, RpcFault},
     latency,
-    state::{VpnMachine, VpnRequest},
+    state::{VpnMachine, vpn_request_from_proto},
 };
 
 /// Wrapper around [`Daemon`] implementing the `VpnService` trait.
@@ -52,7 +51,13 @@ impl VpnService for VpnServiceImpl {
     async fn connect_tunnel(
         &self, _ctx: RequestContext, request: ServiceRequest<'_, pb::ConnectTunnelRequest>,
     ) -> ServiceResult<pb::ConnectTunnelResponse> {
-        let vpn_request = VpnRequest::from(&request);
+        let vpn_request = vpn_request_from_proto(
+            request.mode.as_known(),
+            request.export_id,
+            request.preferred_dot_id,
+            request.otp,
+            request.reconnect,
+        );
         let tunnel = self.daemon.connect_tunnel(vpn_request).await?;
         Response::ok(pb::ConnectTunnelResponse {
             tunnel: tunnel.into(),
@@ -178,24 +183,6 @@ impl VpnService for VpnServiceImpl {
 // ---------------------------------------------------------------------------
 // Proto → domain conversion
 // ---------------------------------------------------------------------------
-
-impl From<&ServiceRequest<'_, pb::ConnectTunnelRequest>> for VpnRequest {
-    fn from(request: &ServiceRequest<'_, pb::ConnectTunnelRequest>) -> Self {
-        let mode = match request.mode.as_known() {
-            Some(pb::VpnMode::Split) => VpnConnectMode::Split,
-            Some(pb::VpnMode::Relay) => VpnConnectMode::Relay,
-            _ => VpnConnectMode::Full,
-        };
-        let otp = request.otp.filter(|s| !s.is_empty()).map(ToOwned::to_owned);
-        Self {
-            mode,
-            export_id: request.export_id,
-            preferred_dot_id: request.preferred_dot_id,
-            otp,
-            reconnect: request.reconnect,
-        }
-    }
-}
 
 /// Convert an optional probe duration to whole milliseconds for the wire,
 /// using `fallback` when absent (`0` for the effective latency, `-1` for a
