@@ -21,6 +21,7 @@ use tokio::{
     task::JoinHandle,
 };
 use url::{Host, Url};
+use wildmatch::WildMatch;
 
 use crate::{IpTun, OutboundInterface};
 
@@ -70,6 +71,9 @@ pub struct DnsHijackPlan {
 #[derive(Clone)]
 pub struct DnsHijacker {
     plan: Arc<DnsHijackPlan>,
+    /// Per-rule wildcard matchers (`{domain}` + `*.{domain}`), precomputed once
+    /// so split-domain matching doesn't rebuild patterns per DNS query.
+    domain_matchers: Arc<Vec<WildMatch>>,
     outbound_interface: Option<OutboundInterface>,
 }
 
@@ -171,20 +175,21 @@ impl DnsHijackPlan {
 
     #[must_use]
     pub fn enabled(&self) -> bool {
-        !self.upstreams_for_domain(None).is_empty()
+        !self.upstreams_for_domain(None, &[]).is_empty()
     }
 
     #[must_use]
     pub fn hijacker(&self, outbound_interface: Option<OutboundInterface>) -> Option<DnsHijacker> {
         self.enabled().then(|| DnsHijacker {
             plan: Arc::new(self.clone()),
+            domain_matchers: Arc::new(build_domain_matchers(&self.domain_rules)),
             outbound_interface,
         })
     }
 
-    fn upstreams_for_domain(&self, domain: Option<&str>) -> Vec<String> {
+    fn upstreams_for_domain(&self, domain: Option<&str>, matchers: &[WildMatch]) -> Vec<String> {
         let mut upstreams = Vec::new();
-        if domain.is_some_and(|value| self.matches_split_domain(value)) {
+        if domain.is_some_and(|value| matches_split_domain(matchers, value)) {
             for rule in &self.domain_rules {
                 push_dns_endpoints(&mut upstreams, &rule.endpoint);
             }
@@ -194,14 +199,6 @@ impl DnsHijackPlan {
         push_optional_dns_endpoints(&mut upstreams, self.primary_dns.as_deref());
         push_optional_dns_endpoints(&mut upstreams, self.backup_dns.as_deref());
         dedupe(upstreams)
-    }
-
-    fn matches_split_domain(&self, domain: &str) -> bool {
-        let domain = normalize_domain(domain);
-        self.domain_rules.iter().any(|rule| {
-            let rule_domain = normalize_domain(&rule.domain);
-            domain == rule_domain || domain.ends_with(&format!(".{rule_domain}"))
-        })
     }
 }
 
@@ -340,7 +337,9 @@ impl DnsHijacker {
             .map(ToOwned::to_owned)
             .or_else(|| parse_dns_question_domain(payload));
         let request_payload = normalize_dns_payload(payload)?;
-        let upstreams = self.plan.upstreams_for_domain(domain.as_deref());
+        let upstreams = self
+            .plan
+            .upstreams_for_domain(domain.as_deref(), &self.domain_matchers);
         if upstreams.is_empty() {
             return Ok(None);
         }
@@ -681,6 +680,31 @@ fn add_domain_pattern(domains: &mut BTreeSet<String>, value: &str) {
     if domain.contains('.') {
         domains.insert(domain);
     }
+}
+
+/// Build the per-rule wildcard matchers used for split-domain matching.
+///
+/// Each rule yields two [`WildMatch`] patterns: the exact host (`example.com`)
+/// and a subdomain wildcard (`*.example.com`). `*` spans dots, so the wildcard
+/// matches any depth of subdomain — reproducing the previous
+/// `domain.ends_with(".{rule}")` behaviour without hand-rolled string work.
+fn build_domain_matchers(rules: &[DnsRule]) -> Vec<WildMatch> {
+    rules
+        .iter()
+        .flat_map(|rule| {
+            let domain = normalize_domain(&rule.domain);
+            [
+                WildMatch::new(&domain),
+                WildMatch::new(&format!("*.{domain}")),
+            ]
+        })
+        .collect()
+}
+
+/// True when `domain` matches any split-tunnel rule matcher.
+fn matches_split_domain(matchers: &[WildMatch], domain: &str) -> bool {
+    let domain = normalize_domain(domain);
+    matchers.iter().any(|matcher| matcher.matches(&domain))
 }
 
 fn normalize_domain(value: &str) -> String {

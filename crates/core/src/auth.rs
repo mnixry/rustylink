@@ -429,7 +429,7 @@ pub fn next_login_step(result: Option<&LoginV2Result>) -> LoginStep {
             masked_email: next.email.clone().unwrap_or_default(),
         };
     }
-    if action.eq_ignore_ascii_case("goto_link") || action.eq_ignore_ascii_case("goToLink") {
+    if matches!(action.to_ascii_lowercase().as_str(), "goto_link" | "gotolink") {
         return LoginStep::Authenticated;
     }
     if result.result.as_deref() == Some("success") {
@@ -451,9 +451,10 @@ pub fn next_login_step(result: Option<&LoginV2Result>) -> LoginStep {
 }
 
 fn is_mfa_action(action: &str) -> bool {
-    action.eq_ignore_ascii_case("2FA")
-        || action.eq_ignore_ascii_case("mfa")
-        || action.eq_ignore_ascii_case("verify_mfa")
+    matches!(
+        action.to_ascii_lowercase().as_str(),
+        "2fa" | "mfa" | "verify_mfa"
+    )
 }
 
 // ---------------------------------------------------------------------------

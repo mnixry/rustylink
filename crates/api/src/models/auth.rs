@@ -1,11 +1,21 @@
 use std::borrow::Cow;
 
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 use snafu::ResultExt as _;
 
 use super::{BaseResponse, JsonObject, SendableRequest};
 use crate::signing::PasswordCipher;
+
+/// RFC 3986 *unreserved* set (`ALPHA / DIGIT / "-" / "." / "_" / "~"`). Every
+/// other byte in a path segment is percent-encoded (uppercase hex), so a value
+/// containing `/` cannot break out of its path segment.
+const PATH_SEGMENT: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
 
 // ---------------------------------------------------------------------------
 // Activate
@@ -349,7 +359,7 @@ impl SendableRequest for OAuthQueryCallbackRequest {
     fn path(&self) -> Cow<'static, str> {
         Cow::Owned(format!(
             "/api/tpslogin/callback/{}",
-            encode_path_segment(&self.alias)
+            utf8_percent_encode(&self.alias, PATH_SEGMENT)
         ))
     }
 
@@ -501,31 +511,6 @@ pub struct ThirdPartyLoginInfo {
     pub icon: Option<String>,
     pub abbreviation: Option<String>,
     pub raw: Option<JsonObject>,
-}
-
-fn encode_path_segment(value: &str) -> String {
-    let mut encoded = String::new();
-    for byte in value.bytes() {
-        if is_unreserved_path_byte(byte) {
-            encoded.push(char::from(byte));
-        } else {
-            encoded.push('%');
-            encoded.push(hex_char(byte >> 4));
-            encoded.push(hex_char(byte & 0x0F));
-        }
-    }
-    encoded
-}
-
-const fn is_unreserved_path_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
-}
-
-const fn hex_char(value: u8) -> char {
-    match value {
-        0..=9 => (b'0' + value) as char,
-        _ => (b'A' + value - 10) as char,
-    }
 }
 
 #[cfg(test)]

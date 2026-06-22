@@ -20,6 +20,7 @@ hmac.workspace               = true
 http.workspace               = true
 jiff.workspace               = true
 machine-uid.workspace        = true
+percent-encoding.workspace   = true
 reqwest.workspace            = true
 reqwest-middleware.workspace = true
 serde.workspace              = true

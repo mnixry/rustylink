@@ -33,9 +33,6 @@ pub enum Error {
         source: url::ParseError,
     },
 
-    #[snafu(display("failed to build URI `{value}`: {source}"))]
-    BuildUri { value: String, source: http::Error },
-
     #[snafu(display("failed to build HTTP client: {source}"))]
     BuildHttpClient { source: reqwest::Error },
 
@@ -780,17 +777,19 @@ fn map_middleware_error(error: reqwest_middleware::Error) -> Error {
 /// every request. Sending them at login is what binds the session to a device
 /// (`did`); `/vpn/conn` requires that binding.
 fn device_cookie_header(cookies: &SessionCookies, identity: &ClientIdentity) -> String {
-    let mut parts: Vec<String> = cookies
+    cookies
         .values
         .iter()
-        .map(|(name, value)| format!("{name}={value}"))
-        .collect();
-    parts.push(format!("device_id={}", identity.device_id));
-    parts.push(format!(
-        "device_name={}",
-        device_name_cookie_value(identity)
-    ));
-    parts.join("; ")
+        .map(|(name, value)| cookie::Cookie::new(name.clone(), value.clone()))
+        .chain([
+            cookie::Cookie::new("device_id", identity.device_id.clone()),
+            cookie::Cookie::new("device_name", device_name_cookie_value(identity)),
+        ])
+        // `Display` renders `name=value` (no attributes set); unlike `encoded()`
+        // it does not percent-encode, preserving Android `CookieJarImpl` bytes.
+        .map(|cookie| cookie.to_string())
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// A cookie-safe device name derived from the identity model (spaces replaced),
@@ -855,23 +854,14 @@ fn url_from_host_port(scheme: &str, host: &str, port: i32) -> Result<Url> {
     if host.is_empty() {
         return MissingVpnDotFieldSnafu { field: "host" }.fail();
     }
-    // Build the authority structurally (bracketing bare IPv6 literals) and let
-    // the `http::Uri` builder validate the scheme/host/port instead of parsing
-    // a placeholder URL and mutating it.
+    // Bracket bare IPv6 literals so the authority parses; `url::Url` validates
+    // the scheme/host/port for us — no second URL/URI type needed.
     let authority = if host.parse::<std::net::Ipv6Addr>().is_ok() {
-        format!("[{host}]:{port}")
+        format!("[{host}]")
     } else {
-        format!("{host}:{port}")
+        host.to_owned()
     };
-    let uri = http::Uri::builder()
-        .scheme(scheme)
-        .authority(authority.as_str())
-        .path_and_query("/")
-        .build()
-        .context(BuildUriSnafu {
-            value: format!("{scheme}://{authority}/"),
-        })?;
-    parse_base_url(&uri.to_string())
+    parse_base_url(&format!("{scheme}://{authority}:{port}/"))
 }
 
 #[cfg(test)]

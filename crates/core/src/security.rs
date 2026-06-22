@@ -1,6 +1,6 @@
 use rustylink_api::{
-    ApiClient, BaseResponse, CommonStringResult, JsonObject, ResponseMeta, SecurityReportItem,
-    SecurityReportRequest, SendableRequest,
+    ApiClient, BaseResponse, CommonStringResult, ResponseMeta, SecurityReportRequest,
+    SendableRequest,
 };
 use snafu::prelude::*;
 
@@ -34,41 +34,31 @@ pub async fn report_security(
 /// objects the app attaches — `network` carries the (empty, no-proxy) HTTP
 /// proxy info, and `debug_off`/`debug_on` carry the battery/USB charging status
 /// (`-1` = not USB-charging). The top-level object contains only `items`.
+///
+/// # Panics
+///
+/// Never in practice: the payload is a fixed literal that always deserializes
+/// into a [`SecurityReportRequest`]. A panic would indicate a programmer error
+/// (the literal was edited into an invalid shape).
 #[must_use]
 pub fn all_green_security_report() -> SecurityReportRequest {
-    let items = [
-        ("root", None),
-        ("certificate", None),
-        ("wifi", None),
-        ("wifi_wep", None),
-        // No system proxy → the app emits `data: {}` for `network`.
-        ("network", Some(JsonObject::new())),
-        ("password", None),
-        ("lock_image", None),
-        ("debug_off", Some(usb_status_data())),
-        ("debug_on", Some(usb_status_data())),
-    ]
-    .into_iter()
-    .map(|(key, data)| SecurityReportItem {
-        data,
-        key: key.to_string(),
-        level: 0,
-    })
-    .collect();
-
-    SecurityReportRequest {
-        items,
-        raw: None,
-        status: None,
-    }
-}
-
-/// `data: { "usbStatus": -1 }` — the value `zd1.t` returns when the device is
-/// not charging over USB (the expected state for a headless client).
-fn usb_status_data() -> JsonObject {
-    let mut data = JsonObject::new();
-    data.insert("usbStatus".to_string(), serde_json::Value::from(-1));
-    data
+    // One item per check (level 0 = safe). `network` carries the empty
+    // (no-proxy) HTTP proxy info; `debug_off`/`debug_on` carry `usbStatus: -1`
+    // (= not USB-charging, the expected state for a headless client).
+    serde_json::from_value(serde_json::json!({
+        "items": [
+            { "key": "root", "level": 0 },
+            { "key": "certificate", "level": 0 },
+            { "key": "wifi", "level": 0 },
+            { "key": "wifi_wep", "level": 0 },
+            { "key": "network", "level": 0, "data": {} },
+            { "key": "password", "level": 0 },
+            { "key": "lock_image", "level": 0 },
+            { "key": "debug_off", "level": 0, "data": { "usbStatus": -1 } },
+            { "key": "debug_on", "level": 0, "data": { "usbStatus": -1 } },
+        ]
+    }))
+    .expect("static all-green security report is valid")
 }
 
 #[cfg(test)]

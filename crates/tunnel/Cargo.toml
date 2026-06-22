@@ -23,6 +23,7 @@ tokio.workspace         = true
 tracing.workspace       = true
 tun-rs.workspace        = true
 url.workspace           = true
+wildmatch.workspace     = true
 
 [dependencies.gotatun]
 features = ["device"]
