@@ -4,9 +4,9 @@
 //! connect/disconnect is delegated to `Daemon::connect_tunnel` /
 //! `Daemon::disconnect_tunnel`; the RPC handlers add proto framing.
 
-use connectrpc::{RequestContext, Response, ServiceRequest, ServiceResult, ServiceStream};
 use std::time::Duration;
 
+use connectrpc::{RequestContext, Response, ServiceRequest, ServiceResult, ServiceStream};
 use rustylink_core::vpn::VpnConnectMode;
 use rustylink_proto::proto::rustylink::daemon::{v1 as pb, v1::VpnService};
 use tokio_stream::{StreamExt as _, wrappers::WatchStream};

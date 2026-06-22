@@ -14,6 +14,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card"
+import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import {
   Select,
@@ -198,6 +199,25 @@ export function SettingsSection() {
               ))}
             </SelectContent>
           </Select>
+        </div>
+
+        <div className="grid gap-2">
+          <Label htmlFor="tun-interface">TUN interface</Label>
+          <Input
+            id="tun-interface"
+            defaultValue={cfg.tunInterface ?? ""}
+            placeholder="Automatic (utun / wg0)"
+            disabled={update.isPending}
+            onBlur={(event) => {
+              const value = event.target.value.trim()
+              if (value !== (cfg.tunInterface ?? "")) {
+                save({ tunInterface: value }, ["tun_interface"])
+              }
+            }}
+          />
+          <p className="text-muted-foreground text-xs">
+            Name of the VPN tunnel device. Leave empty for the platform default.
+          </p>
         </div>
 
         {cfg.deviceIdentity ? (

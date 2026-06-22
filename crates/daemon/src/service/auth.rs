@@ -139,7 +139,10 @@ impl AuthService for AuthServiceImpl {
         let event = AuthEvent::Login {
             account: request.account.to_string(),
             password: request.password.to_string(),
-            login_scene: request.login_scene.non_default_or(DEFAULT_LOGIN_SCENE).to_owned(),
+            login_scene: request
+                .login_scene
+                .non_default_or(DEFAULT_LOGIN_SCENE)
+                .to_owned(),
             account_type: request.account_type.non_default_or("account").to_owned(),
         };
         {
@@ -164,8 +167,16 @@ impl AuthService for AuthServiceImpl {
         self.daemon.require_configured().await?;
         let event = AuthEvent::SendLoginCode {
             account: request.account.to_string(),
-            login_type: request.login_type.as_known().unwrap_or_default().wire().to_owned(),
-            login_scene: request.login_scene.non_default_or(DEFAULT_LOGIN_SCENE).to_owned(),
+            login_type: request
+                .login_type
+                .as_known()
+                .unwrap_or_default()
+                .wire()
+                .to_owned(),
+            login_scene: request
+                .login_scene
+                .non_default_or(DEFAULT_LOGIN_SCENE)
+                .to_owned(),
             account_type: request.account_type.non_default_or("account").to_owned(),
         };
         {
@@ -189,8 +200,16 @@ impl AuthService for AuthServiceImpl {
         let event = AuthEvent::VerifyLoginCode {
             account: request.account.to_string(),
             code: request.code.to_string(),
-            login_type: request.login_type.as_known().unwrap_or_default().wire().to_owned(),
-            login_scene: request.login_scene.non_default_or(DEFAULT_LOGIN_SCENE).to_owned(),
+            login_type: request
+                .login_type
+                .as_known()
+                .unwrap_or_default()
+                .wire()
+                .to_owned(),
+            login_scene: request
+                .login_scene
+                .non_default_or(DEFAULT_LOGIN_SCENE)
+                .to_owned(),
             account_type: request.account_type.non_default_or("account").to_owned(),
         };
         {
@@ -215,7 +234,10 @@ impl AuthService for AuthServiceImpl {
         let event = AuthEvent::SendMfaCode {
             mfa_type: request.mfa_type.to_string(),
             account: request.account.to_string(),
-            login_scene: request.login_scene.non_default_or(DEFAULT_LOGIN_SCENE).to_owned(),
+            login_scene: request
+                .login_scene
+                .non_default_or(DEFAULT_LOGIN_SCENE)
+                .to_owned(),
         };
         {
             let mut inner = self.daemon.inner.lock().await;
@@ -238,7 +260,10 @@ impl AuthService for AuthServiceImpl {
             account: request.account.to_string(),
             code: request.code.map(ToOwned::to_owned),
             password: request.password.map(ToOwned::to_owned),
-            login_scene: request.login_scene.non_default_or(DEFAULT_LOGIN_SCENE).to_owned(),
+            login_scene: request
+                .login_scene
+                .non_default_or(DEFAULT_LOGIN_SCENE)
+                .to_owned(),
         };
         {
             let mut inner = self.daemon.inner.lock().await;
@@ -260,7 +285,10 @@ impl AuthService for AuthServiceImpl {
     ) -> ServiceResult<pb::SkipPendingChallengeResponse> {
         self.daemon.require_configured().await?;
         let event = AuthEvent::SkipChallenge {
-            login_scene: request.login_scene.non_default_or(DEFAULT_LOGIN_SCENE).to_owned(),
+            login_scene: request
+                .login_scene
+                .non_default_or(DEFAULT_LOGIN_SCENE)
+                .to_owned(),
         };
         {
             let mut inner = self.daemon.inner.lock().await;

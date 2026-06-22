@@ -13,6 +13,7 @@ use reqwest::{
 };
 use reqwest_middleware::{ClientBuilder, ClientWithMiddleware, Middleware, Next};
 use snafu::prelude::*;
+use tracing::Instrument as _;
 use url::Url;
 
 use crate::{
@@ -30,6 +31,12 @@ pub enum Error {
     InvalidBaseUrl {
         value: String,
         source: url::ParseError,
+    },
+
+    #[snafu(display("failed to build URI `{value}`: {source}"))]
+    BuildUri {
+        value: String,
+        source: http::Error,
     },
 
     #[snafu(display("failed to build HTTP client: {source}"))]
@@ -97,10 +104,6 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-// ---------------------------------------------------------------------------
-// Session cookies (plain value type)
-// ---------------------------------------------------------------------------
-
 #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
 pub struct SessionCookies {
     pub values: BTreeMap<String, String>,
@@ -125,40 +128,122 @@ impl SessionCookies {
     }
 }
 
-/// A shared, mutable cookie jar.
+/// Listener invoked (outside the cookie lock) after the jar absorbs a change.
+/// The daemon installs one to persist the refreshed session to its credentials
+/// file.
+pub type CookieListener = Arc<dyn Fn() + Send + Sync>;
+
+/// A shared, mutable cookie jar guarded by an async lock.
 ///
 /// Like the Android client's `CookieJar`, this accumulates `Set-Cookie`
 /// mutations across every request made by any [`ApiClient`] that shares it, so
 /// cookies set mid-flow (e.g. `vpn-token` from `/api/vpn/list`) are present on
-/// later requests (e.g. the dot's `/vpn/conn`). All clients built from one
-/// [`ApiHooks`] share the same jar.
-pub type CookieJar = Arc<Mutex<SessionCookies>>;
+/// later requests (e.g. the dot's `/vpn/conn`). The values live behind a
+/// [`tokio::sync::Mutex`] so callers await the lock instead of blocking the
+/// runtime; every change is logged at debug level and reported to the
+/// [`CookieListener`] so it can be persisted.
+pub type CookieJar = Arc<CookieStore>;
 
-/// Merge `Set-Cookie` headers from a response into a [`CookieJar`].
-fn absorb_set_cookies(jar: &CookieJar, headers: &HeaderMap) {
-    let updates: Vec<(String, String)> = headers
-        .get_all(SET_COOKIE)
-        .iter()
-        .filter_map(|value| {
-            let raw = value.to_str().ok()?;
-            let (name, rest) = raw.split_once('=')?;
-            let cookie_value = rest.split(';').next().unwrap_or_default();
-            Some((name.trim().to_string(), cookie_value.trim().to_string()))
-        })
-        .collect();
-    if updates.is_empty() {
-        return;
+pub struct CookieStore {
+    cookies: tokio::sync::Mutex<SessionCookies>,
+    listener: Mutex<Option<CookieListener>>,
+}
+
+impl std::fmt::Debug for CookieStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CookieStore").finish_non_exhaustive()
     }
-    if let Ok(mut jar) = jar.lock() {
+}
+
+impl CookieStore {
+    /// Create an empty jar.
+    #[must_use]
+    pub fn empty() -> CookieJar {
+        Arc::new(Self {
+            cookies: tokio::sync::Mutex::new(SessionCookies::default()),
+            listener: Mutex::new(None),
+        })
+    }
+
+    /// Create a jar seeded with persisted cookie values.
+    #[must_use]
+    pub fn with_values(values: BTreeMap<String, String>) -> CookieJar {
+        Arc::new(Self {
+            cookies: tokio::sync::Mutex::new(SessionCookies { values }),
+            listener: Mutex::new(None),
+        })
+    }
+
+    /// Install the change listener, replacing any previous one.
+    pub fn set_listener(&self, listener: CookieListener) {
+        if let Ok(mut slot) = self.listener.lock() {
+            *slot = Some(listener);
+        }
+    }
+
+    /// Snapshot the current cookies.
+    pub async fn snapshot(&self) -> SessionCookies {
+        self.cookies.lock().await.clone()
+    }
+
+    /// Snapshot the current cookie values.
+    pub async fn values(&self) -> BTreeMap<String, String> {
+        self.cookies.lock().await.values.clone()
+    }
+
+    /// True when the jar holds no cookies.
+    pub async fn is_empty(&self) -> bool {
+        self.cookies.lock().await.values.is_empty()
+    }
+
+    /// Clear all cookies (on logout). Does not notify — the credentials file is
+    /// deleted on logout rather than rewritten.
+    pub async fn clear(&self) {
+        self.cookies.lock().await.values.clear();
+    }
+
+    /// Merge cookie updates into the jar, logging each change at debug level
+    /// and notifying the listener once if anything actually changed.
+    pub async fn merge(&self, updates: impl IntoIterator<Item = (String, String)>) {
+        let mut changed = false;
+        let mut jar = self.cookies.lock().await;
         for (name, value) in updates {
+            if jar
+                .values
+                .get(&name)
+                .is_some_and(|existing| *existing == value)
+            {
+                continue;
+            }
+            tracing::debug!(cookie = %name, "cookie set");
             jar.values.insert(name, value);
+            changed = true;
+        }
+        drop(jar);
+        if changed {
+            self.notify();
+        }
+    }
+
+    fn notify(&self) {
+        let listener = self.listener.lock().ok().and_then(|slot| slot.clone());
+        if let Some(listener) = listener {
+            listener();
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Response metadata — extracted from HTTP response headers
-// ---------------------------------------------------------------------------
+/// Parse `Set-Cookie` response headers into `(name, value)` pairs with the
+/// `cookie` crate (which handles attributes, quoting, and whitespace).
+fn parse_set_cookies(headers: &HeaderMap) -> Vec<(String, String)> {
+    headers
+        .get_all(SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .filter_map(|raw| cookie::Cookie::parse(raw.to_owned()).ok())
+        .map(|cookie| (cookie.name().to_owned(), cookie.value().to_owned()))
+        .collect()
+}
 
 /// Metadata extracted from an HTTP response, returned alongside the typed body.
 ///
@@ -176,10 +261,6 @@ pub struct ResponseMeta {
     pub is_force_logout: bool,
 }
 
-// ---------------------------------------------------------------------------
-// ApiHooks — snapshot of auth state used to decorate requests
-// ---------------------------------------------------------------------------
-
 /// Request-decoration hooks (snapshot). All fields are plain owned values.
 /// A new `ApiHooks` is built from the current `PersistedState` each time the
 /// actor refreshes the `AppContext`.
@@ -193,12 +274,8 @@ pub struct ApiHooks {
 }
 
 impl ApiHooks {
-    fn base_headers(&self) -> Result<HeaderMap> {
-        let cookies = self
-            .cookies
-            .lock()
-            .map(|jar| jar.clone())
-            .unwrap_or_default();
+    async fn base_headers(&self) -> Result<HeaderMap> {
+        let cookies = self.cookies.snapshot().await;
         let mut headers = HeaderMap::new();
         let accept_language = if self.identity.language.contains("zh") {
             "zh-CN"
@@ -263,10 +340,6 @@ impl ApiHooks {
     }
 }
 
-// ---------------------------------------------------------------------------
-// SigningMiddleware — decorates + signs each outgoing request
-// ---------------------------------------------------------------------------
-
 /// reqwest middleware that signs each outgoing request.
 ///
 /// It decorates the request with identity query params, base headers (UA,
@@ -284,14 +357,16 @@ impl SigningMiddleware {
         Self { hooks }
     }
 
-    fn decorate(&self, request: &mut Request) -> Result<()> {
+    async fn decorate(&self, request: &mut Request) -> Result<()> {
         {
             let mut query = request.url_mut().query_pairs_mut();
             for (key, value) in self.hooks.identity.query_pairs(Timestamp::now()) {
                 query.append_pair(key, &value);
             }
         }
-        request.headers_mut().extend(self.hooks.base_headers()?);
+        request
+            .headers_mut()
+            .extend(self.hooks.base_headers().await?);
         let body = request
             .body()
             .and_then(reqwest::Body::as_bytes)
@@ -332,36 +407,32 @@ impl Middleware for SigningMiddleware {
         &self, mut request: Request, extensions: &mut http::Extensions, next: Next<'_>,
     ) -> reqwest_middleware::Result<reqwest::Response> {
         self.decorate(&mut request)
+            .await
             .map_err(reqwest_middleware::Error::middleware)?;
         let response = next.run(request, extensions).await?;
         // Absorb any Set-Cookie mutations into the shared jar so later requests
         // (including ones to other hosts, e.g. the dot config call) carry them.
-        absorb_set_cookies(&self.hooks.cookies, response.headers());
+        self.hooks
+            .cookies
+            .merge(parse_set_cookies(response.headers()))
+            .await;
         Ok(response)
     }
 }
-
-// ---------------------------------------------------------------------------
-// ApiClient
-// ---------------------------------------------------------------------------
 
 #[derive(Clone)]
 pub struct ApiClient {
     base_url: Url,
     http: ClientWithMiddleware,
-    /// Snapshot of the request cookies, used to merge response `Set-Cookie`s
-    /// when building [`ResponseMeta`].
-    request_cookies: SessionCookies,
+    /// Shared cookie jar handle, snapshotted per request to build
+    /// [`ResponseMeta`].
+    cookies: CookieJar,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ApiClientOptions {
     pub outbound_interface: Option<String>,
 }
-
-// ---------------------------------------------------------------------------
-// Endpoint types — the addressable API servers
-// ---------------------------------------------------------------------------
 
 pub trait ApiEndpoint: Clone + Send + Sync {
     fn base_url(&self) -> &Url;
@@ -450,10 +521,6 @@ impl DotEndpoint {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Build the shared HTTP client (connection pool)
-// ---------------------------------------------------------------------------
-
 /// Build a `reqwest::Client` with optional outbound interface binding.
 ///
 /// The returned client is the shared connection pool — clone it (cheap; it is
@@ -470,10 +537,6 @@ pub fn build_http_client(options: &ApiClientOptions) -> Result<reqwest::Client> 
     builder.build().context(BuildHttpClientSnafu)
 }
 
-// ---------------------------------------------------------------------------
-// ApiClient — implementation
-// ---------------------------------------------------------------------------
-
 impl ApiClient {
     /// Build an `ApiClient` addressing `endpoint`, wrapping a clone of the
     /// shared connection `pool` with a [`SigningMiddleware`] carrying the
@@ -483,7 +546,7 @@ impl ApiClient {
         endpoint: &impl ApiEndpoint, pool: reqwest::Client, hooks: ApiHooks,
     ) -> Self {
         let base_url = endpoint.base_url().clone();
-        let request_cookies = hooks.cookies.lock().map(|jar| jar.clone()).unwrap_or_default();
+        let cookies = hooks.cookies.clone();
         let http = ClientBuilder::new(pool)
             .with(SigningMiddleware::new(hooks))
             .build();
@@ -491,7 +554,7 @@ impl ApiClient {
         Self {
             base_url,
             http,
-            request_cookies,
+            cookies,
         }
     }
 
@@ -522,47 +585,56 @@ impl ApiClient {
     where
         R: SendableRequest, {
         let url = endpoint_url(&self.base_url, request.path().as_ref())?;
-        let endpoint_query = request.query_pairs();
-        let body = request.body().context(EncodeSnafu)?;
-        let mut builder = self
-            .http
-            .request(R::METHOD, url)
-            .header(ACCEPT, "application/json");
-        if let Some(body) = body {
-            builder = builder.header(CONTENT_TYPE, "application/json").body(body);
-        }
-        let mut http_request = builder.build().context(BuildRequestSnafu)?;
-        {
-            let mut query = http_request.url_mut().query_pairs_mut();
-            for (key, value) in endpoint_query {
-                query.append_pair(key, &value);
+        // Span covering the whole request so signing/cookie logs and any error
+        // are grouped under the target method + host + path.
+        let span = tracing::debug_span!(
+            "api_request",
+            method = %R::METHOD,
+            host = url.host_str().unwrap_or("<unknown>"),
+            path = url.path(),
+        );
+        async move {
+            let endpoint_query = request.query_pairs();
+            let body = request.body().context(EncodeSnafu)?;
+            let mut builder = self
+                .http
+                .request(R::METHOD, url)
+                .header(ACCEPT, "application/json");
+            if let Some(body) = body {
+                builder = builder.header(CONTENT_TYPE, "application/json").body(body);
             }
-        }
-        // Request decoration + signing is performed by `SigningMiddleware`.
-        let response = self
-            .http
-            .execute(http_request)
-            .await
-            .map_err(map_middleware_error)?;
-
-        let meta = extract_response_meta(response.headers(), &self.request_cookies);
-
-        let status = response.status();
-        let bytes = response.bytes().await.context(RequestSnafu)?.to_vec();
-        if !status.is_success() {
-            return HttpStatusSnafu {
-                status,
-                content: response_content(&bytes),
+            let mut http_request = builder.build().context(BuildRequestSnafu)?;
+            {
+                let mut query = http_request.url_mut().query_pairs_mut();
+                for (key, value) in endpoint_query {
+                    query.append_pair(key, &value);
+                }
             }
-            .fail();
+            // Request decoration + signing is performed by `SigningMiddleware`.
+            let request_cookies = self.cookies.snapshot().await;
+            let response = self
+                .http
+                .execute(http_request)
+                .await
+                .map_err(map_middleware_error)?;
+
+            let meta = extract_response_meta(response.headers(), &request_cookies);
+
+            let status = response.status();
+            let bytes = response.bytes().await.context(RequestSnafu)?.to_vec();
+            if !status.is_success() {
+                return HttpStatusSnafu {
+                    status,
+                    content: response_content(&bytes),
+                }
+                .fail();
+            }
+            Ok((bytes, meta))
         }
-        Ok((bytes, meta))
+        .instrument(span)
+        .await
     }
 }
-
-// ---------------------------------------------------------------------------
-// VpnDot helpers (unchanged)
-// ---------------------------------------------------------------------------
 
 /// Android VPN mode ids carried on a dot's `mode` field and the requested
 /// connect mode (kept in sync with `rustylink_core::vpn::VpnConnectMode`).
@@ -645,10 +717,6 @@ impl VpnDot {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Free functions
-// ---------------------------------------------------------------------------
-
 fn parse_base_url(value: &str) -> Result<Url> {
     Url::parse(value).context(InvalidBaseUrlSnafu {
         value: value.to_string(),
@@ -721,12 +789,16 @@ fn device_cookie_header(cookies: &SessionCookies, identity: &ClientIdentity) -> 
         .map(|(name, value)| format!("{name}={value}"))
         .collect();
     parts.push(format!("device_id={}", identity.device_id));
-    parts.push(format!("device_name={}", device_name_cookie_value(identity)));
+    parts.push(format!(
+        "device_name={}",
+        device_name_cookie_value(identity)
+    ));
     parts.join("; ")
 }
 
 /// A cookie-safe device name derived from the identity model (spaces replaced),
-/// e.g. `"Pixel 8"` → `"Pixel-8"`. Falls back to `"rustylink"` when empty.
+/// e.g. `"Pixel 8"` → `"Pixel-8"`. Falls back to Android's `"unknow"` (the
+/// literal `CookieJarImpl` emits when the device name is unavailable).
 fn device_name_cookie_value(identity: &ClientIdentity) -> String {
     let name: String = identity
         .model
@@ -735,7 +807,7 @@ fn device_name_cookie_value(identity: &ClientIdentity) -> String {
         .filter(|c| !matches!(c, ';' | ',' | '='))
         .collect();
     if name.trim().is_empty() {
-        "rustylink".to_string()
+        "unknow".to_string()
     } else {
         name
     }
@@ -746,20 +818,11 @@ fn extract_response_meta(headers: &HeaderMap, request_cookies: &SessionCookies) 
     let mut cookies = request_cookies.clone();
     let mut any_cookie_changed = false;
     let mut csrf_token = None;
-    for value in &headers.get_all(SET_COOKIE) {
-        let Ok(raw) = value.to_str() else {
-            continue;
-        };
-        let Some((name, rest)) = raw.split_once('=') else {
-            continue;
-        };
-        let cookie_value = rest.split(';').next().unwrap_or_default();
-        let name = name.trim().to_string();
-        let cookie_value = cookie_value.trim().to_string();
+    for (name, value) in parse_set_cookies(headers) {
         if name == "csrf-token" {
-            csrf_token = Some(cookie_value.clone());
+            csrf_token = Some(value.clone());
         }
-        cookies.values.insert(name, cookie_value);
+        cookies.values.insert(name, value);
         any_cookie_changed = true;
     }
     let server_date = headers
@@ -767,11 +830,7 @@ fn extract_response_meta(headers: &HeaderMap, request_cookies: &SessionCookies) 
         .and_then(|v| v.to_str().ok())
         .map(ToOwned::to_owned);
     ResponseMeta {
-        cookies: if any_cookie_changed {
-            Some(cookies)
-        } else {
-            None
-        },
+        cookies: any_cookie_changed.then_some(cookies),
         csrf_token,
         server_date,
         is_force_logout: false,
@@ -791,33 +850,31 @@ fn response_content(bytes: &[u8]) -> String {
 }
 
 fn url_from_host_port(scheme: &str, host: &str, port: i32) -> Result<Url> {
-    if port <= 0 || port > i32::from(u16::MAX) {
-        return InvalidPortSnafu { port }.fail();
-    }
+    let port = u16::try_from(port)
+        .ok()
+        .filter(|port| *port != 0)
+        .context(InvalidPortSnafu { port })?;
     let host = host.trim();
     if host.is_empty() {
         return MissingVpnDotFieldSnafu { field: "host" }.fail();
     }
-    let mut url = match scheme {
-        "https" => Url::parse("https://placeholder.invalid/"),
-        "udp" => Url::parse("udp://placeholder.invalid/"),
-        _ => {
-            return Err(Error::InvalidBaseUrl {
-                value: scheme.to_string(),
-                source: url::ParseError::RelativeUrlWithoutBase,
-            });
-        }
-    }
-    .context(InvalidBaseUrlSnafu {
-        value: scheme.to_string(),
-    })?;
-    url.set_host(Some(host)).context(InvalidBaseUrlSnafu {
-        value: host.to_string(),
-    })?;
-    let port_u16 = u16::try_from(port).map_err(|_| Error::InvalidPort { port })?;
-    url.set_port(Some(port_u16))
-        .map_err(|()| Error::InvalidPort { port })?;
-    Ok(url)
+    // Build the authority structurally (bracketing bare IPv6 literals) and let
+    // the `http::Uri` builder validate the scheme/host/port instead of parsing
+    // a placeholder URL and mutating it.
+    let authority = if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    let uri = http::Uri::builder()
+        .scheme(scheme)
+        .authority(authority.as_str())
+        .path_and_query("/")
+        .build()
+        .context(BuildUriSnafu {
+            value: format!("{scheme}://{authority}/"),
+        })?;
+    parse_base_url(&uri.to_string())
 }
 
 #[cfg(test)]

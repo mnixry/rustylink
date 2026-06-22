@@ -4,9 +4,9 @@ pub mod models;
 pub mod signing;
 
 pub use client::{
-    ApiClient, ApiClientOptions, ApiEndpoint, ApiHooks, CookieJar, DEFAULT_MATCH_BASE_URL,
-    DotEndpoint, Error, MatchEndpoint, ResponseMeta, Result, SessionCookies, SigningMiddleware,
-    TenantEndpoint, build_http_client,
+    ApiClient, ApiClientOptions, ApiEndpoint, ApiHooks, CookieJar, CookieStore,
+    DEFAULT_MATCH_BASE_URL, DotEndpoint, Error, MatchEndpoint, ResponseMeta, Result,
+    SessionCookies, SigningMiddleware, TenantEndpoint, build_http_client,
 };
 pub use identity::ClientIdentity;
 pub use models::{

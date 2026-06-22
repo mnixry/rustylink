@@ -44,7 +44,7 @@ export function SetupScreen() {
     try {
       const client = createClient(MetaService, transport)
       const res = await client.ping({})
-      toast.success(`Connected to rustylinkd v${res.version}`)
+      toast.success(`Connected to daemon v${res.version}`)
       navigate("/", { replace: true })
     } catch (err) {
       clearToken()
@@ -60,11 +60,11 @@ export function SetupScreen() {
           <div className="bg-primary/10 text-primary mb-2 flex size-10 items-center justify-center rounded-lg">
             <PlugIcon className="size-5" weight="duotone" />
           </div>
-          <CardTitle>Connect to rustylinkd</CardTitle>
+          <CardTitle>Connect to the daemon</CardTitle>
           <CardDescription>
-            Paste the daemon access token. It is printed once on the daemon's
-            standard error output (or regenerate it with{" "}
-            <code className="font-mono text-xs">--rotate-token</code>).
+            Open the URL printed in the daemon's startup log — it carries the
+            access token. Otherwise paste the token below. A fresh token is
+            generated each time the daemon starts.
           </CardDescription>
         </CardHeader>
         <form onSubmit={onSubmit}>
@@ -75,7 +75,7 @@ export function SetupScreen() {
               type="password"
               autoComplete="off"
               autoFocus
-              placeholder="rustylinkd bearer token"
+              placeholder="daemon access token"
               {...register("token")}
             />
             {errors.token ? (

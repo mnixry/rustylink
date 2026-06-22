@@ -41,7 +41,8 @@ pub struct VpnSetting {
     pub admin_enable: Option<bool>,
     /// Tenant VPN domain. Dots are reached by IP but present a TLS cert valid
     /// for this domain; the client validates the cert against it.
-    /// (Android: `VpnSettingBean.vpn_domain`, used by the dot hostname verifier.)
+    /// (Android: `VpnSettingBean.vpn_domain`, used by the dot hostname
+    /// verifier.)
     pub vpn_domain: Option<String>,
     pub raw: Option<JsonObject>,
 }
@@ -184,7 +185,7 @@ impl_json_request!(VpnReportRequest, POST, "/vpn/report", BaseResponse<String>);
 #[repr(i32)]
 pub enum VpnReportType {
     /// Periodic keepalive while connected.
-    Connected = 100,
+    Connected    = 100,
     /// Sent once on disconnect / teardown.
     Disconnected = 101,
 }
@@ -229,8 +230,7 @@ pub struct VpnConnResponse {
 /// `optInt`, which coerces a string field to an integer.
 fn deserialize_flexible_opt_i32<'de, D>(deserializer: D) -> Result<Option<i32>, D::Error>
 where
-    D: serde::Deserializer<'de>,
-{
+    D: serde::Deserializer<'de>, {
     use serde::Deserialize as _;
     match Option::<serde_json::Value>::deserialize(deserializer)? {
         Some(serde_json::Value::Number(number)) => {
@@ -246,8 +246,7 @@ where
 /// client's `optString`, which yields an empty/absent value for non-strings.
 fn deserialize_flexible_opt_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
-    D: serde::Deserializer<'de>,
-{
+    D: serde::Deserializer<'de>, {
     use serde::Deserialize as _;
     match Option::<serde_json::Value>::deserialize(deserializer)? {
         Some(serde_json::Value::String(text)) => Ok(Some(text)),

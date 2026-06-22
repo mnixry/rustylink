@@ -40,10 +40,6 @@ use crate::{
     supervisor::{self, SupervisorOutcome},
 };
 
-// ---------------------------------------------------------------------------
-// DaemonInner — serialised inner state
-// ---------------------------------------------------------------------------
-
 /// The serialised inner state owned by the daemon.
 pub struct DaemonInner {
     /// Statig auth state machine.
@@ -61,10 +57,6 @@ pub struct DaemonInner {
     /// Handle to the active connect/supervise background task.
     pub(crate) tunnel_task: Option<JoinHandle<()>>,
 }
-
-// ---------------------------------------------------------------------------
-// Daemon — Clone-able handle
-// ---------------------------------------------------------------------------
 
 /// Cloneable handle to the daemon core.
 #[derive(Clone)]
@@ -103,7 +95,7 @@ impl Daemon {
                 identity,
                 tenant: None,
                 signing: None,
-                cookies: Arc::new(std::sync::Mutex::new(rustylink_api::SessionCookies::default())),
+                cookies: rustylink_api::CookieStore::empty(),
                 csrf_token: None,
                 knock_token: None,
                 totp: None,
@@ -160,25 +152,42 @@ impl Daemon {
             .flatten()
     }
 
-    // -----------------------------------------------------------------------
-    // Persistence helpers
-    // -----------------------------------------------------------------------
-
-    /// Persist current auth credentials to disk.  Only saves when in the
-    /// `Authenticated` state (the machine can produce credentials).
+    /// Persist current auth credentials to disk.  Only saves an authenticated
+    /// session (the machine can produce a complete, restorable snapshot).
     pub async fn persist_credentials(&self) {
         let inner = self.inner.lock().await;
+        if !matches!(inner.auth.state(), State::Authenticated {}) {
+            return;
+        }
         let vpn_request = inner
             .vpn
             .as_ref()
             .and_then(VpnMachine::current_persisted_request);
-        if let Some(creds) = inner.auth.to_credentials_with_vpn(vpn_request) {
+        if let Some(creds) = inner.auth.to_credentials_with_vpn(vpn_request).await {
             let path = inner.credential_path.clone();
             drop(inner);
             if let Err(error) = creds.save(&path).await {
                 tracing::warn!(%error, "failed to persist credentials");
             }
         }
+    }
+
+    /// Install a hook so the shared cookie jar persists the session whenever it
+    /// absorbs a change (e.g. a refreshed `vpn-token`), without an explicit
+    /// save call. Persistence is deferred to a task so it never re-enters a
+    /// held lock.
+    pub async fn install_cookie_persist_listener(&self) {
+        let jar = {
+            let inner = self.inner.lock().await;
+            inner.auth.cookies.clone()
+        };
+        let daemon = self.clone();
+        jar.set_listener(Arc::new(move || {
+            let daemon = daemon.clone();
+            tokio::spawn(async move {
+                daemon.persist_credentials().await;
+            });
+        }));
     }
 
     /// Delete the credentials file (on logout / session expiry).
@@ -203,10 +212,6 @@ impl Daemon {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Auth helpers
-    // -----------------------------------------------------------------------
-
     /// Check that the auth machine is at least configured.
     pub(crate) async fn require_configured(&self) -> Result<()> {
         let inner = self.inner.lock().await;
@@ -224,10 +229,6 @@ impl Daemon {
             _ => Err(RpcFault::NotAuthenticated.into()),
         }
     }
-
-    // -----------------------------------------------------------------------
-    // Tunnel connect / disconnect
-    // -----------------------------------------------------------------------
 
     /// Restore the auth session state from credentials loaded at startup.
     ///
@@ -250,7 +251,7 @@ impl Daemon {
                 return;
             }
             // Restore from the credentials' last_vpn_request.
-            let Some(creds) = inner.auth.to_credentials() else {
+            let Some(creds) = inner.auth.to_credentials().await else {
                 return;
             };
             drop(inner);
@@ -350,10 +351,6 @@ impl Daemon {
         drop(inner);
         Ok(tunnel)
     }
-
-    // -----------------------------------------------------------------------
-    // Connect/supervise background loop + helpers
-    // -----------------------------------------------------------------------
 
     async fn run_connect_loop(self, request: VpnRequest, cancel: CancellationToken) {
         let mut controller =
@@ -508,9 +505,12 @@ impl Daemon {
         &self, config_result: &VpnConfigResult, data: &VpnConnResponse,
         local_params: &LocalTunnelParams,
     ) -> Result<TunnelSession> {
-        let outbound_iface = {
+        let (outbound_iface, tun_interface) = {
             let inner = self.inner.lock().await;
-            inner.config.outbound_interface.clone()
+            (
+                inner.config.outbound_interface.clone(),
+                inner.config.tun_interface.clone(),
+            )
         };
 
         let mut tunnel_config = TunnelConfig::from_vpn_conn(
@@ -527,6 +527,10 @@ impl Daemon {
             .build()
         })?;
         tunnel_config.outbound_interface = outbound_iface;
+        // Override the default TUN device name when one is configured.
+        if let Some(name) = tun_interface.filter(|name| !name.trim().is_empty()) {
+            tunnel_config.interface_name = name;
+        }
 
         let mut session = TunnelSession::new(tunnel_config);
         session.start().await.map_err(|error| {
@@ -681,10 +685,6 @@ impl Daemon {
     }
 }
 
-// ---------------------------------------------------------------------------
-// DaemonConfig → ClientIdentity conversion
-// ---------------------------------------------------------------------------
-
 impl DaemonConfig {
     /// Build a [`ClientIdentity`] from the daemon config.
     ///
@@ -748,14 +748,11 @@ impl DaemonConfig {
             outbound_interface: outbound.into(),
             dns_interface: dns.into(),
             auto_reconnect_on_start: self.auto_reconnect,
+            tun_interface: self.tun_interface.clone(),
             ..Default::default()
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Projection helpers (shared across services)
-// ---------------------------------------------------------------------------
 
 /// Build the API client for a dot's config call.
 ///
@@ -899,26 +896,24 @@ mod tests {
         // The tenant client and every dot client share this machine's live
         // cookie jar, so Set-Cookie mutations propagate automatically.
         let hooks = machine.build_hooks();
-        let snapshot = |label: &str| {
-            if let Ok(jar) = hooks.cookies.lock() {
-                eprintln!("{label}: {:?}", jar.values.keys().collect::<Vec<_>>());
-            }
+        let snapshot = |label: &str, jar: rustylink_api::SessionCookies| {
+            eprintln!("{label}: {:?}", jar.values.keys().collect::<Vec<_>>());
         };
-        snapshot("initial cookies");
+        snapshot("initial cookies", hooks.cookies.snapshot().await);
 
         // Authenticated tenant APIs — confirm the session is valid; the shared
         // jar absorbs any Set-Cookie mutations (e.g. open-time, vpn-token).
         let (setting, _) = rustylink_core::vpn::vpn_setting(&client)
             .await
             .expect("vpn setting");
-        snapshot("after /api/setting");
+        snapshot("after /api/setting", hooks.cookies.snapshot().await);
         let vpn_domain = setting.data.and_then(|s| s.vpn_domain);
         eprintln!("vpn_domain = {vpn_domain:?}");
 
         let (locations, _) = rustylink_core::vpn::vpn_locations(&client)
             .await
             .expect("vpn locations");
-        snapshot("after /api/vpn/list");
+        snapshot("after /api/vpn/list", hooks.cookies.snapshot().await);
         let dots = locations.data.unwrap_or_default();
         eprintln!("dots = {}", dots.len());
 
@@ -931,8 +926,7 @@ mod tests {
             let Ok(endpoint) = rustylink_api::DotEndpoint::from_dot(dot, use_vpn_ip) else {
                 continue;
             };
-            let dot_client =
-                build_dot_api_client(&endpoint, &pool, &hooks, vpn_domain.as_deref());
+            let dot_client = build_dot_api_client(&endpoint, &pool, &hooks, vpn_domain.as_deref());
             let body = VpnConnRequest {
                 mode: Some("Full".to_owned()),
                 public_key: rustylink_tunnel::LocalTunnelParams::generate().local_public_key,

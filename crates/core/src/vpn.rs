@@ -256,8 +256,7 @@ pub async fn vpn_config_from_dot_list<RankFut>(
     rank_dots: impl FnOnce(Vec<VpnDot>) -> RankFut,
 ) -> Result<VpnConfigResult>
 where
-    RankFut: std::future::Future<Output = Vec<VpnDot>>,
-{
+    RankFut: std::future::Future<Output = Vec<VpnDot>>, {
     let (locations, _list_meta) = GetVpnLocationsRequest
         .send_with_meta(tenant_client)
         .await

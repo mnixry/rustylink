@@ -17,12 +17,6 @@ use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use tokio::io::AsyncWriteExt as _;
 
-use crate::token;
-
-// ---------------------------------------------------------------------------
-// Error
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
 pub enum Error {
@@ -58,39 +52,33 @@ pub enum Error {
         path: PathBuf,
         source: std::io::Error,
     },
-
-    #[snafu(display("failed to generate initial token hash"))]
-    TokenHash,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-// ---------------------------------------------------------------------------
-// DaemonConfig (config.json) — survives logout
-// ---------------------------------------------------------------------------
-
 /// Daemon-local configuration persisted in `config.json`.
 ///
-/// Contains the bearer-token hash, device identity overrides, and
-/// runtime preferences.  This file survives logout and session expiry.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// Holds device identity overrides and runtime preferences. The bearer token
+/// is generated fresh each run and never stored here. This file survives logout
+/// and session expiry.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DaemonConfig {
-    /// Argon2 hash of the bearer token (the plaintext is shown once at first
-    /// run and never stored).
-    pub token_hash: String,
     /// Device identity overrides — a subset of what [`ClientIdentity`] carries.
     pub identity: DeviceIdentityConfig,
     /// Bind outbound HTTP/tunnel sockets to a specific interface.
     pub outbound_interface: Option<String>,
     /// Bind DNS resolver sockets to a specific interface.
     pub dns_interface: Option<String>,
+    /// Name of the TUN device to create (empty/unset = platform default).
+    pub tun_interface: Option<String>,
     /// Whether to automatically reconnect the VPN tunnel on daemon start.
     pub auto_reconnect: bool,
 }
 
 /// The persisted device identity.
 ///
-/// A complete identity (after [`ensure_full`](DeviceIdentityConfig::ensure_full))
+/// A complete identity (after
+/// [`ensure_full`](DeviceIdentityConfig::ensure_full))
 /// mirrors [`ClientIdentity`](rustylink_api::ClientIdentity). Optional fields
 /// left unset are merged from the built-in Android-profile default on load.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -104,13 +92,13 @@ pub struct DeviceIdentityConfig {
     pub os_version: Option<String>,
     /// App version (e.g. `"3.2.16"`).
     pub app_version: Option<String>,
-    /// Device brand (e.g. `"Google"`).
+    /// Device brand (e.g. `"google"`).
     pub brand: Option<String>,
     /// Device model (e.g. `"Pixel 8"`).
     pub model: Option<String>,
     /// Build number (e.g. `"2008"`).
     pub build_number: Option<String>,
-    /// OS security-patch date (e.g. `"2026-01-01"`).
+    /// OS security-patch date (e.g. `"2025-05-05"`).
     pub os_version_patch: Option<String>,
     /// Client source identifier (e.g. `"FeiLian"`).
     pub client_source: Option<String>,
@@ -138,7 +126,11 @@ impl DeviceIdentityConfig {
                 &self.user_agent,
             ]
             .into_iter()
-            .all(|field| field.as_deref().is_some_and(|value| !value.trim().is_empty()))
+            .all(|field| {
+                field
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+            })
     }
 
     /// Ensure every field is populated by merging a freshly-generated full
@@ -175,23 +167,6 @@ fn merge_field(slot: &mut Option<String>, default: String) {
     }
 }
 
-impl Default for DaemonConfig {
-    fn default() -> Self {
-        let plain_token = token::generate_token();
-        let token_hash = token::hash_token(&plain_token).unwrap_or_default();
-
-        Self {
-            token_hash,
-            // Identity is completed by `DeviceIdentityConfig::ensure_full` on
-            // load, which generates the device id and merges the full profile.
-            identity: DeviceIdentityConfig::default(),
-            outbound_interface: None,
-            dns_interface: None,
-            auto_reconnect: false,
-        }
-    }
-}
-
 impl DaemonConfig {
     /// Load from `path`, returning `Default` if the file does not exist.
     pub async fn load_or_default(path: &Path) -> Result<Self> {
@@ -213,10 +188,6 @@ impl DaemonConfig {
         atomic_write(path, &data).await
     }
 }
-
-// ---------------------------------------------------------------------------
-// PersistedCredentials (credentials.json) — deleted on logout / expiry
-// ---------------------------------------------------------------------------
 
 /// Tenant configuration (part of credentials).
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -340,10 +311,6 @@ impl PersistedCredentials {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Private helpers
-// ---------------------------------------------------------------------------
 
 /// Atomically write `data` to `path`:
 ///

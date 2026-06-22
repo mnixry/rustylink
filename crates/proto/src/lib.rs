@@ -48,4 +48,3 @@ mod tests {
         assert_eq!(LoginCodeType::from("sms"), LoginCodeType::Mobile);
     }
 }
-

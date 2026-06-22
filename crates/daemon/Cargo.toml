@@ -18,7 +18,6 @@ rustylink-core.path   = "../core"
 rustylink-proto.path  = "../proto"
 rustylink-tunnel.path = "../tunnel"
 
-argon2.workspace                = true
 axum.workspace                  = true
 buffa.workspace                 = true
 buffa-types.workspace           = true

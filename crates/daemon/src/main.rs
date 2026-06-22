@@ -1,4 +1,4 @@
-//! `rustylinkd` — the Rustylink Connect RPC daemon.
+//! The `rustylinkd` Connect RPC daemon.
 //!
 //! Owns auth state (statig), VPN state, and config; persists them as JSON.
 //! Serves a Connect + gRPC + gRPC-Web endpoint under the `/api` path prefix,
@@ -10,7 +10,6 @@
 //!   - `VpnService`   — VPN tunnel connect/disconnect/watch
 //!   - `MetaService`   — ping, user info, configuration
 
-mod auth_layer;
 mod daemon;
 mod error;
 mod latency;
@@ -22,7 +21,11 @@ mod static_assets;
 mod supervisor;
 mod token;
 
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::PathBuf,
+    sync::Arc,
+};
 
 use clap::Parser;
 use connectrpc::Router as ConnectRouter;
@@ -40,30 +43,21 @@ use tower_http::{
 use tracing_subscriber::{EnvFilter, fmt};
 
 use crate::{
-    auth_layer::AuthState,
     daemon::Daemon,
     persist::{DaemonConfig, PersistedCredentials},
     service::{auth::AuthServiceImpl, meta::MetaServiceImpl, vpn::VpnServiceImpl},
 };
 
 #[derive(Debug, Parser)]
-#[command(name = "rustylinkd", version, about = "Rustylink Connect RPC daemon")]
+#[command(version, about = "CorpLink VPN daemon")]
 struct Args {
-    /// Path to the daemon configuration file.
-    #[arg(long, env = "RUSTYLINKD_CONFIG_PATH")]
-    config_path: Option<PathBuf>,
-
-    /// Path to the credentials file.
-    #[arg(long, env = "RUSTYLINKD_CREDENTIAL_PATH")]
-    credential_path: Option<PathBuf>,
+    /// Directory holding `config.json` and `credentials.json`.
+    #[arg(long, env = "RUSTYLINKD_CONFIG_DIR")]
+    config_dir: Option<PathBuf>,
 
     /// Address to bind the Connect RPC server.
     #[arg(long, default_value = "127.0.0.1:7878")]
     listen: SocketAddr,
-
-    /// Regenerate the bearer token (clears + reprints).
-    #[arg(long)]
-    rotate_token: bool,
 }
 
 #[snafu::report]
@@ -78,15 +72,17 @@ async fn main() -> Result<(), InitError> {
         .with_writer(std::io::stderr)
         .init();
 
-    let config_path = args.config_path.unwrap_or_else(default_config_path);
-    let credential_path = args.credential_path.unwrap_or_else(default_credential_path);
+    let config_dir = args.config_dir.unwrap_or_else(default_config_dir);
+    let config_path = config_dir.join("config.json");
+    let credential_path = config_dir.join("credentials.json");
 
     tracing::info!(path = %config_path.display(), "loading daemon config");
-    let mut config = DaemonConfig::load_or_default(&config_path)
-        .await
-        .context(LoadConfigSnafu {
-            path: config_path.clone(),
-        })?;
+    let mut config =
+        DaemonConfig::load_or_default(&config_path)
+            .await
+            .context(LoadConfigSnafu {
+                path: config_path.clone(),
+            })?;
 
     // Complete the persisted device identity: generate a full one (with a
     // device id) on first run, or merge missing fields into a partial one,
@@ -94,21 +90,26 @@ async fn main() -> Result<(), InitError> {
     if config.identity.ensure_full() {
         tracing::info!("completed device identity in daemon config");
     }
-
-    // Ensure a bearer token exists (first run or rotation).
-    let token_hash = ensure_token(&mut config, args.rotate_token)?;
     config.save(&config_path).await.context(SaveConfigSnafu {
         path: config_path.clone(),
     })?;
 
+    // A fresh access token is generated each run and never persisted; the
+    // access URLs below carry it as a `?token=` query the UI captures.
+    let token = token::generate_token();
+
     tracing::info!(path = %credential_path.display(), "loading credentials");
-    let credentials = PersistedCredentials::load(&credential_path)
-        .await
-        .context(LoadCredentialsSnafu {
-            path: credential_path.clone(),
-        })?;
+    let credentials =
+        PersistedCredentials::load(&credential_path)
+            .await
+            .context(LoadCredentialsSnafu {
+                path: credential_path.clone(),
+            })?;
 
     let daemon = Daemon::new(config, config_path, credential_path, credentials);
+
+    // Persist refreshed session cookies as the shared jar absorbs them.
+    daemon.install_cookie_persist_listener().await;
 
     // Recognise a restored, previously-authenticated session before anything
     // queries the auth state (otherwise it stays Unconfigured).
@@ -129,16 +130,19 @@ async fn main() -> Result<(), InitError> {
     let router = Arc::new(vpn_svc).register(router);
     let router = Arc::new(meta_svc).register(router);
 
-    let auth = AuthState::new(token_hash);
-
     // The Connect RPC surface, guarded by CORS + bearer auth, mounted under
     // `/api` (the prefix is stripped before the Connect service, so wire paths
     // stay `/rustylink.daemon.v1.<Service>/<Method>`). Auth applies ONLY here —
-    // static UI assets must load without a token so the user can enter it.
+    // static UI assets must load without a token so the `?token=` capture works.
+    //
+    // tower-http deprecates `bearer` as "too basic" for general web apps, but a
+    // static, per-run token compared against one `Authorization: Bearer` header
+    // is exactly what this local daemon needs.
+    #[allow(deprecated)]
     let api = router.into_axum_router().layer(
         ServiceBuilder::new()
             .layer(CorsLayer::new())
-            .layer(ValidateRequestHeaderLayer::custom(auth)),
+            .layer(ValidateRequestHeaderLayer::bearer(&token)),
     );
 
     let app = axum::Router::new().nest("/api", api);
@@ -174,46 +178,50 @@ async fn main() -> Result<(), InitError> {
 
     let listener = tokio::net::TcpListener::bind(args.listen)
         .await
-        .context(BindListenerSnafu { listen: args.listen })?;
-    tracing::info!(addr = %args.listen, "rustylinkd listening");
+        .context(BindListenerSnafu {
+            listen: args.listen,
+        })?;
+    tracing::info!(addr = %args.listen, "daemon listening");
+    for url in access_urls(args.listen, &token) {
+        tracing::info!("open the web UI at {url}");
+    }
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context(ServeSnafu)?;
 
-    tracing::info!("rustylinkd shut down cleanly");
+    tracing::info!("shutdown complete");
     Ok(())
 }
 
-/// Ensure a bearer token exists, returning its argon2 hash.  On first run or
-/// `--rotate-token` a fresh token is generated, printed once to stderr, and its
-/// hash stored in `config`; otherwise the existing hash is returned unchanged.
-fn ensure_token(config: &mut DaemonConfig, rotate: bool) -> Result<String, InitError> {
-    if !config.token_hash.is_empty() && !rotate {
-        return Ok(config.token_hash.clone());
+/// Build the `http://<host>:<port>/?token=<token>` URLs the UI can be opened
+/// with. When the listen address is unspecified (e.g. `0.0.0.0`), every
+/// non-loopback interface address is listed alongside localhost; otherwise only
+/// the configured address is shown.
+fn access_urls(listen: SocketAddr, token: &str) -> Vec<String> {
+    let port = listen.port();
+    let mut hosts: Vec<IpAddr> = Vec::new();
+    if listen.ip().is_unspecified() {
+        hosts.push(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        for interface in default_net::get_interfaces() {
+            if interface.is_loopback() {
+                continue;
+            }
+            hosts.extend(interface.ipv4.into_iter().map(|net| IpAddr::V4(net.addr)));
+        }
+    } else {
+        hosts.push(listen.ip());
     }
-    let plain_token = token::generate_token();
-    let hash = token::hash_token(&plain_token).context(HashTokenSnafu)?;
-    config.token_hash.clone_from(&hash);
-    eprintln!("─────────────────────────────────────────────────────────────");
-    eprintln!("  rustylinkd bearer token (shown once — store it securely):");
-    eprintln!("    {plain_token}");
-    eprintln!("─────────────────────────────────────────────────────────────");
-    Ok(hash)
+    hosts
+        .into_iter()
+        .map(|host| format!("http://{}/?token={token}", SocketAddr::new(host, port)))
+        .collect()
 }
 
-fn default_config_path() -> PathBuf {
+fn default_config_dir() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("rustylink")
-        .join("config.json")
-}
-
-fn default_credential_path() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("rustylink")
-        .join("credentials.json")
 }
 
 /// Resolve when SIGINT or SIGTERM is received.
@@ -261,9 +269,6 @@ enum InitError {
         path: PathBuf,
         source: persist::Error,
     },
-
-    #[snafu(display("failed to hash the generated bearer token"))]
-    HashToken,
 
     #[snafu(display("failed to bind the RPC listener to {listen}: {source}"))]
     BindListener {

@@ -125,6 +125,13 @@ impl MetaService for MetaServiceImpl {
             if let Some(name) = dns_name {
                 inner.config.dns_interface = name;
             }
+            // Only touch `tun_interface` when the field is present in the
+            // (partial) update; an empty string clears it to the platform
+            // default.
+            if let Some(tun) = config.tun_interface.as_deref() {
+                let tun = tun.trim();
+                inner.config.tun_interface = (!tun.is_empty()).then(|| tun.to_owned());
+            }
         }
 
         self.daemon.persist_config().await;

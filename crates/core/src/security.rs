@@ -1,5 +1,5 @@
 use rustylink_api::{
-    ApiClient, BaseResponse, ResponseMeta, SecurityReportItem, SecurityReportRequest,
+    ApiClient, BaseResponse, JsonObject, ResponseMeta, SecurityReportItem, SecurityReportRequest,
     SendableRequest,
 };
 use snafu::prelude::*;
@@ -27,22 +27,30 @@ pub async fn report_security(
     Ok((response, meta))
 }
 
+/// Build the "all safe" device security report.
+///
+/// Byte-for-byte matches the Android `SecurityConfigViewModel.reportResult`
+/// wire shape: one item per check (level 0 = safe), with the per-key `data`
+/// objects the app attaches — `network` carries the (empty, no-proxy) HTTP
+/// proxy info, and `debug_off`/`debug_on` carry the battery/USB charging status
+/// (`-1` = not USB-charging). The top-level object contains only `items`.
 #[must_use]
 pub fn all_green_security_report() -> SecurityReportRequest {
     let items = [
-        "root",
-        "certificate",
-        "wifi",
-        "wifi_wep",
-        "network",
-        "password",
-        "lock_image",
-        "debug_off",
-        "debug_on",
+        ("root", None),
+        ("certificate", None),
+        ("wifi", None),
+        ("wifi_wep", None),
+        // No system proxy → the app emits `data: {}` for `network`.
+        ("network", Some(JsonObject::new())),
+        ("password", None),
+        ("lock_image", None),
+        ("debug_off", Some(usb_status_data())),
+        ("debug_on", Some(usb_status_data())),
     ]
     .into_iter()
-    .map(|key| SecurityReportItem {
-        data: None,
+    .map(|(key, data)| SecurityReportItem {
+        data,
         key: key.to_string(),
         level: 0,
     })
@@ -55,6 +63,14 @@ pub fn all_green_security_report() -> SecurityReportRequest {
     }
 }
 
+/// `data: { "usbStatus": -1 }` — the value `zd1.t` returns when the device is
+/// not charging over USB (the expected state for a headless client).
+fn usb_status_data() -> JsonObject {
+    let mut data = JsonObject::new();
+    data.insert("usbStatus".to_string(), serde_json::Value::from(-1));
+    data
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -62,29 +78,9 @@ mod tests {
     #[test]
     fn green_report_matches_android_all_safe_wire_shape() {
         let report = all_green_security_report();
-        let items = report
-            .items
-            .iter()
-            .map(|item| (item.key.as_str(), item.level, item.data.is_none()))
-            .collect::<Vec<_>>();
 
         assert_eq!(report.status, None);
         assert_eq!(report.raw, None);
-        assert_eq!(
-            items,
-            [
-                ("root", 0, true),
-                ("certificate", 0, true),
-                ("wifi", 0, true),
-                ("wifi_wep", 0, true),
-                ("network", 0, true),
-                ("password", 0, true),
-                ("lock_image", 0, true),
-                ("debug_off", 0, true),
-                ("debug_on", 0, true),
-            ]
-        );
-
         let serialized = serde_json::to_value(&report).expect("serialize report");
         assert_eq!(
             serialized,
@@ -94,11 +90,11 @@ mod tests {
                     { "key": "certificate", "level": 0 },
                     { "key": "wifi", "level": 0 },
                     { "key": "wifi_wep", "level": 0 },
-                    { "key": "network", "level": 0 },
+                    { "key": "network", "level": 0, "data": {} },
                     { "key": "password", "level": 0 },
                     { "key": "lock_image", "level": 0 },
-                    { "key": "debug_off", "level": 0 },
-                    { "key": "debug_on", "level": 0 },
+                    { "key": "debug_off", "level": 0, "data": { "usbStatus": -1 } },
+                    { "key": "debug_on", "level": 0, "data": { "usbStatus": -1 } },
                 ]
             })
         );

@@ -1,6 +1,26 @@
+use std::sync::LazyLock;
+
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+static DEFAULT_DEVICE_ID: LazyLock<String> = LazyLock::new(|| {
+    let machine_uid = match machine_uid::get() {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "failed to read machine UID; using deterministic fallback device id"
+            );
+            String::new()
+        }
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(b"device-id-v1");
+    hasher.update(machine_uid.trim().as_bytes());
+    let digest = hex::encode(hasher.finalize());
+    digest[..32].to_string()
+});
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ClientIdentity {
@@ -16,21 +36,28 @@ pub struct ClientIdentity {
     pub language: String,
     pub user_agent: String,
 }
+
 impl Default for ClientIdentity {
     fn default() -> Self {
-        let device_id = stable_device_id();
+        // Values for a real Android build (Pixel 8, Android 15 / API 35). The
+        // query params mirror the app's `DeviceUtils` map (`os` = "Android",
+        // `os_version` = `Build.VERSION.SDK`, `brand` = `Build.BRAND`,
+        // `build_number` is the hardcoded "2008", `os_version_patch` =
+        // `Build.VERSION.SECURITY_PATCH`). The User-Agent mirrors
+        // `TopGoApplication`: `CorpLink/<ver> (<BRAND><MODEL>; Android
+        // <release>; <language>)`.
         Self {
             os: "Android".to_string(),
             os_version: "35".to_string(),
             app_version: "3.2.16".to_string(),
-            brand: "Google".to_string(),
+            brand: "google".to_string(),
             model: "Pixel 8".to_string(),
-            device_id,
+            device_id: DEFAULT_DEVICE_ID.clone(),
             build_number: "2008".to_string(),
-            os_version_patch: "2026-01-01".to_string(),
+            os_version_patch: "2025-05-05".to_string(),
             client_source: "FeiLian".to_string(),
             language: "en".to_string(),
-            user_agent: "CorpLink/3.2.16 (Android; Rustylink)".to_string(),
+            user_agent: "CorpLink/3.2.16 (googlePixel 8; Android 15; en)".to_string(),
         }
     }
 }
@@ -51,22 +78,4 @@ impl ClientIdentity {
             ("client_source", self.client_source.clone()),
         ]
     }
-}
-
-fn stable_device_id() -> String {
-    let machine_uid = match machine_uid::get() {
-        Ok(value) => value,
-        Err(error) => {
-            tracing::warn!(
-                %error,
-                "failed to read machine UID; using deterministic fallback device id"
-            );
-            String::new()
-        }
-    };
-    let mut hasher = Sha256::new();
-    hasher.update(b"device-id-v1");
-    hasher.update(machine_uid.trim().as_bytes());
-    let digest = hex::encode(hasher.finalize());
-    digest[..32].to_string()
 }

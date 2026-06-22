@@ -18,14 +18,14 @@
 //! state.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
 
 use jiff::Timestamp;
 use rustylink_api::{
-    ApiClient, ApiHooks, ClientIdentity, CookieJar, LoginV2Result, MatchEndpoint, ResponseMeta,
-    SessionCookies, SigningConfig, SigningContext, TenantEndpoint,
+    ApiClient, ApiHooks, ClientIdentity, CookieJar, CookieStore, LoginV2Result, MatchEndpoint,
+    ResponseMeta, SigningConfig, SigningContext, TenantEndpoint,
 };
 use rustylink_core::vpn::VpnConnectMode;
+use rustylink_core::auth::LoginStep;
 use rustylink_proto::proto::rustylink::daemon::v1 as pb;
 use rustylink_tunnel::TunnelSession;
 use statig::prelude::*;
@@ -55,10 +55,6 @@ pub struct DeviceLoginPending {
     pub alias_key: String,
     pub poll_token: String,
 }
-
-// =========================================================================
-// `AuthMachine` — statig-based auth state machine
-// =========================================================================
 
 /// Shared storage for the auth state machine.
 ///
@@ -93,10 +89,6 @@ pub struct AuthMachine {
     /// `handle()`).  Cleared at the start of each handler invocation.
     pub(crate) last_error: Option<String>,
 }
-
-// ---------------------------------------------------------------------------
-// Auth events
-// ---------------------------------------------------------------------------
 
 /// Events consumed by the auth state machine.
 #[derive(Debug)]
@@ -188,10 +180,6 @@ pub enum AuthEvent {
     RestoreSession,
 }
 
-// ---------------------------------------------------------------------------
-// statig state machine — AuthMachine
-// ---------------------------------------------------------------------------
-
 #[state_machine(initial = "State::unconfigured()")]
 impl AuthMachine {
     // ----- Unconfigured -----
@@ -214,8 +202,8 @@ impl AuthMachine {
                 )
                 .await
             }
-            AuthEvent::RestoreSession => self.handle_restore_session(),
-            other => self.handle_passthrough(other),
+            AuthEvent::RestoreSession => self.handle_restore_session().await,
+            other => self.handle_passthrough(other).await,
         }
     }
 
@@ -264,7 +252,7 @@ impl AuthMachine {
             AuthEvent::StartDeviceLogin { alias_key } => {
                 self.handle_start_device_login(alias_key).await
             }
-            other => self.handle_passthrough(other),
+            other => self.handle_passthrough(other).await,
         }
     }
 
@@ -297,7 +285,7 @@ impl AuthMachine {
                     .await
             }
             AuthEvent::Logout { logout_all } => self.handle_logout(*logout_all).await,
-            other => self.handle_passthrough(other),
+            other => self.handle_passthrough(other).await,
         }
     }
 
@@ -340,7 +328,7 @@ impl AuthMachine {
                 self.handle_skip_challenge(login_scene).await
             }
             AuthEvent::Logout { logout_all } => self.handle_logout(*logout_all).await,
-            other => self.handle_passthrough(other),
+            other => self.handle_passthrough(other).await,
         }
     }
 
@@ -363,7 +351,7 @@ impl AuthMachine {
                 self.oauth_pending = None;
                 self.handle_logout(*logout_all).await
             }
-            other => self.handle_passthrough(other),
+            other => self.handle_passthrough(other).await,
         }
     }
 
@@ -386,7 +374,7 @@ impl AuthMachine {
                 self.device_login_pending = None;
                 self.handle_logout(*logout_all).await
             }
-            other => self.handle_passthrough(other),
+            other => self.handle_passthrough(other).await,
         }
     }
 
@@ -412,29 +400,21 @@ impl AuthMachine {
                 )
                 .await
             }
-            other => self.handle_passthrough(other),
+            other => self.handle_passthrough(other).await,
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// AuthMachine — event handler helpers (called from state handlers)
-// ---------------------------------------------------------------------------
-
 impl AuthMachine {
     /// Handle passthrough (side-effect) events that are valid in every state.
     /// These update shared storage without causing state transitions.
-    fn handle_passthrough(&mut self, event: &AuthEvent) -> Response<State> {
+    async fn handle_passthrough(&mut self, event: &AuthEvent) -> Response<State> {
         match event {
             AuthEvent::MergeResponseMeta {
                 cookies,
                 csrf_token,
             } => {
-                if let Ok(mut jar) = self.cookies.lock() {
-                    for (name, value) in cookies {
-                        jar.values.insert(name.clone(), value.clone());
-                    }
-                }
+                self.cookies.merge(cookies.clone()).await;
                 if let Some(csrf) = csrf_token {
                     self.csrf_token = Some(csrf.clone());
                 }
@@ -458,15 +438,11 @@ impl AuthMachine {
     /// restored machine with a tenant + session cookies transitions to
     /// `Authenticated`; a tenant without cookies falls back to `Configured`;
     /// with no tenant it stays `Unconfigured`.
-    fn handle_restore_session(&self) -> Response<State> {
+    async fn handle_restore_session(&self) -> Response<State> {
         if self.tenant.is_none() {
             return Handled;
         }
-        if self
-            .cookies
-            .lock()
-            .map_or(true, |jar| jar.values.is_empty())
-        {
+        if self.cookies.is_empty().await {
             return Transition(State::configured());
         }
         Transition(State::authenticated())
@@ -479,7 +455,7 @@ impl AuthMachine {
         let match_client = self.build_match_client(match_base_url);
         match rustylink_core::auth::activate(&match_client, code).await {
             Ok((response, meta)) => {
-                self.merge_meta(&meta);
+                self.merge_meta(&meta).await;
                 if let Some(data) = &response.data {
                     let update = rustylink_core::auth::extract_activation_update(data);
                     self.tenant = Some(TenantConfig {
@@ -536,7 +512,7 @@ impl AuthMachine {
         };
         match result {
             Ok((response, meta)) => {
-                self.merge_meta(&meta);
+                self.merge_meta(&meta).await;
                 route_login_next(response.data.as_ref())
             }
             Err(error) => {
@@ -574,7 +550,7 @@ impl AuthMachine {
         };
         match result {
             Ok((_response, meta)) => {
-                self.merge_meta(&meta);
+                self.merge_meta(&meta).await;
                 // Stay in current state — the user hasn't entered the code yet.
                 Handled
             }
@@ -616,7 +592,7 @@ impl AuthMachine {
         };
         match result {
             Ok((response, meta)) => {
-                self.merge_meta(&meta);
+                self.merge_meta(&meta).await;
                 route_login_next(response.data.as_ref())
             }
             Err(error) => {
@@ -646,7 +622,7 @@ impl AuthMachine {
         .await;
         match result {
             Ok((_response, meta)) => {
-                self.merge_meta(&meta);
+                self.merge_meta(&meta).await;
                 Handled
             }
             Err(error) => {
@@ -687,7 +663,7 @@ impl AuthMachine {
         };
         match result {
             Ok((response, meta)) => {
-                self.merge_meta(&meta);
+                self.merge_meta(&meta).await;
                 route_login_next(response.data.as_ref())
             }
             Err(error) => {
@@ -706,7 +682,7 @@ impl AuthMachine {
             .await
         {
             Ok((response, meta)) => {
-                self.merge_meta(&meta);
+                self.merge_meta(&meta).await;
                 route_login_next(response.data.as_ref())
             }
             Err(error) => {
@@ -737,7 +713,7 @@ impl AuthMachine {
                 return Handled;
             }
         };
-        self.merge_meta(&meta);
+        self.merge_meta(&meta).await;
 
         let provider = links
             .response
@@ -784,7 +760,7 @@ impl AuthMachine {
         .await
         {
             Ok((_response, meta)) => {
-                self.merge_meta(&meta);
+                self.merge_meta(&meta).await;
                 Transition(State::authenticated())
             }
             Err(error) => {
@@ -808,7 +784,7 @@ impl AuthMachine {
                 return Handled;
             }
         };
-        self.merge_meta(&meta);
+        self.merge_meta(&meta).await;
 
         let provider = response.data.unwrap_or_default().into_iter().find(|info| {
             info.alias_key.as_deref() == Some(alias_key) || info.alias.as_deref() == Some(alias_key)
@@ -840,20 +816,16 @@ impl AuthMachine {
         // Best-effort server-side logout.
         if let Some(client) = self.build_tenant_client() {
             match rustylink_core::auth::logout(&client, logout_all).await {
-                Ok((_response, meta)) => self.merge_meta(&meta),
+                Ok((_response, meta)) => self.merge_meta(&meta).await,
                 Err(error) => {
                     tracing::warn!(%error, "server-side logout failed (proceeding locally)");
                 }
             }
         }
-        self.clear_session();
+        self.clear_session().await;
         Transition(State::configured())
     }
 }
-
-// ---------------------------------------------------------------------------
-// AuthMachine — client construction + state helpers
-// ---------------------------------------------------------------------------
 
 impl AuthMachine {
     /// Build an [`ApiClient`] pointing at the tenant's base URL with the
@@ -879,13 +851,9 @@ impl AuthMachine {
     }
 
     /// Merge cookies and CSRF token from an API response into shared storage.
-    pub fn merge_meta(&mut self, meta: &ResponseMeta) {
-        if let Some(cookies) = &meta.cookies
-            && let Ok(mut jar) = self.cookies.lock()
-        {
-            for (name, value) in &cookies.values {
-                jar.values.insert(name.clone(), value.clone());
-            }
+    pub async fn merge_meta(&mut self, meta: &ResponseMeta) {
+        if let Some(cookies) = &meta.cookies {
+            self.cookies.merge(cookies.values.clone()).await;
         }
         if let Some(csrf) = &meta.csrf_token {
             self.csrf_token = Some(csrf.clone());
@@ -978,20 +946,15 @@ impl AuthMachine {
 
     /// Snapshot the current session as [`PersistedCredentials`].
     ///
-    /// Returns `Some` only when the machine is in the `Authenticated` state
-    /// (i.e. a complete, persistable session exists).
-    #[must_use]
-    pub fn to_credentials(&self) -> Option<PersistedCredentials> {
+    /// Returns `Some` only when the machine has a tenant + signing config (i.e.
+    /// a persistable session exists).
+    pub async fn to_credentials(&self) -> Option<PersistedCredentials> {
         let tenant = self.tenant.clone()?;
         let signing = self.signing.clone()?;
         Some(PersistedCredentials {
             tenant,
             signing,
-            cookies: self
-                .cookies
-                .lock()
-                .map(|jar| jar.values.clone())
-                .unwrap_or_default(),
+            cookies: self.cookies.values().await,
             csrf_token: self.csrf_token.clone(),
             knock_token: self.knock_token.clone(),
             totp: self.totp.clone(),
@@ -1002,11 +965,10 @@ impl AuthMachine {
     }
 
     /// Snapshot credentials, injecting the given VPN request for persistence.
-    #[must_use]
-    pub fn to_credentials_with_vpn(
+    pub async fn to_credentials_with_vpn(
         &self, vpn_request: Option<crate::persist::PersistedVpnRequest>,
     ) -> Option<PersistedCredentials> {
-        let mut creds = self.to_credentials()?;
+        let mut creds = self.to_credentials().await?;
         creds.last_vpn_request = vpn_request;
         Some(creds)
     }
@@ -1027,9 +989,7 @@ impl AuthMachine {
             identity,
             tenant: Some(creds.tenant),
             signing: Some(creds.signing),
-            cookies: Arc::new(Mutex::new(SessionCookies {
-                values: creds.cookies,
-            })),
+            cookies: CookieStore::with_values(creds.cookies),
             csrf_token: creds.csrf_token,
             knock_token: creds.knock_token,
             totp: creds.totp,
@@ -1065,88 +1025,41 @@ impl AuthMachine {
 
     /// Clear session-specific data (cookies, tokens), keeping tenant +
     /// signing config intact.
-    fn clear_session(&mut self) {
-        if let Ok(mut jar) = self.cookies.lock() {
-            jar.values.clear();
-        }
+    async fn clear_session(&mut self) {
+        self.cookies.clear().await;
         self.csrf_token = None;
         self.knock_token = None;
         self.totp = None;
     }
 }
 
-// ---------------------------------------------------------------------------
-// route_login_next — centralized 2FA / GoToLink routing
-// ---------------------------------------------------------------------------
-
-/// Decide the next auth state from a [`LoginV2Result`].
+/// Map the core [`LoginStep`] decision onto a statig [`State`] transition.
 ///
-/// This function fixes two bugs present in the old per-handler routing:
-///
-/// 1. **`GoToLink` bug:** when `result.result == Some("success")` but `.next`
-///    contains a `goto_link` action (password-change URL), the old code
-///    incorrectly treated it as a pending challenge.  We now check `result ==
-///    "success"` **first** and transition to Authenticated.
-///
-/// 2. **2FA routing bug:** the old code mapped all non-MFA actions to OTP
-///    indiscriminately.  We now inspect the action string to distinguish
-///    between OTP challenges, MFA, and terminal success.
+/// The branching logic (success / `goto_link` / MFA / OTP channel) lives in
+/// [`rustylink_core::auth::next_login_step`]; this only adapts it to the
+/// daemon's state machine.
 fn route_login_next(result: Option<&LoginV2Result>) -> Response<State> {
-    let Some(result) = result else {
-        // No data at all — treat as success (matches Android fallback).
-        return Transition(State::authenticated());
-    };
-
-    // ① Success explicitly reported — done, regardless of `.next`.
-    if result.result.as_deref() == Some("success") {
-        return Transition(State::authenticated());
+    match rustylink_core::auth::next_login_step(result) {
+        LoginStep::Authenticated => Transition(State::authenticated()),
+        LoginStep::AwaitingMfa {
+            mfa_type,
+            auth_list,
+            can_skip,
+            masked_mobile,
+            masked_email,
+        } => Transition(State::awaiting_mfa(
+            mfa_type,
+            auth_list,
+            can_skip,
+            masked_mobile,
+            masked_email,
+        )),
+        LoginStep::AwaitingOtp {
+            masked_target,
+            login_type,
+        } => Transition(State::awaiting_otp(masked_target, login_type)),
     }
-
-    // ② Process `.next` for multi-step flows.
-    if let Some(next) = &result.next {
-        let action = next.action.as_deref().unwrap_or_default();
-
-        // MFA challenge.
-        if action.eq_ignore_ascii_case("mfa") || action.eq_ignore_ascii_case("verify_mfa") {
-            return Transition(State::awaiting_mfa(
-                action.to_owned(),
-                next.auth_list.clone().unwrap_or_default(),
-                next.can_skip.unwrap_or(false),
-                next.mobile.clone().unwrap_or_default(),
-                next.email.clone().unwrap_or_default(),
-            ));
-        }
-
-        // GoToLink — the server wants the user to visit a URL (e.g.
-        // password reset), but the session is authenticated.
-        if action.eq_ignore_ascii_case("goto_link") || action.eq_ignore_ascii_case("goToLink") {
-            return Transition(State::authenticated());
-        }
-
-        // OTP / verify_code / other verification challenge.
-        //
-        // The `login_type` we store is the delivery *channel* (mobile vs.
-        // email), not the action verb: the UI echoes it back when verifying or
-        // resending, and the upstream code endpoints expect `mobile`/`email`.
-        // Derive it from whichever masked target the server returned.
-        let masked_mobile = next.mobile.clone().filter(|value| !value.is_empty());
-        let masked_email = next.email.clone().filter(|value| !value.is_empty());
-        let (masked, login_type) = match (masked_mobile, masked_email) {
-            (Some(mobile), _) => (mobile, "mobile".to_owned()),
-            (None, Some(email)) => (email, "email".to_owned()),
-            (None, None) => (String::new(), "mobile".to_owned()),
-        };
-        return Transition(State::awaiting_otp(masked, login_type));
-    }
-
-    // ③ No explicit success AND no `.next` — treat as authenticated
-    // (matches Android client fallback).
-    Transition(State::authenticated())
 }
-
-// =========================================================================
-// VpnMachine — plain enum state machine (no statig)
-// =========================================================================
 
 /// A VPN connect request — the working form that drives the connect loop.
 #[derive(Clone, Debug)]

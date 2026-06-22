@@ -372,6 +372,81 @@ pub async fn logout(
 }
 
 // ---------------------------------------------------------------------------
+// Login state transition
+// ---------------------------------------------------------------------------
+
+/// The next auth step after a login / code-verify / MFA response. This is the
+/// transition decision a caller's state machine acts on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LoginStep {
+    /// The session is fully authenticated.
+    Authenticated,
+    /// An MFA challenge must be completed.
+    AwaitingMfa {
+        mfa_type: String,
+        auth_list: Vec<String>,
+        can_skip: bool,
+        masked_mobile: String,
+        masked_email: String,
+    },
+    /// A one-time code (SMS/email) must be verified.
+    AwaitingOtp {
+        masked_target: String,
+        login_type: String,
+    },
+}
+
+/// Decide the next [`LoginStep`] from a [`LoginV2Result`], mirroring the Android
+/// client's routing:
+///
+/// - an explicit `result == "success"` is terminal (authenticated), regardless
+///   of any `next` action;
+/// - a `goto_link` action (e.g. a password-reset URL) is also authenticated;
+/// - `mfa` / `verify_mfa` actions become an MFA challenge;
+/// - any other `next` action is an OTP challenge, with the delivery channel
+///   (`mobile`/`email`) derived from whichever masked target the server
+///   returned;
+/// - no `next` at all is treated as authenticated.
+#[must_use]
+pub fn next_login_step(result: Option<&LoginV2Result>) -> LoginStep {
+    let Some(result) = result else {
+        return LoginStep::Authenticated;
+    };
+    if result.result.as_deref() == Some("success") {
+        return LoginStep::Authenticated;
+    }
+    let Some(next) = &result.next else {
+        return LoginStep::Authenticated;
+    };
+    let action = next.action.as_deref().unwrap_or_default();
+    if action.eq_ignore_ascii_case("mfa") || action.eq_ignore_ascii_case("verify_mfa") {
+        return LoginStep::AwaitingMfa {
+            mfa_type: action.to_owned(),
+            auth_list: next.auth_list.clone().unwrap_or_default(),
+            can_skip: next.can_skip.unwrap_or(false),
+            masked_mobile: next.mobile.clone().unwrap_or_default(),
+            masked_email: next.email.clone().unwrap_or_default(),
+        };
+    }
+    if action.eq_ignore_ascii_case("goto_link") || action.eq_ignore_ascii_case("goToLink") {
+        return LoginStep::Authenticated;
+    }
+    // The stored `login_type` is the delivery channel (mobile vs. email), not
+    // the action verb: it is echoed back when verifying/resending codes.
+    let masked_mobile = next.mobile.clone().filter(|value| !value.is_empty());
+    let masked_email = next.email.clone().filter(|value| !value.is_empty());
+    let (masked_target, login_type) = match (masked_mobile, masked_email) {
+        (Some(mobile), _) => (mobile, "mobile".to_owned()),
+        (None, Some(email)) => (email, "email".to_owned()),
+        (None, None) => (String::new(), "mobile".to_owned()),
+    };
+    LoginStep::AwaitingOtp {
+        masked_target,
+        login_type,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
@@ -398,4 +473,74 @@ fn first_non_empty<'a>(values: impl IntoIterator<Item = Option<&'a str>>) -> Opt
         .map(str::trim)
         .find(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+#[cfg(test)]
+mod tests {
+    use rustylink_api::{LoginV2Next, LoginV2Result};
+
+    use super::{LoginStep, next_login_step};
+
+    fn with_next(next: LoginV2Next) -> LoginV2Result {
+        LoginV2Result {
+            result: None,
+            next: Some(next),
+        }
+    }
+
+    #[test]
+    fn explicit_success_and_missing_data_are_authenticated() {
+        assert_eq!(next_login_step(None), LoginStep::Authenticated);
+        let success = LoginV2Result {
+            result: Some("success".to_owned()),
+            next: None,
+        };
+        assert_eq!(next_login_step(Some(&success)), LoginStep::Authenticated);
+    }
+
+    #[test]
+    fn goto_link_is_authenticated_not_a_challenge() {
+        let goto = with_next(LoginV2Next {
+            action: Some("goto_link".to_owned()),
+            ..Default::default()
+        });
+        assert_eq!(next_login_step(Some(&goto)), LoginStep::Authenticated);
+    }
+
+    #[test]
+    fn mfa_action_becomes_mfa_challenge() {
+        let mfa = with_next(LoginV2Next {
+            action: Some("mfa".to_owned()),
+            can_skip: Some(true),
+            auth_list: Some(vec!["totp".to_owned()]),
+            mobile: Some("1***".to_owned()),
+            ..Default::default()
+        });
+        assert_eq!(
+            next_login_step(Some(&mfa)),
+            LoginStep::AwaitingMfa {
+                mfa_type: "mfa".to_owned(),
+                auth_list: vec!["totp".to_owned()],
+                can_skip: true,
+                masked_mobile: "1***".to_owned(),
+                masked_email: String::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn other_action_becomes_otp_with_channel_from_masked_target() {
+        let email_otp = with_next(LoginV2Next {
+            action: Some("verify_code".to_owned()),
+            email: Some("a***@x.com".to_owned()),
+            ..Default::default()
+        });
+        assert_eq!(
+            next_login_step(Some(&email_otp)),
+            LoginStep::AwaitingOtp {
+                masked_target: "a***@x.com".to_owned(),
+                login_type: "email".to_owned(),
+            }
+        );
+    }
 }
