@@ -7,7 +7,7 @@ use jiff::Timestamp;
 use reqwest::{
     Request,
     header::{
-        ACCEPT, ACCEPT_LANGUAGE, CONTENT_TYPE, COOKIE, DATE, HeaderMap, HeaderName, HeaderValue,
+        ACCEPT, ACCEPT_LANGUAGE, CONTENT_TYPE, COOKIE, HeaderMap, HeaderName, HeaderValue,
         SET_COOKIE, USER_AGENT,
     },
 };
@@ -239,22 +239,6 @@ fn parse_set_cookies(headers: &HeaderMap) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Metadata extracted from an HTTP response, returned alongside the typed body.
-///
-/// Callers inspect this to determine if cookies, CSRF, or the server `Date`
-/// header changed, and emit the appropriate `StateChange` variants.
-#[derive(Clone, Debug, Default)]
-pub struct ResponseMeta {
-    /// Cookies set by `Set-Cookie` headers (merged over the request snapshot).
-    pub cookies: Option<SessionCookies>,
-    /// CSRF token extracted from a `csrf-token` `Set-Cookie`, if present.
-    pub csrf_token: Option<String>,
-    /// Server `Date` header value, used for TOTP time-diff calculation.
-    pub server_date: Option<String>,
-    /// Whether the response signalled a force-logout via `action`.
-    pub is_force_logout: bool,
-}
-
 /// Request-decoration hooks (snapshot). All fields are plain owned values.
 /// A new `ApiHooks` is built from the current `PersistedState` each time the
 /// actor refreshes the `AppContext`.
@@ -262,7 +246,6 @@ pub struct ResponseMeta {
 pub struct ApiHooks {
     pub identity: ClientIdentity,
     pub cookies: CookieJar,
-    pub csrf_token: Option<String>,
     pub knock_token: Option<String>,
     pub signer: SigningContext,
 }
@@ -302,11 +285,10 @@ impl ApiHooks {
                 name: "Cookie".to_string(),
             })?,
         );
-        if let Some(csrf) = self
-            .csrf_token
-            .as_deref()
-            .or_else(|| cookies.values.get("csrf-token").map(String::as_str))
-        {
+        // The `csrf-token` cookie is mirrored into a `csrf-token` *header* on
+        // every request (Android parity). It lives in the shared jar like any
+        // other `Set-Cookie`, so there's no separate CSRF field to track.
+        if let Some(csrf) = cookies.values.get("csrf-token") {
             headers.insert(
                 HeaderName::from_static("csrf-token"),
                 HeaderValue::from_str(csrf).context(HeaderValueSnafu {
@@ -418,9 +400,6 @@ impl Middleware for SigningMiddleware {
 pub struct ApiClient {
     base_url: Url,
     http: ClientWithMiddleware,
-    /// Shared cookie jar handle, snapshotted per request to build
-    /// [`ResponseMeta`].
-    cookies: CookieJar,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -540,42 +519,28 @@ impl ApiClient {
         endpoint: &impl ApiEndpoint, pool: reqwest::Client, hooks: ApiHooks,
     ) -> Self {
         let base_url = endpoint.base_url().clone();
-        let cookies = hooks.cookies.clone();
         let http = ClientBuilder::new(pool)
             .with(SigningMiddleware::new(hooks))
             .build();
         tracing::debug!(%base_url, "created API client");
-        Self {
-            base_url,
-            http,
-            cookies,
-        }
+        Self { base_url, http }
     }
 
-    /// Send a typed request and return only the decoded response body.
+    /// Send a typed request and return the decoded response body.
+    ///
+    /// Any `Set-Cookie` headers on the response are absorbed into the shared
+    /// cookie jar by [`SigningMiddleware`], so callers never need to inspect
+    /// response cookies or CSRF tokens directly.
     pub async fn send<R>(&self, request: R) -> Result<R::Response>
     where
         R: SendableRequest, {
-        let (response, _meta) = self.send_with_meta(request).await?;
-        Ok(response)
-    }
-
-    /// Send a typed request and return **both** the decoded body and
-    /// [`ResponseMeta`] (cookies, CSRF, Date header, force-logout flag).
-    pub async fn send_with_meta<R>(&self, request: R) -> Result<(R::Response, ResponseMeta)>
-    where
-        R: SendableRequest, {
-        let (response_body, meta) = self.execute(request).await?;
+        let response_body = self.execute(request).await?;
         let decoded = decode_response::<R::Response>(&response_body)?;
         check_api_status(&decoded, &response_body)?;
-        let meta = ResponseMeta {
-            is_force_logout: decoded.is_force_logout(),
-            ..meta
-        };
-        Ok((decoded, meta))
+        Ok(decoded)
     }
 
-    async fn execute<R>(&self, request: R) -> Result<(Vec<u8>, ResponseMeta)>
+    async fn execute<R>(&self, request: R) -> Result<Vec<u8>>
     where
         R: SendableRequest, {
         let url = endpoint_url(&self.base_url, request.path().as_ref())?;
@@ -604,15 +569,13 @@ impl ApiClient {
                     query.append_pair(key, &value);
                 }
             }
-            // Request decoration + signing is performed by `SigningMiddleware`.
-            let request_cookies = self.cookies.snapshot().await;
+            // Request decoration + signing is performed by `SigningMiddleware`,
+            // which also absorbs `Set-Cookie` into the shared jar.
             let response = self
                 .http
                 .execute(http_request)
                 .await
                 .map_err(map_middleware_error)?;
-
-            let meta = extract_response_meta(response.headers(), &request_cookies);
 
             let status = response.status();
             let bytes = response.bytes().await.context(RequestSnafu)?.to_vec();
@@ -623,7 +586,7 @@ impl ApiClient {
                 }
                 .fail();
             }
-            Ok((bytes, meta))
+            Ok(bytes)
         }
         .instrument(span)
         .await
@@ -809,30 +772,7 @@ fn device_name_cookie_value(identity: &ClientIdentity) -> String {
     }
 }
 
-/// Extract metadata from response headers: cookies, CSRF token, Date header.
-fn extract_response_meta(headers: &HeaderMap, request_cookies: &SessionCookies) -> ResponseMeta {
-    let mut cookies = request_cookies.clone();
-    let mut any_cookie_changed = false;
-    let mut csrf_token = None;
-    for (name, value) in parse_set_cookies(headers) {
-        if name == "csrf-token" {
-            csrf_token = Some(value.clone());
-        }
-        cookies.values.insert(name, value);
-        any_cookie_changed = true;
-    }
-    let server_date = headers
-        .get(DATE)
-        .and_then(|v| v.to_str().ok())
-        .map(ToOwned::to_owned);
-    ResponseMeta {
-        cookies: any_cookie_changed.then_some(cookies),
-        csrf_token,
-        server_date,
-        is_force_logout: false,
-    }
-}
-
+/// Clamp response bodies to a sane size before surfacing them in errors/logs.
 fn response_content(bytes: &[u8]) -> String {
     const MAX_ERROR_CONTENT_BYTES: usize = 4096;
     if bytes.len() <= MAX_ERROR_CONTENT_BYTES {

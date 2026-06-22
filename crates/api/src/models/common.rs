@@ -92,12 +92,6 @@ pub trait SendableRequest: Sized + Send + Sync {
     ) -> crate::client::Result<Self::Response> {
         client.send(self).await
     }
-
-    async fn send_with_meta(
-        self, client: &crate::client::ApiClient,
-    ) -> crate::client::Result<(Self::Response, crate::client::ResponseMeta)> {
-        client.send_with_meta(self).await
-    }
 }
 
 #[cfg(test)]

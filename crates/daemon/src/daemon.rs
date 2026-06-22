@@ -97,7 +97,6 @@ impl Daemon {
                 tenant: None,
                 signing: None,
                 cookies: rustylink_api::CookieStore::empty(),
-                csrf_token: None,
                 knock_token: None,
                 totp: None,
                 login_api_version: LoginApiVersion::default(),
@@ -432,7 +431,7 @@ impl Daemon {
         let vpn_domain = rustylink_core::vpn::vpn_setting(&client)
             .await
             .ok()
-            .and_then(|(resp, _meta)| resp.data)
+            .and_then(|resp| resp.data)
             .and_then(|setting| setting.vpn_domain)
             .filter(|domain| !domain.trim().is_empty());
 
@@ -472,22 +471,8 @@ impl Daemon {
         .await
         .map_err(DaemonError::from)?;
 
-        // Merge response meta (cookies) via event dispatch.
-        {
-            let event = AuthEvent::MergeResponseMeta {
-                cookies: config_result
-                    .meta
-                    .cookies
-                    .as_ref()
-                    .map(|c| c.values.clone())
-                    .unwrap_or_default(),
-                csrf_token: config_result.meta.csrf_token.clone(),
-            };
-            let mut inner = self.inner.lock().await;
-            inner.auth.handle(&event).await;
-            drop(inner);
-        }
-
+        // Set-Cookie from the dot config call was already absorbed into the
+        // shared jar by the API client middleware — nothing to merge here.
         let data = config_result.response.data.clone().context(TunnelSnafu {
             message: "/vpn/conn returned no data",
         })?;
@@ -661,22 +646,7 @@ impl Daemon {
             mode: report.mode.android_name(),
         };
         match rustylink_core::vpn::report_vpn(client, &request).await {
-            Ok((response, meta)) => {
-                {
-                    let event = AuthEvent::MergeResponseMeta {
-                        cookies: meta
-                            .cookies
-                            .as_ref()
-                            .map(|c| c.values.clone())
-                            .unwrap_or_default(),
-                        csrf_token: meta.csrf_token.clone(),
-                    };
-                    let mut inner = self.inner.lock().await;
-                    inner.auth.handle(&event).await;
-                    drop(inner);
-                }
-                response.is_force_logout()
-            }
+            Ok(response) => response.is_force_logout(),
             Err(error) => {
                 tracing::warn!(%error, ?report_type, "vpn report failed (non-fatal)");
                 false
@@ -964,14 +934,14 @@ mod tests {
 
         // Authenticated tenant APIs — confirm the session is valid; the shared
         // jar absorbs any Set-Cookie mutations (e.g. open-time, vpn-token).
-        let (setting, _) = rustylink_core::vpn::vpn_setting(&client)
+        let setting = rustylink_core::vpn::vpn_setting(&client)
             .await
             .expect("vpn setting");
         snapshot("after /api/setting", hooks.cookies.snapshot().await);
         let vpn_domain = setting.data.and_then(|s| s.vpn_domain);
         eprintln!("vpn_domain = {vpn_domain:?}");
 
-        let (locations, _) = rustylink_core::vpn::vpn_locations(&client)
+        let locations = rustylink_core::vpn::vpn_locations(&client)
             .await
             .expect("vpn locations");
         snapshot("after /api/vpn/list", hooks.cookies.snapshot().await);
@@ -996,8 +966,8 @@ mod tests {
                 sign_token: None,
                 not_auto: Some(true),
             };
-            match body.send_with_meta(&dot_client).await {
-                Ok((resp, _)) => {
+            match body.send(&dot_client).await {
+                Ok(resp) => {
                     eprintln!("dot {:?}: /vpn/conn code={}", dot.id, resp.code);
                     any_ok |= resp.code == 0;
                 }

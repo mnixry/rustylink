@@ -101,26 +101,17 @@ impl AuthService for AuthServiceImpl {
                 inner.auth.build_tenant_client()
             };
             if let Some(client) = client
-                && let Ok((setting, meta)) = rustylink_core::vpn::login_setting(&client).await
+                && let Ok(setting) = rustylink_core::vpn::login_setting(&client).await
+                && let Some(data) = setting.data.as_ref()
+                && data.is_v1()
             {
                 let mut inner = self.daemon.inner.lock().await;
-                let merge = AuthEvent::MergeResponseMeta {
-                    cookies: meta
-                        .cookies
-                        .as_ref()
-                        .map(|c| c.values.clone())
-                        .unwrap_or_default(),
-                    csrf_token: meta.csrf_token.clone(),
-                };
-                inner.auth.handle(&merge).await;
-                if let Some(data) = setting.data.as_ref()
-                    && data.is_v1()
-                {
-                    let version_event = AuthEvent::SetLoginApiVersion {
+                inner
+                    .auth
+                    .handle(&AuthEvent::SetLoginApiVersion {
                         version: crate::persist::LoginApiVersion::V1,
-                    };
-                    inner.auth.handle(&version_event).await;
-                }
+                    })
+                    .await;
                 drop(inner);
             }
         }
@@ -318,22 +309,9 @@ impl AuthService for AuthServiceImpl {
                 .build_tenant_client()
                 .ok_or_else(|| DaemonError::from(RpcFault::NotConfigured))?
         };
-        let (links, meta) = rustylink_core::auth::third_party_login_links(&client)
+        let links = rustylink_core::auth::third_party_login_links(&client)
             .await
             .map_err(DaemonError::from)?;
-        {
-            let mut inner = self.daemon.inner.lock().await;
-            let event = AuthEvent::MergeResponseMeta {
-                cookies: meta
-                    .cookies
-                    .as_ref()
-                    .map(|c| c.values.clone())
-                    .unwrap_or_default(),
-                csrf_token: meta.csrf_token.clone(),
-            };
-            inner.auth.handle(&event).await;
-            drop(inner);
-        }
         let providers = links
             .response
             .data
@@ -482,21 +460,9 @@ impl AuthService for AuthServiceImpl {
             match rustylink_core::auth::check_third_party_login_token(&client, poll_token.clone())
                 .await
             {
-                Ok((_response, meta)) => {
-                    // Success: merge the session cookies/csrf from the response.
-                    let mut inner = self.daemon.inner.lock().await;
-                    inner
-                        .auth
-                        .handle(&AuthEvent::MergeResponseMeta {
-                            cookies: meta
-                                .cookies
-                                .as_ref()
-                                .map(|c| c.values.clone())
-                                .unwrap_or_default(),
-                            csrf_token: meta.csrf_token.clone(),
-                        })
-                        .await;
-                    drop(inner);
+                Ok(_response) => {
+                    // Success: the session cookies were absorbed into the shared
+                    // jar by the API client middleware; nothing to merge here.
                     break;
                 }
                 Err(error) => {
@@ -579,39 +545,20 @@ impl AuthServiceImpl {
             }
         };
         match rustylink_core::vpn::fetch_totp(&client).await {
-            Ok((Some(config), meta)) => {
+            Ok(Some(config)) => {
                 let mut inner = self.daemon.inner.lock().await;
-                let merge = AuthEvent::MergeResponseMeta {
-                    cookies: meta
-                        .cookies
-                        .as_ref()
-                        .map(|c| c.values.clone())
-                        .unwrap_or_default(),
-                    csrf_token: meta.csrf_token.clone(),
-                };
-                inner.auth.handle(&merge).await;
-                let totp_event = AuthEvent::StoreTotp {
-                    config: Some(crate::persist::PersistedTotpConfig {
-                        url: config.url,
-                        time_diff_seconds: config.time_diff_seconds,
-                    }),
-                };
-                inner.auth.handle(&totp_event).await;
+                inner
+                    .auth
+                    .handle(&AuthEvent::StoreTotp {
+                        config: Some(crate::persist::PersistedTotpConfig {
+                            url: config.url,
+                            time_diff_seconds: config.time_diff_seconds,
+                        }),
+                    })
+                    .await;
                 drop(inner);
             }
-            Ok((None, meta)) => {
-                let mut inner = self.daemon.inner.lock().await;
-                let merge = AuthEvent::MergeResponseMeta {
-                    cookies: meta
-                        .cookies
-                        .as_ref()
-                        .map(|c| c.values.clone())
-                        .unwrap_or_default(),
-                    csrf_token: meta.csrf_token.clone(),
-                };
-                inner.auth.handle(&merge).await;
-                drop(inner);
-            }
+            Ok(None) => {}
             Err(error) => {
                 tracing::warn!(%error, "failed to fetch TOTP secret (non-fatal)");
             }
@@ -629,19 +576,7 @@ impl AuthServiceImpl {
         };
         let report = rustylink_core::security::all_green_security_report();
         match rustylink_core::security::report_security(&client, &report).await {
-            Ok((_response, meta)) => {
-                let mut inner = self.daemon.inner.lock().await;
-                let merge = AuthEvent::MergeResponseMeta {
-                    cookies: meta
-                        .cookies
-                        .as_ref()
-                        .map(|c| c.values.clone())
-                        .unwrap_or_default(),
-                    csrf_token: meta.csrf_token.clone(),
-                };
-                inner.auth.handle(&merge).await;
-                drop(inner);
-            }
+            Ok(_response) => {}
             Err(error) => {
                 tracing::warn!(%error, "security report failed (non-fatal)");
             }

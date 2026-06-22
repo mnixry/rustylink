@@ -1,8 +1,8 @@
 use rustylink_api::{
     ApiClient, BaseResponse, DotEndpoint, FetchOtpRequest, GetLoginSettingRequest,
     GetTenantConfigRequest, GetUserInfoRequest, GetVpnLocationsRequest, GetVpnSettingRequest,
-    LoginSetting, OtpProvision, ResponseMeta, SendableRequest, TenantConfig, UserInfo,
-    VpnConnRequest, VpnConnResponse, VpnDot, VpnReportRequest, VpnSetting,
+    LoginSetting, OtpProvision, SendableRequest, TenantConfig, UserInfo, VpnConnRequest,
+    VpnConnResponse, VpnDot, VpnReportRequest, VpnSetting,
 };
 use snafu::prelude::*;
 use strum::{Display, EnumIter, EnumString, FromRepr, IntoStaticStr};
@@ -52,8 +52,6 @@ pub struct VpnConfigResult {
     pub dot: VpnDot,
     pub endpoint: DotEndpoint,
     pub response: BaseResponse<VpnConnResponse>,
-    /// The [`ResponseMeta`] from the successful VPN config call.
-    pub meta: ResponseMeta,
 }
 
 #[derive(Debug, Snafu)]
@@ -165,54 +163,28 @@ pub struct TotpConfig {
 // Profile / settings
 // ---------------------------------------------------------------------------
 
-pub async fn user_info(client: &ApiClient) -> Result<(BaseResponse<UserInfo>, ResponseMeta)> {
-    let (response, meta) = GetUserInfoRequest
-        .send_with_meta(client)
-        .await
-        .context(ApiSnafu)?;
-    Ok((response, meta))
+pub async fn user_info(client: &ApiClient) -> Result<BaseResponse<UserInfo>> {
+    GetUserInfoRequest.send(client).await.context(ApiSnafu)
 }
 
-pub async fn tenant_config(
-    client: &ApiClient,
-) -> Result<(BaseResponse<TenantConfig>, ResponseMeta)> {
-    let (response, meta) = GetTenantConfigRequest
-        .send_with_meta(client)
-        .await
-        .context(ApiSnafu)?;
-    Ok((response, meta))
+pub async fn tenant_config(client: &ApiClient) -> Result<BaseResponse<TenantConfig>> {
+    GetTenantConfigRequest.send(client).await.context(ApiSnafu)
 }
 
-pub async fn login_setting(
-    client: &ApiClient,
-) -> Result<(BaseResponse<LoginSetting>, ResponseMeta)> {
-    let (response, meta) = GetLoginSettingRequest
-        .send_with_meta(client)
-        .await
-        .context(ApiSnafu)?;
-    Ok((response, meta))
+pub async fn login_setting(client: &ApiClient) -> Result<BaseResponse<LoginSetting>> {
+    GetLoginSettingRequest.send(client).await.context(ApiSnafu)
 }
 
 // ---------------------------------------------------------------------------
 // VPN settings / locations
 // ---------------------------------------------------------------------------
 
-pub async fn vpn_setting(client: &ApiClient) -> Result<(BaseResponse<VpnSetting>, ResponseMeta)> {
-    let (response, meta) = GetVpnSettingRequest
-        .send_with_meta(client)
-        .await
-        .context(ApiSnafu)?;
-    Ok((response, meta))
+pub async fn vpn_setting(client: &ApiClient) -> Result<BaseResponse<VpnSetting>> {
+    GetVpnSettingRequest.send(client).await.context(ApiSnafu)
 }
 
-pub async fn vpn_locations(
-    client: &ApiClient,
-) -> Result<(BaseResponse<Vec<VpnDot>>, ResponseMeta)> {
-    let (response, meta) = GetVpnLocationsRequest
-        .send_with_meta(client)
-        .await
-        .context(ApiSnafu)?;
-    Ok((response, meta))
+pub async fn vpn_locations(client: &ApiClient) -> Result<BaseResponse<Vec<VpnDot>>> {
+    GetVpnLocationsRequest.send(client).await.context(ApiSnafu)
 }
 
 // ---------------------------------------------------------------------------
@@ -221,13 +193,8 @@ pub async fn vpn_locations(
 
 pub async fn vpn_conn(
     client: &ApiClient, request: &VpnConnRequest,
-) -> Result<(BaseResponse<VpnConnResponse>, ResponseMeta)> {
-    let (response, meta) = request
-        .clone()
-        .send_with_meta(client)
-        .await
-        .context(ApiSnafu)?;
-    Ok((response, meta))
+) -> Result<BaseResponse<VpnConnResponse>> {
+    request.clone().send(client).await.context(ApiSnafu)
 }
 
 /// Fetch the dot list, select a suitable dot, and negotiate a VPN config.
@@ -257,8 +224,8 @@ pub async fn vpn_config_from_dot_list<RankFut>(
 ) -> Result<VpnConfigResult>
 where
     RankFut: std::future::Future<Output = Vec<VpnDot>>, {
-    let (locations, _list_meta) = GetVpnLocationsRequest
-        .send_with_meta(tenant_client)
+    let locations = GetVpnLocationsRequest
+        .send(tenant_client)
         .await
         .context(ApiSnafu)?;
     let dots = locations.data.clone().context(MissingVpnDotListDataSnafu)?;
@@ -312,14 +279,13 @@ where
                 attempt,
                 "requesting VPN config from dot"
             );
-            match body.clone().send_with_meta(&dot_client).await {
-                Ok((response, dot_meta)) => {
+            match body.clone().send(&dot_client).await {
+                Ok(response) => {
                     response.data.as_ref().context(MissingVpnConfigDataSnafu)?;
                     return Ok(VpnConfigResult {
                         dot,
                         endpoint,
                         response,
-                        meta: dot_meta,
                     });
                 }
                 Err(source) => {
@@ -349,13 +315,8 @@ where
 
 pub async fn report_vpn(
     client: &ApiClient, request: &VpnReportRequest,
-) -> Result<(BaseResponse<serde_json::Value>, ResponseMeta)> {
-    let (response, meta) = request
-        .clone()
-        .send_with_meta(client)
-        .await
-        .context(ApiSnafu)?;
-    Ok((response, meta))
+) -> Result<BaseResponse<serde_json::Value>> {
+    request.clone().send(client).await.context(ApiSnafu)
 }
 
 /// Fetch the tenant TOTP provisioning from `POST /api/v2/p/otp`.
@@ -363,15 +324,11 @@ pub async fn report_vpn(
 /// Gated on the Android `User-Agent` we send, the server returns an
 /// `otpauth://` URI (carrying the secret/algorithm/digits/period) plus its
 /// wall-clock `timestamp`.  We persist the URI and the derived clock offset so
-/// codes can be generated locally for auto-reconnect.  Returns `Ok((None, _))`
+/// codes can be generated locally for auto-reconnect.  Returns `Ok(None)`
 /// when the tenant has no OTP requirement (empty `url`).
-pub async fn fetch_totp(client: &ApiClient) -> Result<(Option<TotpConfig>, ResponseMeta)> {
-    let (response, meta) = FetchOtpRequest
-        .send_with_meta(client)
-        .await
-        .context(ApiSnafu)?;
-    let config = response.data.and_then(totp_from_provision);
-    Ok((config, meta))
+pub async fn fetch_totp(client: &ApiClient) -> Result<Option<TotpConfig>> {
+    let response = FetchOtpRequest.send(client).await.context(ApiSnafu)?;
+    Ok(response.data.and_then(totp_from_provision))
 }
 
 /// Build a [`TotpConfig`] from the provisioning payload, deriving

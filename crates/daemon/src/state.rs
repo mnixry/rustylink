@@ -17,12 +17,10 @@
 //! `&mut self` locking problematic.  Explicit transition methods advance the
 //! state.
 
-use std::collections::BTreeMap;
-
 use jiff::Timestamp;
 use rustylink_api::{
     ApiClient, ApiHooks, ClientIdentity, CookieJar, CookieStore, LoginV2Result, MatchEndpoint,
-    ResponseMeta, SigningConfig, SigningContext, TenantEndpoint,
+    SigningConfig, SigningContext, TenantEndpoint,
 };
 use rustylink_core::{auth::LoginStep, vpn::VpnConnectMode};
 use rustylink_proto::proto::rustylink::daemon::v1 as pb;
@@ -69,10 +67,9 @@ pub struct AuthMachine {
     /// Signing / HMAC configuration (set after activation).
     pub(crate) signing: Option<PersistedSigningConfig>,
     /// HTTP session cookies, shared as a live jar with every [`ApiClient`]
-    /// built from this machine's hooks (Android-style `CookieJar`).
+    /// built from this machine's hooks (Android-style `CookieJar`).  This jar
+    /// also holds the `csrf-token` cookie, so no separate CSRF field is needed.
     pub(crate) cookies: CookieJar,
-    /// CSRF token from `Set-Cookie: csrf-token=…`.
-    pub(crate) csrf_token: Option<String>,
     /// Knock token for API request decoration.
     pub(crate) knock_token: Option<String>,
     /// TOTP provisioning for auto-reconnect OTP generation.
@@ -159,11 +156,6 @@ pub enum AuthEvent {
     Logout { logout_all: bool },
 
     // -- passthrough events (no state transition; update shared storage) --
-    /// Merge cookies/CSRF from an out-of-band API response.
-    MergeResponseMeta {
-        cookies: BTreeMap<String, String>,
-        csrf_token: Option<String>,
-    },
     /// Store the TOTP provisioning config after a successful fetch.
     StoreTotp { config: Option<PersistedTotpConfig> },
     /// Update the detected login API version.
@@ -202,7 +194,7 @@ impl AuthMachine {
                 .await
             }
             AuthEvent::RestoreSession => self.handle_restore_session().await,
-            other => self.handle_passthrough(other).await,
+            other => self.handle_passthrough(other),
         }
     }
 
@@ -251,7 +243,7 @@ impl AuthMachine {
             AuthEvent::StartDeviceLogin { alias_key } => {
                 self.handle_start_device_login(alias_key).await
             }
-            other => self.handle_passthrough(other).await,
+            other => self.handle_passthrough(other),
         }
     }
 
@@ -284,7 +276,7 @@ impl AuthMachine {
                     .await
             }
             AuthEvent::Logout { logout_all } => self.handle_logout(*logout_all).await,
-            other => self.handle_passthrough(other).await,
+            other => self.handle_passthrough(other),
         }
     }
 
@@ -327,7 +319,7 @@ impl AuthMachine {
                 self.handle_skip_challenge(login_scene).await
             }
             AuthEvent::Logout { logout_all } => self.handle_logout(*logout_all).await,
-            other => self.handle_passthrough(other).await,
+            other => self.handle_passthrough(other),
         }
     }
 
@@ -350,7 +342,7 @@ impl AuthMachine {
                 self.oauth_pending = None;
                 self.handle_logout(*logout_all).await
             }
-            other => self.handle_passthrough(other).await,
+            other => self.handle_passthrough(other),
         }
     }
 
@@ -373,7 +365,7 @@ impl AuthMachine {
                 self.device_login_pending = None;
                 self.handle_logout(*logout_all).await
             }
-            other => self.handle_passthrough(other).await,
+            other => self.handle_passthrough(other),
         }
     }
 
@@ -399,7 +391,7 @@ impl AuthMachine {
                 )
                 .await
             }
-            other => self.handle_passthrough(other).await,
+            other => self.handle_passthrough(other),
         }
     }
 }
@@ -407,18 +399,8 @@ impl AuthMachine {
 impl AuthMachine {
     /// Handle passthrough (side-effect) events that are valid in every state.
     /// These update shared storage without causing state transitions.
-    async fn handle_passthrough(&mut self, event: &AuthEvent) -> Response<State> {
+    fn handle_passthrough(&mut self, event: &AuthEvent) -> Response<State> {
         match event {
-            AuthEvent::MergeResponseMeta {
-                cookies,
-                csrf_token,
-            } => {
-                self.cookies.merge(cookies.clone()).await;
-                if let Some(csrf) = csrf_token {
-                    self.csrf_token = Some(csrf.clone());
-                }
-                Handled
-            }
             AuthEvent::StoreTotp { config } => {
                 self.totp.clone_from(config);
                 Handled
@@ -453,8 +435,7 @@ impl AuthMachine {
     ) -> Response<State> {
         let match_client = self.build_match_client(match_base_url);
         match rustylink_core::auth::activate(&match_client, code).await {
-            Ok((response, meta)) => {
-                self.merge_meta(&meta).await;
+            Ok(response) => {
                 if let Some(data) = &response.data {
                     let update = rustylink_core::auth::extract_activation_update(data);
                     self.tenant = Some(TenantConfig {
@@ -510,10 +491,7 @@ impl AuthMachine {
             .await
         };
         match result {
-            Ok((response, meta)) => {
-                self.merge_meta(&meta).await;
-                route_login_next(response.data.as_ref())
-            }
+            Ok(response) => route_login_next(response.data.as_ref()),
             Err(error) => {
                 self.last_error = Some(error.to_string());
                 Handled
@@ -548,8 +526,7 @@ impl AuthMachine {
             .await
         };
         match result {
-            Ok((_response, meta)) => {
-                self.merge_meta(&meta).await;
+            Ok(_response) => {
                 // Stay in current state — the user hasn't entered the code yet.
                 Handled
             }
@@ -590,10 +567,7 @@ impl AuthMachine {
             .await
         };
         match result {
-            Ok((response, meta)) => {
-                self.merge_meta(&meta).await;
-                route_login_next(response.data.as_ref())
-            }
+            Ok(response) => route_login_next(response.data.as_ref()),
             Err(error) => {
                 self.last_error = Some(error.to_string());
                 Handled
@@ -620,10 +594,7 @@ impl AuthMachine {
         )
         .await;
         match result {
-            Ok((_response, meta)) => {
-                self.merge_meta(&meta).await;
-                Handled
-            }
+            Ok(_response) => Handled,
             Err(error) => {
                 self.last_error = Some(error.to_string());
                 Handled
@@ -661,10 +632,7 @@ impl AuthMachine {
             .await
         };
         match result {
-            Ok((response, meta)) => {
-                self.merge_meta(&meta).await;
-                route_login_next(response.data.as_ref())
-            }
+            Ok(response) => route_login_next(response.data.as_ref()),
             Err(error) => {
                 self.last_error = Some(error.to_string());
                 Handled
@@ -680,10 +648,7 @@ impl AuthMachine {
         match rustylink_core::auth::v1_login_skip(&client, login_scene.to_owned(), String::new())
             .await
         {
-            Ok((response, meta)) => {
-                self.merge_meta(&meta).await;
-                route_login_next(response.data.as_ref())
-            }
+            Ok(response) => route_login_next(response.data.as_ref()),
             Err(error) => {
                 self.last_error = Some(error.to_string());
                 Handled
@@ -705,14 +670,13 @@ impl AuthMachine {
         // the matching `code_verifier` for the callback rather than building a
         // fresh URL.
         let links_result = rustylink_core::auth::third_party_login_links(&client).await;
-        let (links, meta) = match links_result {
-            Ok((links, meta)) => (links, meta),
+        let links = match links_result {
+            Ok(links) => links,
             Err(error) => {
                 self.last_error = Some(error.to_string());
                 return Handled;
             }
         };
-        self.merge_meta(&meta).await;
 
         let provider = links
             .response
@@ -758,10 +722,7 @@ impl AuthMachine {
         )
         .await
         {
-            Ok((_response, meta)) => {
-                self.merge_meta(&meta).await;
-                Transition(State::authenticated())
-            }
+            Ok(_response) => Transition(State::authenticated()),
             Err(error) => {
                 self.last_error = Some(error.to_string());
                 Handled
@@ -776,14 +737,13 @@ impl AuthMachine {
         };
         // Fetch provider list WITHOUT a PKCE challenge so the server returns a
         // poll `token` for the device/QR flow (`/api/tpslogin/token/check`).
-        let (response, meta) = match rustylink_core::auth::device_login_links(&client).await {
-            Ok(pair) => pair,
+        let response = match rustylink_core::auth::device_login_links(&client).await {
+            Ok(response) => response,
             Err(error) => {
                 self.last_error = Some(error.to_string());
                 return Handled;
             }
         };
-        self.merge_meta(&meta).await;
 
         let provider = response.data.unwrap_or_default().into_iter().find(|info| {
             info.alias_key.as_deref() == Some(alias_key) || info.alias.as_deref() == Some(alias_key)
@@ -815,7 +775,7 @@ impl AuthMachine {
         // Best-effort server-side logout.
         if let Some(client) = self.build_tenant_client() {
             match rustylink_core::auth::logout(&client, logout_all).await {
-                Ok((_response, meta)) => self.merge_meta(&meta).await,
+                Ok(_response) => {}
                 Err(error) => {
                     tracing::debug!(
                         %error,
@@ -853,15 +813,13 @@ impl AuthMachine {
     }
 
     /// Merge cookies and CSRF token from an API response into shared storage.
-    pub async fn merge_meta(&mut self, meta: &ResponseMeta) {
-        if let Some(cookies) = &meta.cookies {
-            self.cookies.merge(cookies.values.clone()).await;
-        }
-        if let Some(csrf) = &meta.csrf_token {
-            self.csrf_token = Some(csrf.clone());
-        }
-    }
-
+    ///
+    /// No-op now: every `Set-Cookie` (session cookies *and* `csrf-token`) is
+    /// absorbed into the shared jar by the API client's signing middleware.
+    /// Merge cookies and CSRF token from an API response into shared storage.
+    ///
+    /// No-op now: every `Set-Cookie` (session cookies *and* `csrf-token`) is
+    /// absorbed into the shared jar by the API client's signing middleware.
     /// Project the current auth state to an RPC [`Session`](pb::Session)
     /// message.
     #[must_use]
@@ -957,7 +915,6 @@ impl AuthMachine {
             tenant,
             signing,
             cookies: self.cookies.values().await,
-            csrf_token: self.csrf_token.clone(),
             knock_token: self.knock_token.clone(),
             totp: self.totp.clone(),
             login_api_version: self.login_api_version,
@@ -992,7 +949,6 @@ impl AuthMachine {
             tenant: Some(creds.tenant),
             signing: Some(creds.signing),
             cookies: CookieStore::with_values(creds.cookies),
-            csrf_token: creds.csrf_token,
             knock_token: creds.knock_token,
             totp: creds.totp,
             login_api_version: creds.login_api_version,
@@ -1019,7 +975,6 @@ impl AuthMachine {
         ApiHooks {
             identity: self.identity.clone(),
             cookies: self.cookies.clone(),
-            csrf_token: self.csrf_token.clone(),
             knock_token: self.knock_token.clone(),
             signer: SigningContext::new(signing_config),
         }
@@ -1029,7 +984,6 @@ impl AuthMachine {
     /// signing config intact.
     async fn clear_session(&mut self) {
         self.cookies.clear().await;
-        self.csrf_token = None;
         self.knock_token = None;
         self.totp = None;
     }

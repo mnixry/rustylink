@@ -257,10 +257,9 @@ pub struct PersistedCredentials {
     pub tenant: TenantConfig,
     /// Signing / HMAC configuration.
     pub signing: PersistedSigningConfig,
-    /// HTTP session cookies (`name → value`).
+    /// HTTP session cookies (`name → value`). Includes the `csrf-token` cookie,
+    /// so no separate CSRF field is persisted.
     pub cookies: BTreeMap<String, String>,
-    /// CSRF token from `Set-Cookie: csrf-token=…`.
-    pub csrf_token: Option<String>,
     /// Knock token for API request decoration.
     pub knock_token: Option<String>,
     /// TOTP provisioning for auto-reconnect OTP generation.

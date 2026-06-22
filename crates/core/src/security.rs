@@ -1,6 +1,5 @@
 use rustylink_api::{
-    ApiClient, BaseResponse, CommonStringResult, ResponseMeta, SecurityReportRequest,
-    SendableRequest,
+    ApiClient, BaseResponse, CommonStringResult, SecurityReportRequest, SendableRequest,
 };
 use snafu::prelude::*;
 
@@ -18,13 +17,8 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub async fn report_security(
     client: &ApiClient, report: &SecurityReportRequest,
-) -> Result<(BaseResponse<CommonStringResult>, ResponseMeta)> {
-    let (response, meta) = report
-        .clone()
-        .send_with_meta(client)
-        .await
-        .context(ApiSnafu)?;
-    Ok((response, meta))
+) -> Result<BaseResponse<CommonStringResult>> {
+    report.clone().send(client).await.context(ApiSnafu)
 }
 
 /// Build the "all safe" device security report.

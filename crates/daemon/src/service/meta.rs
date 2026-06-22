@@ -11,7 +11,6 @@ use rustylink_proto::proto::rustylink::daemon::{v1 as pb, v1::MetaService};
 use crate::{
     daemon::{Daemon, project_user_info},
     error::{DaemonError, RpcFault},
-    state::AuthEvent,
 };
 
 /// Wrapper around [`Daemon`] implementing the `MetaService` trait.
@@ -50,22 +49,9 @@ impl MetaService for MetaServiceImpl {
                 .build_tenant_client()
                 .ok_or_else(|| DaemonError::from(RpcFault::NotAuthenticated))?
         };
-        let (resp, meta) = rustylink_core::vpn::user_info(&client)
+        let resp = rustylink_core::vpn::user_info(&client)
             .await
             .map_err(DaemonError::from)?;
-        {
-            let mut inner = self.daemon.inner.lock().await;
-            let event = AuthEvent::MergeResponseMeta {
-                cookies: meta
-                    .cookies
-                    .as_ref()
-                    .map(|c| c.values.clone())
-                    .unwrap_or_default(),
-                csrf_token: meta.csrf_token.clone(),
-            };
-            inner.auth.handle(&event).await;
-            drop(inner);
-        }
         Response::ok(pb::GetUserInfoResponse {
             user_info: project_user_info(resp.data).into(),
             ..Default::default()

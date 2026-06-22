@@ -15,7 +15,7 @@ use crate::{
     daemon::{Daemon, project_vpn_location},
     error::{DaemonError, RpcFault},
     latency,
-    state::{AuthEvent, VpnMachine, VpnRequest},
+    state::{VpnMachine, VpnRequest},
 };
 
 /// Wrapper around [`Daemon`] implementing the `VpnService` trait.
@@ -81,22 +81,9 @@ impl VpnService for VpnServiceImpl {
                 .build_tenant_client()
                 .ok_or_else(|| DaemonError::from(RpcFault::NotAuthenticated))?
         };
-        let (resp, meta) = rustylink_core::vpn::vpn_locations(&client)
+        let resp = rustylink_core::vpn::vpn_locations(&client)
             .await
             .map_err(DaemonError::from)?;
-        {
-            let mut inner = self.daemon.inner.lock().await;
-            let event = AuthEvent::MergeResponseMeta {
-                cookies: meta
-                    .cookies
-                    .as_ref()
-                    .map(|c| c.values.clone())
-                    .unwrap_or_default(),
-                csrf_token: meta.csrf_token.clone(),
-            };
-            inner.auth.handle(&event).await;
-            drop(inner);
-        }
         let locations = resp
             .data
             .unwrap_or_default()
@@ -120,22 +107,9 @@ impl VpnService for VpnServiceImpl {
                 .build_tenant_client()
                 .ok_or_else(|| DaemonError::from(RpcFault::NotAuthenticated))?
         };
-        let (resp, meta) = rustylink_core::vpn::vpn_locations(&client)
+        let resp = rustylink_core::vpn::vpn_locations(&client)
             .await
             .map_err(DaemonError::from)?;
-        {
-            let mut inner = self.daemon.inner.lock().await;
-            let event = AuthEvent::MergeResponseMeta {
-                cookies: meta
-                    .cookies
-                    .as_ref()
-                    .map(|c| c.values.clone())
-                    .unwrap_or_default(),
-                csrf_token: meta.csrf_token.clone(),
-            };
-            inner.auth.handle(&event).await;
-            drop(inner);
-        }
         let dots = resp.data.unwrap_or_default();
 
         // Probe through the picked outbound interface (configured or default),
