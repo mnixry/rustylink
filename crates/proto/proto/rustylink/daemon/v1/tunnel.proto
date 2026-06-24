@@ -76,6 +76,10 @@ message VpnLocation {
   string icon = 7;
   bool dedicated = 8;
   string tag = 9;
+  // Protocols this dot accepts. UDP-only dots list [UDP], TCP-only dots list
+  // [TCP], dual-mode dots list both. Clients use this to disable unsupported
+  // `protocol_mode` choices in `ConnectTunnelRequest`.
+  repeated ProtocolMode supported_protocols = 10;
 }
 
 // ---------------------------------------------------------------------------

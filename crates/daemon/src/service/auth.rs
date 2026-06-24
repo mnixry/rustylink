@@ -486,10 +486,12 @@ impl AuthServiceImpl {
         match rustylink_core::vpn::fetch_totp(&client).await {
             Ok(Some(config)) => {
                 let mut inner = self.daemon.inner.lock().await;
-                inner.auth.set_totp(Some(crate::persist::PersistedTotpConfig {
-                    url: config.url,
-                    time_diff_seconds: config.time_diff_seconds,
-                }));
+                inner
+                    .auth
+                    .set_totp(Some(crate::persist::PersistedTotpConfig {
+                        url: config.url,
+                        time_diff_seconds: config.time_diff_seconds,
+                    }));
                 drop(inner);
             }
             Ok(None) => {}

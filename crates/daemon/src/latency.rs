@@ -1,55 +1,46 @@
 //! Latency probing for dot (access-point) selection.
 //!
-//! Each dot's API server already exposes an HTTP endpoint (`/vpn/ping`), so a
-//! plain TCP connect to that host:port gives us the round-trip latency to the
-//! tenant server directly — no separate ICMP or `WireGuard` ping mechanism is
-//! needed.
-//!
-//! **The probe is routed through the picked outbound interface** (the same
-//! configured-or-default interface the tunnel binds to), via
-//! [`rustylink_tunnel::outbound::connect_tcp`]. Measuring through any other
-//! path would not reflect the latency the tunnel will actually experience.
+//! Each dot's API server exposes `GET /vpn/ping`, so timing that request
+//! against the dot's API host gives the application-level round-trip latency to
+//! the tenant server. The probe reuses the shared API client (cookies, request
+//! signing and the tenant `vpn_domain` TLS host), so it measures the same path
+//! the dot config call will take.
 
-use std::{
-    net::{IpAddr, SocketAddr},
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
-use rustylink_api::VpnDot;
-use rustylink_tunnel::{OutboundInterface, outbound::connect_tcp};
+use rustylink_api::{ApiClient, VpnDot};
 
 /// Default timeout for a single probe attempt.
 pub const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Default API port when the dot does not advertise one.
-pub const DEFAULT_API_PORT: u16 = 443;
-
-/// Probe latency to a dot's API server by timing a TCP connect, bound to the
-/// given outbound interface.
+/// Probe latency to a dot by timing a `GET /vpn/ping` against its API server.
 ///
-/// Returns `Some(rtt)` on a successful connect within `timeout`, or `None` if
-/// the host cannot be resolved or the connect fails/times out.
-pub async fn probe_latency(
-    host: &str, port: u16, outbound: Option<&OutboundInterface>, timeout: Duration,
-) -> Option<Duration> {
-    let destination = resolve_addr(host, port).await?;
+/// Returns `Some(rtt)` on a successful reply within `timeout`, or `None` if the
+/// request fails or times out.
+pub async fn probe_latency(client: &ApiClient, timeout: Duration) -> Option<Duration> {
     let start = Instant::now();
-    connect_tcp(destination, outbound, timeout)
-        .await
-        .ok()
-        .map(|_stream| start.elapsed())
+    match tokio::time::timeout(timeout, rustylink_core::vpn::vpn_ping(client)).await {
+        Ok(Ok(())) => Some(start.elapsed()),
+        Ok(Err(error)) => {
+            tracing::debug!(%error, "vpn ping probe failed");
+            None
+        }
+        Err(_) => {
+            tracing::debug!("vpn ping probe timed out");
+            None
+        }
+    }
 }
 
 /// Rank dots by measured latency, best (lowest RTT) first.
 ///
-/// All dots are probed concurrently through `outbound`. Reachable dots are
+/// All dots are probed concurrently; `build_client` yields the per-dot API
+/// client (or `None` when its endpoint can't be built). Reachable dots are
 /// ordered ahead of unreachable ones; ties and unreachable dots keep their
-/// original order. This mirrors the "auto" outbound-interface behaviour: when
-/// the caller has not pinned a specific node, pick the one that responds
-/// fastest over the egress path the tunnel will use.
+/// original order.
 #[must_use = "the returned, latency-ordered list is the selection result"]
 pub async fn rank_dots_by_latency(
-    dots: Vec<VpnDot>, outbound: Option<OutboundInterface>,
+    dots: Vec<VpnDot>, build_client: impl Fn(&VpnDot) -> Option<ApiClient>,
 ) -> Vec<VpnDot> {
     if dots.len() <= 1 {
         return dots;
@@ -57,21 +48,10 @@ pub async fn rank_dots_by_latency(
 
     let mut join_set = tokio::task::JoinSet::new();
     for (index, dot) in dots.iter().enumerate() {
-        let host = dot.api_host().map(ToOwned::to_owned);
-        let port = dot
-            .api_port
-            .and_then(|p| u16::try_from(p).ok())
-            .unwrap_or(DEFAULT_API_PORT);
-        let outbound = outbound.clone();
-        join_set.spawn(async move {
-            let rtt = match host {
-                Some(host) => {
-                    probe_latency(&host, port, outbound.as_ref(), DEFAULT_PROBE_TIMEOUT).await
-                }
-                None => None,
-            };
-            (index, rtt)
-        });
+        let Some(client) = build_client(dot) else {
+            continue;
+        };
+        join_set.spawn(async move { (index, probe_latency(&client, DEFAULT_PROBE_TIMEOUT).await) });
     }
 
     let mut latencies: Vec<Option<Duration>> = vec![None; dots.len()];
@@ -95,14 +75,6 @@ pub fn cmp_latency(a: Option<Duration>, b: Option<Duration>) -> std::cmp::Orderi
         (None, Some(_)) => std::cmp::Ordering::Greater,
         (None, None) => std::cmp::Ordering::Equal,
     }
-}
-
-/// Resolve `host:port` (an IP literal or DNS name) to a single [`SocketAddr`].
-async fn resolve_addr(host: &str, port: u16) -> Option<SocketAddr> {
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return Some(SocketAddr::new(ip, port));
-    }
-    tokio::net::lookup_host((host, port)).await.ok()?.next()
 }
 
 #[cfg(test)]

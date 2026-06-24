@@ -58,6 +58,22 @@ struct Args {
     /// Address to bind the Connect RPC server.
     #[arg(long, default_value = "127.0.0.1:7878")]
     listen: SocketAddr,
+
+    /// Log filter in `tracing` `EnvFilter` syntax, e.g.
+    /// `info,rustylink_tunnel=trace,gotatun=debug`. Reads `RUST_LOG` when the
+    /// flag is omitted; defaults to `debug` in debug builds, `info` in release.
+    #[arg(long, env = "RUST_LOG", default_value_t = default_log_level())]
+    log_level: String,
+}
+
+/// Default log filter: verbose in debug builds, quiet in release. Overridden by
+/// `--log-level` or `RUST_LOG`.
+fn default_log_level() -> String {
+    if cfg!(debug_assertions) {
+        "debug".to_owned()
+    } else {
+        "info".to_owned()
+    }
 }
 
 #[snafu::report]
@@ -65,10 +81,14 @@ struct Args {
 async fn main() -> Result<(), InitError> {
     let args = Args::parse();
 
+    // `--log-level` / `RUST_LOG` (full EnvFilter syntax) gates both our
+    // `tracing` events and gotatun's `log` records (bridged via
+    // tracing-subscriber's `tracing-log` feature). Falls back to the cfg-based
+    // default on an invalid directive.
+    let filter =
+        EnvFilter::try_new(&args.log_level).unwrap_or_else(|_| EnvFilter::new(default_log_level()));
     fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
+        .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .init();
 

@@ -222,14 +222,14 @@ pub struct PersistedTotpConfig {
 /// Last VPN connect parameters (for auto-reconnect).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PersistedVpnRequest {
-    /// VPN connect mode name (e.g. `"Full"`, `"Split"`, `"Relay"`).
+    /// VPN connect mode name (e.g. `"Full"`, `"Split"`).
     pub mode: String,
     /// Export ID for the connection.
     pub export_id: i32,
     /// Preferred dot ID, if any.
     pub preferred_dot_id: Option<i32>,
-    /// Protocol mode (0 = UDP, 1 = `FeiLian` TCP, 2 = Dual/Auto).
-    pub protocol_mode: i32,
+    /// Caller-requested `WireGuard` transport (UDP or `FeiLian` TCP).
+    pub protocol_mode: rustylink_api::ProtocolMode,
     /// Whether this is a reconnect attempt.
     pub reconnect: bool,
 }

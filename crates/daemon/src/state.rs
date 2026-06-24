@@ -17,8 +17,12 @@
 
 use jiff::Timestamp;
 use rustylink_api::{
-    ApiClient, ApiHooks, ClientIdentity, CookieJar, CookieStore, MatchEndpoint, SigningConfig,
-    SigningContext, TenantEndpoint,
+    ApiClient, ApiHooks, ClientIdentity, CookieJar, CookieStore, MatchEndpoint, ProtocolMode,
+    SigningConfig, SigningContext, TenantEndpoint,
+};
+pub use rustylink_core::state::{
+    auth::{AuthState, LoginApiVersion},
+    vpn::{ActiveTunnel, VpnRequest, VpnState},
 };
 use rustylink_core::{
     state::auth::{self as core_auth, DeviceLoginPending, OAuthPending},
@@ -27,11 +31,6 @@ use rustylink_core::{
 use rustylink_proto::proto::rustylink::daemon::v1 as pb;
 use rustylink_tunnel::TunnelSession;
 use tokio_util::sync::CancellationToken;
-
-pub use rustylink_core::state::{
-    auth::{AuthState, LoginApiVersion},
-    vpn::{ActiveTunnel, VpnRequest, VpnState},
-};
 
 use crate::{
     error::{DaemonError, Result, RpcFault},
@@ -52,8 +51,9 @@ pub struct AuthMachine {
     pub(crate) tenant: Option<TenantConfig>,
     /// Signing / HMAC configuration (set after activation).
     pub(crate) signing: Option<PersistedSigningConfig>,
-    /// HTTP session cookies, shared as a live jar with every [`ApiClient`] built
-    /// from this machine's hooks.  Also holds the `csrf-token` cookie.
+    /// HTTP session cookies, shared as a live jar with every [`ApiClient`]
+    /// built from this machine's hooks.  Also holds the `csrf-token`
+    /// cookie.
     pub(crate) cookies: CookieJar,
     /// Knock token for API request decoration.
     pub(crate) knock_token: Option<String>,
@@ -63,7 +63,8 @@ pub struct AuthMachine {
     pub(crate) login_api_version: LoginApiVersion,
     /// Pending OAuth flow parameters (set while in `AwaitingOauth`).
     pub(crate) oauth_pending: Option<OAuthPending>,
-    /// Pending device login flow parameters (set while in `AwaitingDeviceLogin`).
+    /// Pending device login flow parameters (set while in
+    /// `AwaitingDeviceLogin`).
     pub(crate) device_login_pending: Option<DeviceLoginPending>,
 }
 
@@ -289,8 +290,8 @@ impl AuthMachine {
             .ok_or_else(|| DaemonError::from(RpcFault::NotConfigured))
     }
 
-    /// Build an [`ApiClient`] pointing at the tenant's base URL with the current
-    /// signing/cookie state.  Returns `None` before activation.
+    /// Build an [`ApiClient`] pointing at the tenant's base URL with the
+    /// current signing/cookie state.  Returns `None` before activation.
     pub fn build_tenant_client(&self) -> Option<ApiClient> {
         let tenant = self.tenant.as_ref()?;
         let endpoint = TenantEndpoint::new(&tenant.base_url).ok()?;
@@ -449,8 +450,9 @@ impl AuthMachine {
     }
 
     /// Restore an `AuthMachine` from persisted credentials.  Starts in
-    /// `Unconfigured`; the daemon calls [`restore_session`](Self::restore_session)
-    /// to place it into the right state.
+    /// `Unconfigured`; the daemon calls
+    /// [`restore_session`](Self::restore_session) to place it into the
+    /// right state.
     #[must_use]
     pub fn restore_from_credentials(
         creds: PersistedCredentials, http_pool: reqwest::Client, identity: ClientIdentity,
@@ -514,7 +516,7 @@ impl VpnMachine {
                 mode: request.mode.to_string(),
                 export_id: request.export_id,
                 preferred_dot_id: request.preferred_dot_id,
-                protocol_mode: 0,
+                protocol_mode: request.protocol_mode,
                 reconnect: request.reconnect,
             })
     }
@@ -613,16 +615,15 @@ impl VpnMachine {
 
 /// Build a [`VpnRequest`] from a `ConnectTunnel` RPC request.
 ///
-/// A free function rather than a `From` impl because [`VpnRequest`] is a foreign
-/// (core) type.
+/// A free function rather than a `From` impl because [`VpnRequest`] is a
+/// foreign (core) type.
 #[must_use]
 pub fn vpn_request_from_proto(
-    mode: Option<pb::VpnMode>, export_id: i32, preferred_dot_id: Option<i32>, otp: Option<&str>,
-    reconnect: bool,
+    mode: Option<pb::VpnMode>, protocol_mode: Option<pb::ProtocolMode>, export_id: i32,
+    preferred_dot_id: Option<i32>, otp: Option<&str>, reconnect: bool,
 ) -> VpnRequest {
     let mode = match mode {
         Some(pb::VpnMode::Split) => VpnConnectMode::Split,
-        Some(pb::VpnMode::Relay) => VpnConnectMode::Relay,
         _ => VpnConnectMode::Full,
     };
     VpnRequest {
@@ -631,5 +632,17 @@ pub fn vpn_request_from_proto(
         preferred_dot_id,
         otp: otp.filter(|s| !s.is_empty()).map(ToOwned::to_owned),
         reconnect,
+        protocol_mode: protocol_mode_to_api(protocol_mode),
+    }
+}
+
+/// Translate the proto `ProtocolMode` (UNSPECIFIED=0/UDP=1/TCP=2) to the api
+/// enum. Unspecified or unknown wire values fall back to UDP (the user-facing
+/// dropdown never offers `Unspecified`, but proto3 default-zero clients land
+/// here).
+fn protocol_mode_to_api(mode: Option<pb::ProtocolMode>) -> ProtocolMode {
+    match mode {
+        Some(pb::ProtocolMode::Tcp) => ProtocolMode::FeilianTcp,
+        Some(pb::ProtocolMode::Udp | pb::ProtocolMode::Unspecified) | None => ProtocolMode::Udp,
     }
 }

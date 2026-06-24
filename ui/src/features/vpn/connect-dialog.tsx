@@ -1,6 +1,6 @@
 import { useMutation, useQuery } from "@connectrpc/connect-query"
 import { standardSchemaResolver } from "@hookform/resolvers/standard-schema"
-import { type ReactElement, useEffect, useState } from "react"
+import { type ReactElement, useEffect, useMemo, useState } from "react"
 import { Controller, useForm } from "react-hook-form"
 import { toast } from "sonner"
 import { z } from "zod"
@@ -29,6 +29,7 @@ import {
   listVpnLocations,
   probeDotLatency,
 } from "@/gen/rustylink/daemon/v1/daemon-VpnService_connectquery"
+import type { VpnLocation } from "@/gen/rustylink/daemon/v1/tunnel_pb"
 import { ProtocolMode, VpnMode } from "@/gen/rustylink/daemon/v1/types_pb"
 import { useApplyTunnel } from "@/hooks/use-tunnel"
 import { errorMessage } from "@/lib/errors"
@@ -51,6 +52,22 @@ const schema = z.object({
 })
 type Values = z.infer<typeof schema>
 
+/// Protocols the picked location accepts. When `Auto` is the location, every
+/// real protocol is allowed because the daemon may land on any dot.
+function supportedProtocolsFor(
+  locationId: string,
+  locations: VpnLocation[] | undefined
+): Set<ProtocolMode> {
+  if (locationId === AUTO || !locations) {
+    return new Set(PROTOCOL_MODES.map((p) => p.value))
+  }
+  const dot = locations.find((l) => String(l.id) === locationId)
+  if (!dot || dot.supportedProtocols.length === 0) {
+    return new Set(PROTOCOL_MODES.map((p) => p.value))
+  }
+  return new Set(dot.supportedProtocols)
+}
+
 export function ConnectDialog({
   trigger,
   defaultLocationId,
@@ -62,12 +79,12 @@ export function ConnectDialog({
   const locations = useQuery(listVpnLocations, {}, { enabled: open })
   const applyTunnel = useApplyTunnel()
 
-  const { control, register, handleSubmit, setValue } = useForm<Values>({
+  const { control, register, handleSubmit, setValue, watch } = useForm<Values>({
     resolver: standardSchemaResolver(schema),
     defaultValues: {
       locationId: AUTO,
       mode: VpnMode.FULL,
-      protocol: ProtocolMode.AUTO,
+      protocol: ProtocolMode.UDP,
       otp: "",
       reconnect: true,
     },
@@ -78,6 +95,24 @@ export function ConnectDialog({
       setValue("locationId", String(defaultLocationId))
     }
   }, [open, defaultLocationId, setValue])
+
+  const locationId = watch("locationId")
+  const protocol = watch("protocol")
+  const supported = useMemo(
+    () => supportedProtocolsFor(locationId, locations.data?.locations),
+    [locationId, locations.data?.locations]
+  )
+
+  // Snap the protocol to a supported one whenever the dot changes (e.g. user
+  // had UDP picked, then chose a TCP-only dot).
+  useEffect(() => {
+    if (!supported.has(protocol as ProtocolMode)) {
+      const fallback = PROTOCOL_MODES.find((p) => supported.has(p.value))
+      if (fallback) {
+        setValue("protocol", fallback.value)
+      }
+    }
+  }, [supported, protocol, setValue])
 
   const probe = useMutation(probeDotLatency)
   const connect = useMutation(connectTunnel, {
@@ -223,11 +258,19 @@ export function ConnectDialog({
                       </SelectValue>
                     </SelectTrigger>
                     <SelectContent>
-                      {PROTOCOL_MODES.map((p) => (
-                        <SelectItem key={p.value} value={String(p.value)}>
-                          {p.label}
-                        </SelectItem>
-                      ))}
+                      {PROTOCOL_MODES.map((p) => {
+                        const enabled = supported.has(p.value)
+                        return (
+                          <SelectItem
+                            key={p.value}
+                            value={String(p.value)}
+                            disabled={!enabled}
+                          >
+                            {p.label}
+                            {enabled ? "" : " · unavailable"}
+                          </SelectItem>
+                        )
+                      })}
                     </SelectContent>
                   </Select>
                 )}

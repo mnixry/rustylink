@@ -50,11 +50,12 @@ export function isActive(state: Tunnel_State): boolean {
 export const VPN_MODES: { value: VpnMode; label: string }[] = [
   { value: VpnMode.FULL, label: "Full tunnel" },
   { value: VpnMode.SPLIT, label: "Split tunnel" },
-  { value: VpnMode.RELAY, label: "Relay" },
 ]
 
+// The dropdown only exposes the two real transports. `PROTOCOL_MODE_UNSPECIFIED`
+// exists on the wire as the proto3 default and is treated as UDP server-side,
+// but the user must pick one explicitly here.
 export const PROTOCOL_MODES: { value: ProtocolMode; label: string }[] = [
-  { value: ProtocolMode.AUTO, label: "Auto" },
   { value: ProtocolMode.UDP, label: "UDP" },
   { value: ProtocolMode.TCP, label: "TCP" },
 ]
@@ -64,5 +65,5 @@ export function vpnModeLabel(mode: VpnMode): string {
 }
 
 export function protocolModeLabel(mode: ProtocolMode): string {
-  return PROTOCOL_MODES.find((m) => m.value === mode)?.label ?? "Auto"
+  return PROTOCOL_MODES.find((m) => m.value === mode)?.label ?? "UDP"
 }

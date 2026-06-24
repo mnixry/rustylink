@@ -4,6 +4,7 @@ use gotatun::{
     packet::{Packet, PacketBufPool},
     udp::{UdpRecv, UdpSend, UdpTransportFactory, UdpTransportFactoryParams},
 };
+use snafu::prelude::*;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::tcp::{OwnedReadHalf, OwnedWriteHalf},
@@ -14,6 +15,66 @@ use crate::OutboundInterface;
 
 const TCP_DIAL_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_FEILIAN_TCP_FRAME: u32 = 65_535;
+
+/// Errors on the `WireGuard` data path (UDP datagrams and the `FeiLian` TCP
+/// transport). gotatun's transport traits require [`std::io::Error`], so these
+/// are converted via [`From`] — which is also the single place they are
+/// **logged automatically** (once, with the full cause chain, since every
+/// variant's `Display` ends in `: {source}`). `warn` for real failures, `debug`
+/// for benign teardown.
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub(crate)))]
+pub(crate) enum TunnelTransportError {
+    #[snafu(display("failed to dial {transport} transport to {destination}: {source}"))]
+    Dial {
+        transport: &'static str,
+        destination: SocketAddr,
+        source: io::Error,
+    },
+    #[snafu(display("failed to send {len}-byte datagram to {destination}: {source}"))]
+    Send {
+        destination: SocketAddr,
+        len: usize,
+        source: io::Error,
+    },
+    #[snafu(display("failed to receive from {transport} transport: {source}"))]
+    Recv {
+        transport: &'static str,
+        source: io::Error,
+    },
+    #[snafu(display("{transport} receive channel closed"))]
+    RecvClosed { transport: &'static str },
+    #[snafu(display("invalid {transport} frame length {frame_len} for peer {peer}"))]
+    InvalidFrame {
+        transport: &'static str,
+        frame_len: usize,
+        peer: SocketAddr,
+    },
+}
+
+impl TunnelTransportError {
+    fn io_kind(&self) -> io::ErrorKind {
+        match self {
+            Self::Dial { source, .. } | Self::Send { source, .. } | Self::Recv { source, .. } => {
+                source.kind()
+            }
+            Self::RecvClosed { .. } => io::ErrorKind::ConnectionAborted,
+            Self::InvalidFrame { .. } => io::ErrorKind::InvalidData,
+        }
+    }
+}
+
+impl From<TunnelTransportError> for io::Error {
+    fn from(error: TunnelTransportError) -> Self {
+        if matches!(error, TunnelTransportError::RecvClosed { .. }) {
+            tracing::debug!(%error, "tunnel transport closed");
+        } else {
+            tracing::warn!(%error, "tunnel transport error");
+        }
+        let kind = error.io_kind();
+        Self::new(kind, error)
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct FeilianTcpTransportFactory {
@@ -70,64 +131,70 @@ impl UdpSend for FeilianTcpSend {
 
     async fn send_to(&self, packet: Packet, destination: SocketAddr) -> io::Result<()> {
         let payload = packet.to_vec();
-        let frame_len = u32::try_from(payload.len()).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "FeiLian TCP frame is larger than u32",
+        let frame_len = u32::try_from(payload.len())
+            .ok()
+            .filter(|len| *len != 0 && *len <= MAX_FEILIAN_TCP_FRAME)
+            .context(InvalidFrameSnafu {
+                transport: "FeiLian TCP",
+                frame_len: payload.len(),
+                peer: destination,
+            })?;
+
+        let mut state = self.state.lock().await;
+        let should_connect = state
+            .as_ref()
+            .is_none_or(|current| current.destination != destination);
+        if should_connect {
+            tracing::info!(
+                %destination,
+                outbound_interface = self
+                    .outbound_interface
+                    .as_ref()
+                    .map_or("<default>", |interface| interface.name.as_str()),
+                "dialing FeiLian TCP WireGuard transport"
+            );
+            let stream = crate::outbound::connect_tcp(
+                destination,
+                self.outbound_interface.as_ref(),
+                TCP_DIAL_TIMEOUT,
             )
-        })?;
-        if frame_len == 0 || frame_len > MAX_FEILIAN_TCP_FRAME {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("invalid FeiLian TCP frame length {frame_len}"),
+            .await
+            .context(DialSnafu {
+                transport: "FeiLian TCP",
+                destination,
+            })?;
+            let (reader, writer) = stream.into_split();
+            tokio::spawn(read_feilian_tcp_frames(
+                reader,
+                destination,
+                self.incoming.clone(),
             ));
+            *state = Some(TcpWriterState {
+                destination,
+                writer,
+            });
         }
 
-        {
-            let mut state = self.state.lock().await;
-            let should_connect = state
-                .as_ref()
-                .is_none_or(|current| current.destination != destination);
-            if should_connect {
-                tracing::info!(
-                    %destination,
-                    outbound_interface = self
-                        .outbound_interface
-                        .as_ref()
-                        .map_or("<default>", |interface| interface.name.as_str()),
-                    "dialing FeiLian TCP WireGuard transport"
-                );
-                let stream = crate::outbound::connect_tcp(
-                    destination,
-                    self.outbound_interface.as_ref(),
-                    TCP_DIAL_TIMEOUT,
-                )
-                .await?;
-                let (reader, writer) = stream.into_split();
-                tokio::spawn(read_feilian_tcp_frames(
-                    reader,
-                    destination,
-                    self.incoming.clone(),
-                ));
-                *state = Some(TcpWriterState {
-                    destination,
-                    writer,
-                });
-            }
-
-            let writer = &mut state
-                .as_mut()
-                .expect("state exists after successful FeiLian TCP dial")
-                .writer;
-            let result = match writer.write_all(&frame_len.to_le_bytes()).await {
-                Ok(()) => writer.write_all(&payload).await,
-                Err(error) => Err(error),
-            };
-            if result.is_err() {
-                *state = None;
-            }
-            result
+        let writer = &mut state
+            .as_mut()
+            .expect("state exists after successful FeiLian TCP dial")
+            .writer;
+        let write_result = async {
+            writer.write_all(&frame_len.to_le_bytes()).await?;
+            writer.write_all(&payload).await
         }
+        .await;
+        if write_result.is_err() {
+            // Drop the connection so the next datagram re-dials.
+            *state = None;
+        }
+        drop(state);
+        write_result.context(SendSnafu {
+            destination,
+            len: payload.len(),
+        })?;
+        tracing::trace!(%destination, frame_len, "feilian tcp tx");
+        Ok(())
     }
 
     fn local_addr(&self) -> io::Result<Option<SocketAddr>> {
@@ -139,11 +206,8 @@ impl UdpRecv for FeilianTcpRecv {
     type RecvManyBuf = ();
 
     async fn recv_from(&mut self, pool: &mut PacketBufPool) -> io::Result<(Packet, SocketAddr)> {
-        let (payload, source) = self.incoming.recv().await.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::ConnectionAborted,
-                "FeiLian TCP receive channel closed",
-            )
+        let (payload, source) = self.incoming.recv().await.context(RecvClosedSnafu {
+            transport: "FeiLian TCP",
         })?;
         let mut packet = pool.get();
         packet.buf_mut().clear();
@@ -172,7 +236,9 @@ async fn read_feilian_tcp_frames(
 ) {
     loop {
         let mut frame_len = [0_u8; 4];
-        if let Err(error) = reader.read_exact(&mut frame_len).await {
+        if let Err(error) = reader.read_exact(&mut frame_len).await.context(RecvSnafu {
+            transport: "FeiLian TCP",
+        }) {
             tracing::warn!(%source, %error, "FeiLian TCP frame reader stopped");
             return;
         }
@@ -182,10 +248,13 @@ async fn read_feilian_tcp_frames(
             return;
         }
         let mut payload = vec![0_u8; frame_len as usize];
-        if let Err(error) = reader.read_exact(&mut payload).await {
+        if let Err(error) = reader.read_exact(&mut payload).await.context(RecvSnafu {
+            transport: "FeiLian TCP",
+        }) {
             tracing::warn!(%source, %error, "failed to read FeiLian TCP frame payload");
             return;
         }
+        tracing::trace!(%source, frame_len, "feilian tcp rx");
         if incoming.send((payload, source)).await.is_err() {
             return;
         }

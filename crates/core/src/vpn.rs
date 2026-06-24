@@ -2,7 +2,7 @@ use rustylink_api::{
     ApiClient, BaseResponse, DotEndpoint, FetchOtpRequest, GetLoginSettingRequest,
     GetTenantConfigRequest, GetUserInfoRequest, GetVpnLocationsRequest, GetVpnSettingRequest,
     LoginSetting, OtpProvision, SendableRequest, TenantConfig, UserInfo, VpnConnRequest,
-    VpnConnResponse, VpnDot, VpnReportRequest, VpnSetting,
+    VpnConnResponse, VpnDot, VpnPingRequest, VpnReportRequest, VpnSetting,
 };
 use snafu::prelude::*;
 use strum::{Display, EnumIter, EnumString, FromRepr, IntoStaticStr};
@@ -31,8 +31,6 @@ pub enum VpnConnectMode {
     Full  = 0,
     #[strum(to_string = "Split", serialize = "split")]
     Split = 1,
-    #[strum(to_string = "Relay", serialize = "relay", serialize = "relpy")]
-    Relay = 2,
 }
 
 #[derive(Clone, Debug)]
@@ -317,6 +315,13 @@ pub async fn report_vpn(
     client: &ApiClient, request: &VpnReportRequest,
 ) -> Result<BaseResponse<serde_json::Value>> {
     request.clone().send(client).await.context(ApiSnafu)
+}
+
+/// Time a `GET /vpn/ping` against a dot's API server, used to measure latency
+/// to the access point for dot selection. Returns `Ok(())` on a `2xx` reply.
+pub async fn vpn_ping(client: &ApiClient) -> Result<()> {
+    VpnPingRequest.send(client).await.context(ApiSnafu)?;
+    Ok(())
 }
 
 /// Fetch the tenant TOTP provisioning from `POST /api/v2/p/otp`.

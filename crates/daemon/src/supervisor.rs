@@ -3,30 +3,40 @@
 //! disconnect (S2).
 //!
 //! Triggers detected here (per D9):
-//!   - `TransportFailed`  — `TunnelSession::wait()` resolves (device error)
-//!   - `HandshakeTimeout` — WG last-handshake age exceeds a protocol threshold
-//!   - `NetworkChanged`   — default route / pinned interface changes (S3)
-//!   - `ServerKickOut`    — periodic `/vpn/report` returns force-logout
+//!   - `TransportFailed`   — `TunnelSession::wait()` resolves (device error)
+//!   - `HandshakeTimeout`  — liveness probe stops getting replies (initial
+//!     connect window: no probe reply within [`CONNECT_TIMEOUT`]; steady-state:
+//!     gap between replies exceeds [`LIVENESS_TIMEOUT`])
+//!   - `NetworkChanged`    — default route / pinned interface changes (S3)
+//!   - `ServerKickOut`     — periodic `/vpn/report` returns force-logout
 //!
 //! `IdleTimeout` is deferred (not reverse-engineered).
+//!
+//! gotatun is lazy: `WireGuard` performs the initial handshake only when an
+//! outbound TUN packet asks for the first transport (there is no force-
+//! handshake API). The `LivenessProbe` owned by the session sends a constant
+//! routed DNS query every ~3 s, which both triggers the initial handshake and
+//! provides the steady-state liveness signal we read here.
 
 use std::time::Duration;
 
-use rustylink_api::VpnProtocolDetectConfig;
-use rustylink_tunnel::{ProtocolMode, ReconnectEvent, TunnelSession};
+use rustylink_tunnel::{ReconnectEvent, TunnelSession};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-/// How often to poll the WG handshake age and the network state.
-const HANDSHAKE_POLL: Duration = Duration::from_secs(3);
+/// How often to inspect probe + network + report state.
+const LIVENESS_POLL: Duration = Duration::from_secs(3);
 const NETWORK_POLL: Duration = Duration::from_secs(5);
 const REPORT_INTERVAL: Duration = Duration::from_mins(1);
 
-/// Handshake-age thresholds by protocol mode (UDP / TCP / dual), in seconds.
-const HANDSHAKE_TIMEOUT_UDP: u64 = 15;
-const HANDSHAKE_TIMEOUT_TCP: u64 = 9;
-const HANDSHAKE_TIMEOUT_DUAL: u64 = 6;
-const TCP_TO_UDP_AVOID_AFTER_UDP_TO_TCP: Duration = Duration::from_hours(1);
+/// Maximum time we wait for the first liveness-probe reply after connect.
+/// Exceeding it without any reply is treated as `HandshakeTimeout`.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Maximum gap between successive liveness-probe replies on a healthy tunnel.
+/// Exceeding it is treated as `HandshakeTimeout` (likely peer death, network
+/// stall, or roaming).
+const LIVENESS_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The reason a supervised tunnel stopped.
 #[derive(Clone, Debug)]
@@ -35,37 +45,8 @@ pub enum SupervisorOutcome {
     Trigger(ReconnectEvent),
     /// The server forced a logout via a `/vpn/report` response.
     ServerKickOut,
-    /// Protocol detection selected the other transport for a dual-capable dot.
-    ProtocolSwitch(ProtocolMode),
     /// Disconnect was requested (cancellation).
     Cancelled,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct ProtocolDetectOptions {
-    pub config: Option<VpnProtocolDetectConfig>,
-    pub dot_protocol_mode: Option<ProtocolMode>,
-    pub last_udp_to_tcp: Option<Instant>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ProtocolDetectAction {
-    Continue,
-    HandshakeTimeout,
-    Switch(ProtocolMode),
-}
-
-#[derive(Clone, Debug)]
-struct ProtocolDetectState {
-    udp2tcp_timeout_count: Option<u32>,
-    tcp2udp_available_count: Option<u32>,
-    refresh_timeout_count: Option<u32>,
-    bad_network_count: Option<u32>,
-    udp_timeout_count: u32,
-    tcp_timeout_count: u32,
-    tcp_available_count: u32,
-    bad_network_samples: u32,
-    last_udp_to_tcp: Option<Instant>,
 }
 
 /// Network-state snapshot used to detect changes.
@@ -86,124 +67,23 @@ fn interface_present(name: &str) -> bool {
     default_net::get_interfaces().iter().any(|i| i.name == name)
 }
 
-fn handshake_threshold(protocol_mode: Option<ProtocolMode>) -> Duration {
-    let secs = match protocol_mode {
-        Some(ProtocolMode::FeilianTcp) => HANDSHAKE_TIMEOUT_TCP,
-        Some(ProtocolMode::Dual) => HANDSHAKE_TIMEOUT_DUAL,
-        Some(ProtocolMode::Udp) | None => HANDSHAKE_TIMEOUT_UDP,
-    };
-    Duration::from_secs(secs)
+/// Liveness verdict from the probe state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LivenessStatus {
+    /// At least one probe reply within bounds.
+    Healthy,
+    /// No probe reply yet and the initial-connect window expired.
+    ConnectTimeout,
+    /// Probe replied at least once, but the gap to the last reply exceeded
+    /// [`LIVENESS_TIMEOUT`].
+    Stalled,
 }
 
-impl ProtocolDetectState {
-    fn new(options: ProtocolDetectOptions) -> Option<Self> {
-        let config = options.config?;
-        if config.enable != Some(true) || options.dot_protocol_mode != Some(ProtocolMode::Dual) {
-            return None;
-        }
-        let positive_count =
-            |value: Option<i32>| u32::try_from(value?).ok().filter(|value| *value > 0);
-        Some(Self {
-            udp2tcp_timeout_count: positive_count(config.udp2tcp_timeout_count),
-            tcp2udp_available_count: positive_count(config.tcp2udp_available_count),
-            refresh_timeout_count: positive_count(config.refresh_timeout_count),
-            bad_network_count: positive_count(config.bad_network_count),
-            udp_timeout_count: 0,
-            tcp_timeout_count: 0,
-            tcp_available_count: 0,
-            bad_network_samples: 0,
-            last_udp_to_tcp: options.last_udp_to_tcp,
-        })
-    }
-
-    fn record_timeout(&mut self, protocol_mode: Option<ProtocolMode>) -> ProtocolDetectAction {
-        self.tcp_available_count = 0;
-        match protocol_mode {
-            Some(ProtocolMode::FeilianTcp) => {
-                self.tcp_timeout_count = self.tcp_timeout_count.saturating_add(1);
-                if self
-                    .refresh_timeout_count
-                    .is_some_and(|threshold| self.tcp_timeout_count >= threshold)
-                {
-                    ProtocolDetectAction::HandshakeTimeout
-                } else if self.refresh_timeout_count.is_some() {
-                    tracing::warn!(
-                        timeout_count = self.tcp_timeout_count,
-                        threshold = ?self.refresh_timeout_count,
-                        "TCP protocol-detect timeout below refresh threshold"
-                    );
-                    ProtocolDetectAction::Continue
-                } else {
-                    ProtocolDetectAction::HandshakeTimeout
-                }
-            }
-            Some(ProtocolMode::Udp | ProtocolMode::Dual) | None => {
-                self.udp_timeout_count = self.udp_timeout_count.saturating_add(1);
-                self.bad_network_samples = self.bad_network_samples.saturating_add(1);
-                if self
-                    .udp2tcp_timeout_count
-                    .is_some_and(|threshold| self.udp_timeout_count >= threshold)
-                {
-                    tracing::warn!(
-                        timeout_count = self.udp_timeout_count,
-                        threshold = ?self.udp2tcp_timeout_count,
-                        "UDP protocol-detect threshold reached; switching to TCP"
-                    );
-                    ProtocolDetectAction::Switch(ProtocolMode::FeilianTcp)
-                } else if self
-                    .bad_network_count
-                    .is_some_and(|threshold| self.bad_network_samples >= threshold)
-                {
-                    ProtocolDetectAction::HandshakeTimeout
-                } else if self.udp2tcp_timeout_count.is_some() || self.bad_network_count.is_some() {
-                    tracing::warn!(
-                        timeout_count = self.udp_timeout_count,
-                        udp2tcp_threshold = ?self.udp2tcp_timeout_count,
-                        bad_network_samples = self.bad_network_samples,
-                        bad_network_threshold = ?self.bad_network_count,
-                        "UDP protocol-detect timeout below switch threshold"
-                    );
-                    ProtocolDetectAction::Continue
-                } else {
-                    ProtocolDetectAction::HandshakeTimeout
-                }
-            }
-        }
-    }
-
-    fn record_success(&mut self, protocol_mode: Option<ProtocolMode>) -> ProtocolDetectAction {
-        self.udp_timeout_count = 0;
-        self.tcp_timeout_count = 0;
-        self.bad_network_samples = 0;
-        if protocol_mode != Some(ProtocolMode::FeilianTcp) {
-            self.tcp_available_count = 0;
-            return ProtocolDetectAction::Continue;
-        }
-
-        self.tcp_available_count = self.tcp_available_count.saturating_add(1);
-        let Some(threshold) = self.tcp2udp_available_count else {
-            return ProtocolDetectAction::Continue;
-        };
-        if self.tcp_available_count < threshold {
-            return ProtocolDetectAction::Continue;
-        }
-        if self
-            .last_udp_to_tcp
-            .is_some_and(|instant| instant.elapsed() < TCP_TO_UDP_AVOID_AFTER_UDP_TO_TCP)
-        {
-            tracing::debug!(
-                available_count = self.tcp_available_count,
-                threshold,
-                "TCP protocol-detect availability threshold reached inside TCP-to-UDP avoid window"
-            );
-            return ProtocolDetectAction::Continue;
-        }
-        tracing::info!(
-            available_count = self.tcp_available_count,
-            threshold,
-            "TCP protocol-detect availability threshold reached; switching back to UDP"
-        );
-        ProtocolDetectAction::Switch(ProtocolMode::Udp)
+fn liveness_status(probe_age: Option<Duration>, session_age: Duration) -> LivenessStatus {
+    match probe_age {
+        None if session_age > CONNECT_TIMEOUT => LivenessStatus::ConnectTimeout,
+        Some(age) if age > LIVENESS_TIMEOUT => LivenessStatus::Stalled,
+        _ => LivenessStatus::Healthy,
     }
 }
 
@@ -212,22 +92,19 @@ impl ProtocolDetectState {
 /// `report` is invoked on the report interval; it returns `Ok(true)` if the
 /// server signalled a force-logout/kickout.
 pub async fn run<F, Fut>(
-    session: &mut TunnelSession, protocol_mode: Option<ProtocolMode>, outbound: Option<String>,
-    protocol_detect_options: ProtocolDetectOptions, cancel: CancellationToken, mut report: F,
+    session: &mut TunnelSession, outbound: Option<String>, cancel: CancellationToken, mut report: F,
 ) -> SupervisorOutcome
 where
     F: FnMut() -> Fut + Send,
     Fut: std::future::Future<Output = bool> + Send, {
-    let mut handshake_tick = tokio::time::interval(HANDSHAKE_POLL);
+    let mut liveness_tick = tokio::time::interval(LIVENESS_POLL);
     let mut network_tick = tokio::time::interval(NETWORK_POLL);
     let mut report_tick = tokio::time::interval(REPORT_INTERVAL);
     // Skip the immediate first tick on the report timer.
     report_tick.tick().await;
 
-    let threshold = handshake_threshold(protocol_mode);
     let last_net = current_net();
     let started = Instant::now();
-    let mut protocol_detect = ProtocolDetectState::new(protocol_detect_options);
 
     loop {
         tokio::select! {
@@ -238,31 +115,30 @@ where
                 return SupervisorOutcome::Trigger(ReconnectEvent::TransportFailed);
             }
 
-            _ = handshake_tick.tick() => {
-                let handshake_age = session.last_handshake().await;
-                if handshake_age.map_or_else(|| started.elapsed() > threshold, |age| age > threshold) {
-                    if let Some(detect) = &mut protocol_detect {
-                        match detect.record_timeout(protocol_mode) {
-                            ProtocolDetectAction::Continue => continue,
-                            ProtocolDetectAction::HandshakeTimeout => {}
-                            ProtocolDetectAction::Switch(protocol_mode) => {
-                                return SupervisorOutcome::ProtocolSwitch(protocol_mode);
-                            }
-                        }
-                    }
-                    tracing::warn!(
-                        age_secs = handshake_age.map(|age| age.as_secs()),
+            _ = liveness_tick.tick() => {
+                // Per-peer tx/rx + handshake age are debug-only diagnostic
+                // signals now: the supervisor's verdict comes from the routed
+                // probe, not the `WireGuard` handshake age (the Android client
+                // does the same — see `mLastRxBytes`/`mIdleCount`).
+                for peer in session.peer_stats().await {
+                    tracing::debug!(
+                        tx_bytes = peer.stats.tx_bytes,
+                        rx_bytes = peer.stats.rx_bytes,
+                        last_handshake_secs = peer.stats.last_handshake.map(|age| age.as_secs()),
                         session_age_secs = started.elapsed().as_secs(),
-                        "handshake timeout"
+                        "tunnel peer stats"
+                    );
+                }
+                let probe_age = session.last_probe_rx_elapsed();
+                let status = liveness_status(probe_age, started.elapsed());
+                if status != LivenessStatus::Healthy {
+                    tracing::warn!(
+                        ?status,
+                        probe_age_secs = probe_age.map(|d| d.as_secs()),
+                        session_age_secs = started.elapsed().as_secs(),
+                        "tunnel liveness probe stalled"
                     );
                     return SupervisorOutcome::Trigger(ReconnectEvent::HandshakeTimeout);
-                }
-                if handshake_age.is_some()
-                    && let Some(detect) = &mut protocol_detect
-                    && let ProtocolDetectAction::Switch(protocol_mode) =
-                        detect.record_success(protocol_mode)
-                {
-                    return SupervisorOutcome::ProtocolSwitch(protocol_mode);
                 }
             }
 
@@ -295,79 +171,34 @@ where
 mod tests {
     use std::time::Duration;
 
-    use rustylink_api::VpnProtocolDetectConfig;
-    use rustylink_tunnel::ProtocolMode;
-    use tokio::time::Instant;
-
-    use super::{
-        ProtocolDetectAction, ProtocolDetectOptions, ProtocolDetectState,
-        TCP_TO_UDP_AVOID_AFTER_UDP_TO_TCP,
-    };
-
-    fn config(
-        udp2tcp: i32, tcp2udp: i32, refresh: i32, bad_network: i32,
-    ) -> VpnProtocolDetectConfig {
-        VpnProtocolDetectConfig {
-            enable: Some(true),
-            udp2tcp_timeout_count: Some(udp2tcp),
-            tcp2udp_available_count: Some(tcp2udp),
-            refresh_timeout_count: Some(refresh),
-            bad_network_count: Some(bad_network),
-        }
-    }
+    use super::{CONNECT_TIMEOUT, LIVENESS_TIMEOUT, LivenessStatus, liveness_status};
 
     #[test]
-    fn udp_timeouts_switch_to_tcp_after_config_threshold() {
-        let mut state = ProtocolDetectState::new(ProtocolDetectOptions {
-            config: Some(config(2, 0, 0, 0)),
-            dot_protocol_mode: Some(ProtocolMode::Dual),
-            last_udp_to_tcp: None,
-        })
-        .expect("state");
-
+    fn initial_connect_window_tolerates_silence_then_fails() {
+        // Before the connect timeout, silence is acceptable (handshake still
+        // pending lazy-trigger via the first probe).
         assert_eq!(
-            state.record_timeout(Some(ProtocolMode::Udp)),
-            ProtocolDetectAction::Continue
+            liveness_status(None, CONNECT_TIMEOUT.saturating_sub(Duration::from_secs(1))),
+            LivenessStatus::Healthy
         );
+        // Past the connect timeout, silence is a hard failure.
         assert_eq!(
-            state.record_timeout(Some(ProtocolMode::Udp)),
-            ProtocolDetectAction::Switch(ProtocolMode::FeilianTcp)
+            liveness_status(None, CONNECT_TIMEOUT + Duration::from_secs(1)),
+            LivenessStatus::ConnectTimeout
         );
     }
 
     #[test]
-    fn tcp_success_switches_back_to_udp_outside_avoid_window() {
-        let mut state = ProtocolDetectState::new(ProtocolDetectOptions {
-            config: Some(config(0, 2, 0, 0)),
-            dot_protocol_mode: Some(ProtocolMode::Dual),
-            last_udp_to_tcp: Some(
-                Instant::now() - TCP_TO_UDP_AVOID_AFTER_UDP_TO_TCP - Duration::from_secs(1),
-            ),
-        })
-        .expect("state");
-
+    fn steady_state_stalls_when_probe_gap_exceeds_threshold() {
+        let healthy = LIVENESS_TIMEOUT.saturating_sub(Duration::from_secs(1));
+        let stalled = LIVENESS_TIMEOUT + Duration::from_secs(1);
         assert_eq!(
-            state.record_success(Some(ProtocolMode::FeilianTcp)),
-            ProtocolDetectAction::Continue
+            liveness_status(Some(healthy), Duration::from_mins(2)),
+            LivenessStatus::Healthy
         );
         assert_eq!(
-            state.record_success(Some(ProtocolMode::FeilianTcp)),
-            ProtocolDetectAction::Switch(ProtocolMode::Udp)
-        );
-    }
-
-    #[test]
-    fn tcp_success_does_not_switch_inside_avoid_window() {
-        let mut state = ProtocolDetectState::new(ProtocolDetectOptions {
-            config: Some(config(0, 1, 0, 0)),
-            dot_protocol_mode: Some(ProtocolMode::Dual),
-            last_udp_to_tcp: Some(Instant::now()),
-        })
-        .expect("state");
-
-        assert_eq!(
-            state.record_success(Some(ProtocolMode::FeilianTcp)),
-            ProtocolDetectAction::Continue
+            liveness_status(Some(stalled), Duration::from_mins(2)),
+            LivenessStatus::Stalled
         );
     }
 }

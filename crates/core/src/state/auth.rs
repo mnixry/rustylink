@@ -23,7 +23,8 @@ pub enum LoginApiVersion {
     V1,
 }
 
-/// Pending OAuth flow parameters (set when entering [`AuthState::AwaitingOauth`]).
+/// Pending OAuth flow parameters (set when entering
+/// [`AuthState::AwaitingOauth`]).
 #[derive(Clone, Debug)]
 pub struct OAuthPending {
     pub alias_key: String,
@@ -195,7 +196,8 @@ pub async fn skip_challenge(client: &ApiClient, login_scene: String) -> Result<A
 }
 
 /// Begin a third-party OAuth login: fetch the provider list and build the
-/// pending flow (PKCE-bound authorize URL + the verifier kept for the callback).
+/// pending flow (PKCE-bound authorize URL + the verifier kept for the
+/// callback).
 pub async fn start_oauth(client: &ApiClient, alias_key: &str) -> Result<OAuthPending> {
     let links = crate::auth::third_party_login_links(client)
         .await
@@ -206,8 +208,7 @@ pub async fn start_oauth(client: &ApiClient, alias_key: &str) -> Result<OAuthPen
         .unwrap_or_default()
         .into_iter()
         .find(|info| {
-            info.alias_key.as_deref() == Some(alias_key)
-                || info.alias.as_deref() == Some(alias_key)
+            info.alias_key.as_deref() == Some(alias_key) || info.alias.as_deref() == Some(alias_key)
         })
         .context(UnknownProviderSnafu {
             alias: alias_key.to_owned(),
@@ -254,8 +255,7 @@ pub async fn start_device_login(client: &ApiClient, alias_key: &str) -> Result<D
         .unwrap_or_default()
         .into_iter()
         .find(|info| {
-            info.alias_key.as_deref() == Some(alias_key)
-                || info.alias.as_deref() == Some(alias_key)
+            info.alias_key.as_deref() == Some(alias_key) || info.alias.as_deref() == Some(alias_key)
         })
         .context(UnknownProviderSnafu {
             alias: alias_key.to_owned(),

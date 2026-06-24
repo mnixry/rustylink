@@ -118,6 +118,18 @@ impl OutboundInterface {
             index: interface.index,
         })
     }
+
+    /// Look up an interface by name (used to pin the routed DNS transport to
+    /// the TUN device, so its packets egress the tunnel rather than racing
+    /// the system routing table). Returns `None` if the interface is not
+    /// found or its OS index isn't populated yet.
+    #[must_use]
+    pub fn lookup(name: &str) -> Option<Self> {
+        default_net::get_interfaces()
+            .into_iter()
+            .find(|interface| interface.name == name && interface.index > 0)
+            .and_then(|interface| Self::from_interface(interface).ok())
+    }
 }
 
 impl BoundUdpSocketFactory {
@@ -172,7 +184,7 @@ impl UdpRecv for BoundUdpSocket {
     }
 }
 
-pub fn bind_udp_socket(
+pub fn bind_udp(
     bind_addr: SocketAddr, outbound_interface: Option<&OutboundInterface>,
 ) -> io::Result<UdpSocket> {
     let family = SocketFamily::from_addr(bind_addr);
@@ -195,71 +207,42 @@ pub async fn connect_tcp(
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TCP dial timed out"))?
 }
 
+/// Bind the matching IPv4/IPv6 `WireGuard` UDP socket pair on a shared local
+/// port. A fixed `port` is bound directly; an ephemeral port (`0`) is resolved
+/// from the IPv4 socket and copied to IPv6, retrying that copy if the OS hands
+/// the same number to another socket first.
 fn bind_udp_pair(
     addr_v4: Ipv4Addr, addr_v6: Ipv6Addr, port: u16, outbound_interface: Option<&OutboundInterface>,
 ) -> io::Result<(BoundUdpSocket, BoundUdpSocket)> {
-    let udp_v4 = bind_bound_udp_socket(
-        SocketAddr::from((addr_v4, port)),
-        SocketFamily::V4,
-        outbound_interface,
-    )?;
-    match port {
-        0 => bind_v6_with_retry(addr_v4, addr_v6, udp_v4, outbound_interface),
-        fixed_port => {
-            let udp_v6 = bind_bound_udp_socket(
-                SocketAddr::from((addr_v6, fixed_port)),
-                SocketFamily::V6,
-                outbound_interface,
-            )?;
-            Ok((udp_v4, udp_v6))
-        }
-    }
-}
-
-fn bind_v6_with_retry(
-    addr_v4: Ipv4Addr, addr_v6: Ipv6Addr, mut udp_v4: BoundUdpSocket,
-    outbound_interface: Option<&OutboundInterface>,
-) -> io::Result<(BoundUdpSocket, BoundUdpSocket)> {
-    let mut port = udp_v4.inner.local_addr()?.port();
     let mut retries = 0_u32;
-    let udp_v6 = loop {
-        match bind_bound_udp_socket(
-            SocketAddr::from((addr_v6, port)),
-            SocketFamily::V6,
-            outbound_interface,
-        ) {
-            Ok(socket) => break socket,
-            Err(error) if is_bind_retry_error(&error) && retries < BIND_MAX_RETRIES => {
+    loop {
+        let udp_v4 = bind_bound_udp(SocketAddr::from((addr_v4, port)), outbound_interface)?;
+        let bound_port = udp_v4.inner.local_addr()?.port();
+        match bind_bound_udp(SocketAddr::from((addr_v6, bound_port)), outbound_interface) {
+            Ok(udp_v6) => return Ok((udp_v4, udp_v6)),
+            // Only an ephemeral bind can race for its port; a fixed port that
+            // fails on IPv6 is a genuine error.
+            Err(error)
+                if port == 0 && is_bind_retry_error(&error) && retries < BIND_MAX_RETRIES =>
+            {
                 retries += 1;
                 tracing::debug!(
-                    port,
+                    bound_port,
                     retries,
                     max_retries = BIND_MAX_RETRIES,
                     "IPv6 UDP port already in use, retrying WireGuard UDP bind"
                 );
-                udp_v4 = bind_bound_udp_socket(
-                    SocketAddr::from((addr_v4, 0)),
-                    SocketFamily::V4,
-                    outbound_interface,
-                )?;
-                port = udp_v4.inner.local_addr()?.port();
             }
             Err(error) => return Err(error),
         }
-    };
-    Ok((udp_v4, udp_v6))
+    }
 }
 
-fn bind_bound_udp_socket(
-    bind_addr: SocketAddr, family: SocketFamily, outbound_interface: Option<&OutboundInterface>,
+fn bind_bound_udp(
+    bind_addr: SocketAddr, outbound_interface: Option<&OutboundInterface>,
 ) -> io::Result<BoundUdpSocket> {
-    let socket = new_socket2(family, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
-    socket.set_reuse_address(true)?;
-    bind_socket_to_interface(&socket, family, outbound_interface)?;
-    socket.bind(&bind_addr.into())?;
-    let inner = UdpSocket::from_std(socket.into())?;
     Ok(BoundUdpSocket {
-        inner: Arc::new(inner),
+        inner: Arc::new(bind_udp(bind_addr, outbound_interface)?),
     })
 }
 

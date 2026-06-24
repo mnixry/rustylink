@@ -11,7 +11,7 @@ use rustylink_proto::proto::rustylink::daemon::{v1 as pb, v1::VpnService};
 use tokio_stream::{StreamExt as _, wrappers::WatchStream};
 
 use crate::{
-    daemon::{Daemon, project_vpn_location},
+    daemon::{Daemon, build_dot_api_client, project_vpn_location},
     error::{DaemonError, RpcFault},
     latency,
     state::{VpnMachine, vpn_request_from_proto},
@@ -53,6 +53,7 @@ impl VpnService for VpnServiceImpl {
     ) -> ServiceResult<pb::ConnectTunnelResponse> {
         let vpn_request = vpn_request_from_proto(
             request.mode.as_known(),
+            request.protocol_mode.as_known(),
             request.export_id,
             request.preferred_dot_id,
             request.otp,
@@ -117,29 +118,36 @@ impl VpnService for VpnServiceImpl {
             .map_err(DaemonError::from)?;
         let dots = resp.data.unwrap_or_default();
 
-        // Probe through the picked outbound interface (configured or default),
-        // so the measured latency reflects the tunnel's actual egress path.
-        let outbound = self.daemon.resolve_outbound_interface().await;
+        // Reach each dot's API host with the tenant TLS name (matching the dot
+        // config call) and time `GET /vpn/ping` to measure latency.
+        let vpn_domain = rustylink_core::vpn::vpn_setting(&client)
+            .await
+            .ok()
+            .and_then(|resp| resp.data)
+            .and_then(|setting| setting.vpn_domain)
+            .filter(|domain| !domain.trim().is_empty());
+        let (pool, hooks) = {
+            let inner = self.daemon.inner.lock().await;
+            (inner.auth.http_pool.clone(), inner.auth.build_hooks())
+        };
 
         // Probe each dot in parallel using a JoinSet.
         let mut join_set = tokio::task::JoinSet::new();
         for dot in &dots {
             let dot_id = dot.id.unwrap_or_default();
             let dot_name = dot.name.clone().unwrap_or_default();
-            let host = dot.api_host().unwrap_or_default().to_owned();
-            let port = dot
-                .api_port
-                .and_then(|p| u16::try_from(p).ok())
-                .unwrap_or(latency::DEFAULT_API_PORT);
-            let outbound = outbound.clone();
+            let client = rustylink_api::DotEndpoint::from_dot(dot, false)
+                .ok()
+                .map(|endpoint| {
+                    build_dot_api_client(&endpoint, &pool, &hooks, vpn_domain.as_deref())
+                });
             join_set.spawn(async move {
-                let rtt = latency::probe_latency(
-                    &host,
-                    port,
-                    outbound.as_ref(),
-                    latency::DEFAULT_PROBE_TIMEOUT,
-                )
-                .await;
+                let rtt = match client {
+                    Some(client) => {
+                        latency::probe_latency(&client, latency::DEFAULT_PROBE_TIMEOUT).await
+                    }
+                    None => None,
+                };
                 pb::DotLatency {
                     dot_id,
                     dot_name,

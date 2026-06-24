@@ -6,14 +6,13 @@ enum VpnMode {
   VPN_MODE_UNSPECIFIED = 0;
   VPN_MODE_FULL = 1;
   VPN_MODE_SPLIT = 2;
-  VPN_MODE_RELAY = 3;
 }
 
 enum ProtocolMode {
+  // Default (proto3 zero). Treated as UDP server-side; the UI never offers it.
   PROTOCOL_MODE_UNSPECIFIED = 0;
   PROTOCOL_MODE_UDP = 1;
   PROTOCOL_MODE_TCP = 2;
-  PROTOCOL_MODE_AUTO = 3;
 }
 
 // Channel used to deliver a login verification code.

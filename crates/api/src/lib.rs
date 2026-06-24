@@ -15,12 +15,12 @@ pub use models::{
     GetThirdPartyLoginLinksRequest, GetUserInfoRequest, GetVpnExportsRequest,
     GetVpnLocationsRequest, GetVpnSettingRequest, IpDelayRoutingPolicy, JsonObject, LoginResult,
     LoginSetting, LoginV2Next, LoginV2Result, LogoutReason, LogoutRequest, OAuthCallbackRequest,
-    OAuthQueryCallbackRequest, OtpProvision, PasswordLoginRequest, SecurityReportItem,
-    SecurityReportRequest, SendCodeRequest, SendableRequest, SigningRule, TenantConfig,
-    TenantSigningConfig, ThirdPartyLoginInfo, ThirdPartyTokenCheckRequest, UserInfo,
+    OAuthQueryCallbackRequest, OtpProvision, PasswordLoginRequest, ProtocolMode,
+    SecurityReportItem, SecurityReportRequest, SendCodeRequest, SendableRequest, SigningRule,
+    TenantConfig, TenantSigningConfig, ThirdPartyLoginInfo, ThirdPartyTokenCheckRequest, UserInfo,
     V1LoginRequest, V1LoginSkipRequest, V1MfaSendRequest, V1MfaVerifyRequest, V1SendCodeRequest,
     V1VerifyCodeRequest, VerifyCodeRequest, VerifyMfaRequest, VpnConnRequest, VpnConnResponse,
     VpnConnSetting, VpnDot, VpnExportInfo, VpnExportListInfo, VpnLocation, VpnPingRequest,
-    VpnProtocolDetectConfig, VpnReportRequest, VpnReportType, VpnSetting,
+    VpnReportRequest, VpnReportType, VpnSetting,
 };
 pub use signing::{PasswordCipher, SigningConfig, SigningContext, SigningRuleConfig};

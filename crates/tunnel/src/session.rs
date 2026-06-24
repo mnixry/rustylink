@@ -1,4 +1,7 @@
-use std::net::{Ipv4Addr, Ipv6Addr, UdpSocket};
+use std::{
+    net::{Ipv4Addr, Ipv6Addr, UdpSocket},
+    sync::Arc,
+};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use gotatun::{
@@ -7,16 +10,16 @@ use gotatun::{
     x25519::{PublicKey, StaticSecret},
 };
 use ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
-use rustylink_api::VpnConnResponse;
+use rustylink_api::{ProtocolMode, VpnConnResponse};
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
-use strum::{Display, EnumIter, FromRepr};
 use tokio::net::lookup_host;
 use url::{Host, Url};
 
 use crate::{
-    BoundUdpSocketFactory, DnsHijackPlan, DnsHijackTun, DnsProxyRuntime,
-    FeilianTcpTransportFactory, IpTun, OutboundInterface, RoutePlan, route::AppliedRoutes,
+    BoundUdpSocketFactory, DnsHijackPlan, DnsQueryTransport, DnsResolver,
+    FeilianTcpTransportFactory, LivenessProbe, OutboundInterface, UdpDnsTransport, VpnTun,
+    route::{self, AppliedRoutes, VpnRouteMode},
 };
 
 const ANDROID_LOCAL_PORT_START: u16 = 12912;
@@ -24,8 +27,8 @@ const WIREGUARD_KEEPALIVE_SECS: u16 = 25;
 const STANDARD_NOISE_CONSTRUCTION: &[u8] = b"Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s";
 const FEILIAN_V2_PROTOCOL_IDENTIFIER: &[u8] = b"CorpLink v1 vpn@feilian-----------";
 
-type UdpTunnelDevice = Device<(BoundUdpSocketFactory, DnsHijackTun, DnsHijackTun)>;
-type TcpTunnelDevice = Device<(FeilianTcpTransportFactory, DnsHijackTun, DnsHijackTun)>;
+type UdpTunnelDevice = Device<(BoundUdpSocketFactory, VpnTun, VpnTun)>;
+type TcpTunnelDevice = Device<(FeilianTcpTransportFactory, VpnTun, VpnTun)>;
 
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
@@ -73,9 +76,6 @@ pub enum Error {
     #[snafu(display("TUN device creation failed: {source}"))]
     TunCreate { source: std::io::Error },
 
-    #[snafu(display("DNS hijack setup failed: {source}"))]
-    Dns { source: crate::dns::Error },
-
     #[snafu(display("outbound interface selection failed: {source}"))]
     Outbound { source: crate::outbound::Error },
 
@@ -93,9 +93,6 @@ pub enum Error {
 
     #[snafu(display("invalid WireGuard key `{name}`"))]
     InvalidKey { name: &'static str },
-
-    #[snafu(display("custom WireGuard engine failed: {message}"))]
-    WireGuard { message: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -121,11 +118,12 @@ pub struct TunnelConfig {
     pub server_public_key: String,
     pub server_preshared_key: Option<String>,
     pub endpoint: Url,
-    pub protocol_mode: Option<i32>,
+    pub protocol_mode: ProtocolMode,
     pub protocol_version: Option<String>,
-    pub protocol_detect_enable: bool,
     pub outbound_interface: Option<String>,
-    pub route_plan: RoutePlan,
+    pub routes: Vec<IpNetwork>,
+    pub full_tunnel: bool,
+    pub ipv6_enabled: bool,
     pub dns_plan: DnsHijackPlan,
 }
 
@@ -141,27 +139,13 @@ pub struct TunnelSession {
     pub config: TunnelConfig,
     pub status: TunnelStatus,
     device: Option<TunnelDevice>,
-    dns_proxy: Option<DnsProxyRuntime>,
     routes: Option<AppliedRoutes>,
+    probe: Option<LivenessProbe>,
 }
 
 enum TunnelDevice {
     Udp(UdpTunnelDevice),
     FeilianTcp(TcpTunnelDevice),
-}
-
-#[derive(Clone, Copy, Debug)]
-enum TunnelTransport {
-    Udp,
-    FeilianTcp,
-}
-
-#[derive(Clone, Copy, Debug, Display, EnumIter, Eq, FromRepr, PartialEq)]
-#[repr(i32)]
-pub enum ProtocolMode {
-    Udp        = 0,
-    FeilianTcp = 1,
-    Dual       = 2,
 }
 
 impl LocalTunnelParams {
@@ -190,7 +174,7 @@ impl LocalTunnelParams {
 impl TunnelConfig {
     pub fn from_vpn_conn(
         conn: &VpnConnResponse, local_params: LocalTunnelParams, endpoint: Url,
-        protocol_mode: Option<i32>, protocol_detect_enable: bool,
+        protocol_mode: ProtocolMode, route_mode: VpnRouteMode,
     ) -> Result<Self> {
         if conn.setting.vpn_mtu <= 0 {
             return InvalidConfigSnafu {
@@ -198,8 +182,19 @@ impl TunnelConfig {
             }
             .fail();
         }
-        let dns_plan =
-            DnsHijackPlan::from_vpn_conn(conn).with_local_dns(local_params.local_dns.clone());
+        let dns_plan = DnsHijackPlan::from_vpn_conn(conn, local_params.local_dns.as_deref());
+        let ipv6_enabled = conn
+            .ipv6
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty());
+        let routes =
+            route::networks_from_vpn_conn(conn, route_mode, ipv6_enabled).context(RouteSnafu)?;
+        tracing::info!(
+            %route_mode,
+            ipv6_enabled,
+            routes = routes.len(),
+            "selected VPN routes from config"
+        );
         Ok(Self {
             interface_name: default_interface_name(),
             local_addr: conn.ip.clone(),
@@ -214,9 +209,10 @@ impl TunnelConfig {
             endpoint,
             protocol_mode,
             protocol_version: conn.protocol_version.clone(),
-            protocol_detect_enable,
             outbound_interface: None,
-            route_plan: RoutePlan::from_vpn_conn(conn).context(RouteSnafu)?,
+            routes,
+            full_tunnel: matches!(route_mode, VpnRouteMode::Full),
+            ipv6_enabled,
             dns_plan,
         })
     }
@@ -229,8 +225,8 @@ impl TunnelSession {
             config,
             status: TunnelStatus::Created,
             device: None,
-            dns_proxy: None,
             routes: None,
+            probe: None,
         }
     }
 
@@ -247,6 +243,64 @@ impl TunnelSession {
         Ok(())
     }
 
+    /// In split-tunnel mode, route the system DNS server IP(s) into the TUN as
+    /// host routes so the OS's own DNS queries enter the tunnel and can be
+    /// intercepted by the hijacker. IPv6 servers are gated on the tunnel having
+    /// a v6 address. Full-tunnel mode needs no extra route (the default route
+    /// already covers them).
+    fn route_system_dns_into_tunnel(&mut self, system_servers: &[std::net::IpAddr]) {
+        if self.config.full_tunnel {
+            return;
+        }
+        let dns_host_routes = route::dns_host_routes(system_servers, self.config.ipv6_enabled);
+        if dns_host_routes.is_empty() {
+            return;
+        }
+        tracing::info!(
+            dns_host_routes = ?dns_host_routes
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            "routing system DNS servers into tunnel for split-tunnel DNS interception"
+        );
+        self.config.routes.extend(dns_host_routes);
+    }
+
+    /// Build the directed/routed DNS transports, the `DnsResolver`, and the
+    /// merged `VpnTun`. Returned alongside the routed transport (cloned so the
+    /// `LivenessProbe` can reuse it).
+    ///
+    /// The routed transport is pinned to the TUN via `IP_BOUND_IF` so the
+    /// probe + intranet forwards egress the `WireGuard` adapter rather than
+    /// racing the OS routing table; `VpnTun` skips hijacking these forwards
+    /// via its `dst ∈ vpn_dns_ips` check (otherwise the resolver would catch
+    /// its own traffic and loop indefinitely).
+    fn build_vpn_tun(
+        &self, tun_device: tun_rs::AsyncDevice, tun_name: &str,
+        outbound_interface: Option<&OutboundInterface>, system_servers: &[std::net::IpAddr],
+    ) -> Result<(VpnTun, Arc<dyn DnsQueryTransport>)> {
+        let tun_outbound = OutboundInterface::lookup(tun_name);
+        if tun_outbound.is_none() {
+            tracing::warn!(
+                tun = %tun_name,
+                "TUN interface index not yet visible; routed DNS will use OS routing only"
+            );
+        }
+        let directed_dns: Arc<dyn DnsQueryTransport> =
+            Arc::new(UdpDnsTransport::new(outbound_interface.cloned()));
+        let routed_dns: Arc<dyn DnsQueryTransport> = Arc::new(UdpDnsTransport::new(tun_outbound));
+        let resolver = DnsResolver::build(
+            &self.config.dns_plan,
+            self.config.full_tunnel,
+            system_servers,
+            directed_dns,
+            routed_dns.clone(),
+        )
+        .map(Arc::new);
+        let tun = VpnTun::new(tun_device, resolver).context(TunCreateSnafu)?;
+        Ok((tun, routed_dns))
+    }
+
     async fn start_inner(&mut self) -> Result<()> {
         tracing::info!(
             interface = %self.config.interface_name,
@@ -254,16 +308,16 @@ impl TunnelSession {
             endpoint = %self.config.endpoint,
             "starting tunnel session"
         );
-        validate_protocol_mode(&self.config)?;
-        let transport = tunnel_transport(&self.config);
         tracing::info!(
-            transport = ?transport,
-            protocol_mode = ?self.config.protocol_mode,
+            protocol_mode = %self.config.protocol_mode,
             protocol_version = ?self.config.protocol_version,
-            dns_proxy_port = self.config.dns_plan.proxy_port,
-            split_domain_rules = self.config.dns_plan.domain_rules.len(),
+            full_tunnel = self.config.full_tunnel,
+            vpn_routes = self.config.routes.len(),
+            split_domain_rules = self.config.dns_plan.split_domains.len(),
             "selected tunnel runtime options"
         );
+        let system_servers = crate::dns::system_dns_servers();
+        self.route_system_dns_into_tunnel(&system_servers);
         let endpoint = resolve_endpoint(&self.config.endpoint).await?;
         let private_key = StaticSecret::from(decode_key(
             "local_private_key",
@@ -271,7 +325,7 @@ impl TunnelSession {
         )?);
         let peer = tunnel_peer(&self.config, endpoint)?;
 
-        let (tun, actual_interface_name) = self.open_tun()?;
+        let (tun_device, actual_interface_name) = self.open_tun()?;
         let outbound_interface = OutboundInterface::resolve(
             self.config.outbound_interface.as_deref(),
             Some(&actual_interface_name),
@@ -290,20 +344,20 @@ impl TunnelSession {
                 "no outbound interface selected; tunnel sockets will use OS routing"
             );
         }
-        let routes = self
-            .config
-            .route_plan
-            .apply(&actual_interface_name)
+        let routes = self.config.routes.as_slice();
+        let routes = route::apply(&actual_interface_name, routes)
             .await
             .context(RouteSnafu)?;
         self.routes = Some(routes);
         self.status = TunnelStatus::RoutesApplied;
-        self.dns_proxy = DnsProxyRuntime::start(&self.config.dns_plan, outbound_interface.clone())
-            .await
-            .context(DnsSnafu)?;
-        let tun = DnsHijackTun::new(tun, &self.config.dns_plan, outbound_interface.clone());
-        let device = match transport {
-            TunnelTransport::Udp => {
+        let (tun, routed_dns) = self.build_vpn_tun(
+            tun_device,
+            &actual_interface_name,
+            outbound_interface.as_ref(),
+            &system_servers,
+        )?;
+        let device = match self.config.protocol_mode {
+            ProtocolMode::Udp => {
                 let builder = DeviceBuilder::new()
                     .with_udp(BoundUdpSocketFactory::new(outbound_interface.clone()))
                     .with_ip(tun)
@@ -313,7 +367,7 @@ impl TunnelSession {
                 let builder = with_feilian_protocol_identifier(builder, &self.config);
                 TunnelDevice::Udp(builder.build().await.context(DeviceSnafu)?)
             }
-            TunnelTransport::FeilianTcp => {
+            ProtocolMode::FeilianTcp => {
                 let builder = DeviceBuilder::new()
                     .with_udp(FeilianTcpTransportFactory::new(outbound_interface.clone()))
                     .with_ip(tun)
@@ -325,10 +379,14 @@ impl TunnelSession {
             }
         };
         self.device = Some(device);
+        self.probe = Some(LivenessProbe::start(
+            routed_dns,
+            self.config.dns_plan.vpn_servers.clone(),
+        ));
         self.status = TunnelStatus::Running;
         tracing::info!(
             interface = %self.config.interface_name,
-            transport = ?self.config.protocol_mode,
+            protocol_mode = %self.config.protocol_mode,
             "gotatun WireGuard device started"
         );
         Ok(())
@@ -336,9 +394,10 @@ impl TunnelSession {
 
     pub async fn stop(&mut self) -> Result<()> {
         tracing::info!(interface = %self.config.interface_name, "stopping tunnel session");
-        if let Some(dns_proxy) = self.dns_proxy.take() {
-            dns_proxy.stop();
-        }
+        // Drop the probe before tearing down the device so its spawned task
+        // (which sends through routed_dns → TUN → gotatun) is cancelled before
+        // the receive end disappears.
+        drop(self.probe.take());
         if let Some(routes) = self.routes.take() {
             routes.remove().await.context(RouteSnafu)?;
         }
@@ -347,6 +406,15 @@ impl TunnelSession {
         }
         self.status = TunnelStatus::Stopped;
         Ok(())
+    }
+
+    /// Elapsed time since the most recent reply to the routed liveness probe,
+    /// or `None` if no probe has succeeded yet (initial-connect window).
+    /// The supervisor uses this to detect a stalled tunnel
+    /// (`HandshakeTimeout`).
+    #[must_use]
+    pub fn last_probe_rx_elapsed(&self) -> Option<std::time::Duration> {
+        self.probe.as_ref().and_then(LivenessProbe::last_rx_elapsed)
     }
 
     pub async fn wait(&mut self) {
@@ -367,7 +435,19 @@ impl TunnelSession {
         }
     }
 
-    fn open_tun(&mut self) -> Result<(IpTun, String)> {
+    /// Per-peer transport counters (`tx_bytes` / `rx_bytes` / `last_handshake`)
+    /// for diagnostics. Empty when the device is not running. Used by the
+    /// daemon supervisor to log whether handshake bytes are leaving and
+    /// whether the server is replying.
+    pub async fn peer_stats(&self) -> Vec<gotatun::device::configure::PeerStats> {
+        match self.device.as_ref() {
+            Some(TunnelDevice::Udp(device)) => device.peers().await,
+            Some(TunnelDevice::FeilianTcp(device)) => device.peers().await,
+            None => Vec::new(),
+        }
+    }
+
+    fn open_tun(&mut self) -> Result<(tun_rs::AsyncDevice, String)> {
         let local_addr =
             self.config
                 .local_addr
@@ -446,9 +526,8 @@ impl TunnelSession {
             tun_builder = tun_builder.associate_route(false).packet_information(false);
         }
 
-        let tun = IpTun::new(tun_builder.build_async().context(TunCreateSnafu)?)
-            .context(TunCreateSnafu)?;
-        let actual_interface_name = tun.name().to_string();
+        let device = tun_builder.build_async().context(TunCreateSnafu)?;
+        let actual_interface_name = device.name().context(TunCreateSnafu)?;
         if actual_interface_name != requested_interface_name {
             if !cfg!(target_os = "macos") || requested_interface_name != "utun" {
                 return InvalidConfigSnafu {
@@ -467,7 +546,7 @@ impl TunnelSession {
                 .interface_name
                 .clone_from(&actual_interface_name);
         }
-        Ok((tun, actual_interface_name))
+        Ok((device, actual_interface_name))
     }
 }
 
@@ -511,32 +590,6 @@ fn choose_local_port() -> u16 {
         }
     }
     0
-}
-
-fn validate_protocol_mode(config: &TunnelConfig) -> Result<()> {
-    if config.protocol_detect_enable {
-        tracing::info!(
-            protocol_version = ?config.protocol_version,
-            protocol_mode = ?config.protocol_mode,
-            "protocol detection enabled; daemon supervisor applies Android-compatible switch thresholds"
-        );
-    }
-    if let Some(mode) = config.protocol_mode
-        && ProtocolMode::from_repr(mode).is_none()
-    {
-        return WireGuardSnafu {
-            message: format!("unsupported protocol_mode={mode}"),
-        }
-        .fail();
-    }
-    Ok(())
-}
-
-fn tunnel_transport(config: &TunnelConfig) -> TunnelTransport {
-    match config.protocol_mode.and_then(ProtocolMode::from_repr) {
-        Some(ProtocolMode::FeilianTcp) => TunnelTransport::FeilianTcp,
-        Some(ProtocolMode::Udp | ProtocolMode::Dual) | None => TunnelTransport::Udp,
-    }
 }
 
 fn with_feilian_protocol_identifier<Udp, TunTx, TunRx>(
@@ -608,7 +661,7 @@ fn tunnel_peer(config: &TunnelConfig, endpoint: std::net::SocketAddr) -> Result<
         PublicKey::from(decode_key("server_public_key", &config.server_public_key)?);
     let mut peer = Peer::new(server_public_key)
         .with_endpoint(endpoint)
-        .with_allowed_ips(allowed_ips(&config.route_plan));
+        .with_allowed_ips(config.routes.clone());
     peer.keepalive = Some(WIREGUARD_KEEPALIVE_SECS);
     if let Some(preshared_key) = config
         .server_preshared_key
@@ -618,18 +671,6 @@ fn tunnel_peer(config: &TunnelConfig, endpoint: std::net::SocketAddr) -> Result<
         peer = peer.with_preshared_key(decode_key("server_preshared_key", preshared_key)?);
     }
     Ok(peer)
-}
-
-fn allowed_ips(route_plan: &RoutePlan) -> Vec<IpNetwork> {
-    let mut networks = route_plan
-        .rules
-        .iter()
-        .map(|rule| rule.network)
-        .collect::<Vec<_>>();
-    if networks.is_empty() {
-        networks.push("0.0.0.0/0".parse().expect("static IPv4 CIDR is valid"));
-    }
-    networks
 }
 
 fn decode_key(name: &'static str, value: &str) -> Result<[u8; 32]> {

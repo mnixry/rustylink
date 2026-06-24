@@ -5,13 +5,14 @@ pub mod reconnect;
 pub mod route;
 pub mod session;
 pub mod transport;
-pub mod tun;
 
-pub use dns::{DnsHijackPlan, DnsHijackTun, DnsProxyRuntime, DnsRule};
+pub use dns::{
+    DnsHijackPlan, DnsQueryTransport, DnsResolver, LivenessProbe, UdpDnsTransport, VpnTun,
+    system_dns_servers,
+};
 pub use error::{Error, Result};
 pub use outbound::{BoundUdpSocketFactory, OutboundInterface};
 pub use reconnect::{ReconnectController, ReconnectDecision, ReconnectEvent, ReconnectPolicy};
-pub use route::{RoutePlan, RouteRule};
-pub use session::{LocalTunnelParams, ProtocolMode, TunnelConfig, TunnelSession, TunnelStatus};
+pub use route::VpnRouteMode;
+pub use session::{LocalTunnelParams, TunnelConfig, TunnelSession, TunnelStatus};
 pub use transport::FeilianTcpTransportFactory;
-pub use tun::IpTun;

@@ -16,20 +16,19 @@ use std::{
 };
 
 use rustylink_api::{
-    ApiClient, ApiHooks, ClientIdentity, DotEndpoint, UserInfo, VpnConnResponse, VpnDot,
-    VpnReportRequest, VpnReportType,
+    ApiClient, ApiHooks, ClientIdentity, DotEndpoint, ProtocolMode, UserInfo, VpnConnResponse,
+    VpnDot, VpnReportRequest, VpnReportType,
 };
 use rustylink_core::vpn::{VpnConfigRequest, VpnConfigResult, VpnConnectMode};
 use rustylink_proto::proto::rustylink::daemon::v1 as pb;
 use rustylink_tunnel::{
-    LocalTunnelParams, OutboundInterface, ProtocolMode, ReconnectController, ReconnectDecision,
-    ReconnectEvent, ReconnectPolicy, TunnelConfig, TunnelSession,
+    LocalTunnelParams, ReconnectController, ReconnectDecision, ReconnectEvent, ReconnectPolicy,
+    TunnelConfig, TunnelSession, VpnRouteMode,
 };
 use snafu::prelude::*;
 use tokio::{
     sync::{Mutex, watch},
     task::JoinHandle,
-    time::Instant,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -70,7 +69,6 @@ pub struct Daemon {
 /// small.
 #[derive(Clone)]
 struct ReportParams {
-    dot: VpnDot,
     assigned_ip: String,
     pub_key: String,
     mode: VpnConnectMode,
@@ -131,21 +129,6 @@ impl Daemon {
     #[must_use]
     pub fn subscribe_tunnel(&self) -> watch::Receiver<pb::Tunnel> {
         self.vpn_watch_rx.clone()
-    }
-
-    /// Resolve the picked outbound interface (the configured one, or the
-    /// system default) used to bind tunnel and latency-probe sockets.
-    ///
-    /// Returns `None` when no usable interface is found, in which case sockets
-    /// use the OS default routing.
-    pub(crate) async fn resolve_outbound_interface(&self) -> Option<OutboundInterface> {
-        let configured = {
-            let inner = self.inner.lock().await;
-            inner.config.outbound_interface.clone()
-        };
-        OutboundInterface::resolve(configured.as_deref(), None)
-            .ok()
-            .flatten()
     }
 
     /// Persist current auth credentials to disk.  Only saves an authenticated
@@ -258,6 +241,7 @@ impl Daemon {
                     preferred_dot_id: persisted.preferred_dot_id,
                     otp: None,
                     reconnect: persisted.reconnect,
+                    protocol_mode: persisted.protocol_mode,
                 },
                 None => return,
             }
@@ -351,27 +335,11 @@ impl Daemon {
     async fn run_connect_loop(self, request: VpnRequest, cancel: CancellationToken) {
         let mut controller =
             ReconnectController::new(ReconnectPolicy::android_compatible_default());
-        let mut forced_protocol = None;
-        let mut last_udp_to_tcp = None;
         loop {
-            match self
-                .connect_once(&request, &cancel, forced_protocol, last_udp_to_tcp)
-                .await
-            {
+            match self.connect_once(&request, &cancel).await {
                 Ok(SupervisorOutcome::Cancelled) => {
                     self.mark_disconnected().await;
                     return;
-                }
-                Ok(SupervisorOutcome::ProtocolSwitch(protocol)) => {
-                    tracing::info!(protocol = ?protocol, "protocol detection requested transport switch");
-                    if protocol == ProtocolMode::FeilianTcp {
-                        last_udp_to_tcp = Some(Instant::now());
-                    }
-                    forced_protocol = Some(protocol);
-                    controller.reset();
-                    if cancel.is_cancelled() {
-                        return;
-                    }
                 }
                 Ok(SupervisorOutcome::ServerKickOut) => {
                     let decision = controller.record(ReconnectEvent::ServerKickOut);
@@ -380,10 +348,6 @@ impl Daemon {
                     }
                 }
                 Ok(SupervisorOutcome::Trigger(event)) => {
-                    if event == ReconnectEvent::NetworkChanged {
-                        forced_protocol = None;
-                        last_udp_to_tcp = None;
-                    }
                     let decision = controller.record(event);
                     if !self.handle_decision(decision, &cancel).await {
                         return;
@@ -408,7 +372,6 @@ impl Daemon {
     /// cancellation.  Tears down the session and reports 101 before returning.
     async fn connect_once(
         &self, request: &VpnRequest, cancel: &CancellationToken,
-        forced_protocol: Option<ProtocolMode>, last_udp_to_tcp: Option<Instant>,
     ) -> Result<SupervisorOutcome> {
         self.vpn_transition(VpnMachine::set_configuring).await;
 
@@ -445,24 +408,16 @@ impl Daemon {
             preferred_dot_id: request.preferred_dot_id,
         };
 
-        let build_dot_client = {
+        let (pool, hooks) = {
             let inner = self.inner.lock().await;
-            let hooks = inner.auth.build_hooks();
-            let pool = inner.auth.http_pool.clone();
-            drop(inner);
-            let vpn_domain = vpn_domain.clone();
-            move |endpoint: &DotEndpoint| {
-                build_dot_api_client(endpoint, &pool, &hooks, vpn_domain.as_deref())
-            }
+            (inner.auth.http_pool.clone(), inner.auth.build_hooks())
         };
-
-        // Auto dot selection probes through the picked outbound interface.
-        let outbound = self.resolve_outbound_interface().await;
+        let (build_dot_client, probe_client) = dot_client_builders(pool, hooks, vpn_domain.clone());
         let config_result = rustylink_core::vpn::vpn_config_from_dot_list(
             &client,
             &config_request,
             build_dot_client,
-            move |dots| crate::latency::rank_dots_by_latency(dots, outbound),
+            move |dots| crate::latency::rank_dots_by_latency(dots, probe_client),
         )
         .await
         .map_err(DaemonError::from)?;
@@ -474,13 +429,31 @@ impl Daemon {
         })?;
 
         let mut session = self
-            .start_session(&config_result, &data, &local_params, forced_protocol)
+            .start_session(&config_result, &data, &local_params, request)
             .await?;
 
         self.mark_connected(&config_result, &data.ip).await;
 
+        // `/vpn/report` is a VPN-control API: like `/vpn/conn`, the Android
+        // client (`VpnReportOperator.report`) posts it to the *selected dot's*
+        // API host (`https://{apiIp}:{apiPort}/vpn/report`), not the tenant
+        // host. Reuse the dot endpoint + TLS handling from the config call so
+        // the report reaches the dot; the tenant host has no such route and
+        // answers 405 Method Not Allowed.
+        let report_client = {
+            let inner = self.inner.lock().await;
+            let hooks = inner.auth.build_hooks();
+            let pool = inner.auth.http_pool.clone();
+            drop(inner);
+            build_dot_api_client(
+                &config_result.endpoint,
+                &pool,
+                &hooks,
+                vpn_domain.as_deref(),
+            )
+        };
+
         let report = ReportParams {
-            dot: config_result.dot.clone(),
             assigned_ip: data.ip.clone(),
             pub_key: local_params.local_public_key.clone(),
             mode: request.mode,
@@ -488,18 +461,18 @@ impl Daemon {
 
         // report(100) — connected.
         let _ = self
-            .send_report(&client, &report, VpnReportType::Connected)
+            .send_report(&report_client, &report, VpnReportType::Connected)
             .await;
 
         // Supervise until a trigger / cancellation.
         let outcome = self
-            .supervise(&mut session, &client, &report, cancel, last_udp_to_tcp)
+            .supervise(&mut session, &report_client, &report, cancel)
             .await;
 
         // Teardown: stop the device + report(101).
         let _ = session.stop().await;
         let _ = self
-            .send_report(&client, &report, VpnReportType::Disconnected)
+            .send_report(&report_client, &report, VpnReportType::Disconnected)
             .await;
         Ok(outcome)
     }
@@ -508,7 +481,7 @@ impl Daemon {
     /// up.
     async fn start_session(
         &self, config_result: &VpnConfigResult, data: &VpnConnResponse,
-        local_params: &LocalTunnelParams, forced_protocol: Option<ProtocolMode>,
+        local_params: &LocalTunnelParams, request: &VpnRequest,
     ) -> Result<TunnelSession> {
         let (outbound_iface, tun_interface) = {
             let inner = self.inner.lock().await;
@@ -518,39 +491,15 @@ impl Daemon {
             )
         };
 
-        let effective_protocol_mode = forced_protocol
-            .filter(|protocol| {
-                match (
-                    config_result
-                        .dot
-                        .protocol_mode
-                        .and_then(ProtocolMode::from_repr),
-                    *protocol,
-                ) {
-                    (Some(ProtocolMode::Dual), ProtocolMode::Udp | ProtocolMode::FeilianTcp)
-                    | (None, ProtocolMode::Udp) => true,
-                    (Some(dot_protocol), requested) => dot_protocol == requested,
-                    _ => false,
-                }
-            })
-            .map(|protocol| protocol as i32)
-            .or(config_result.dot.protocol_mode);
-        if let Some(protocol) = forced_protocol
-            && Some(protocol as i32) == effective_protocol_mode
-        {
-            tracing::info!(
-                protocol = ?protocol,
-                dot_protocol_mode = ?config_result.dot.protocol_mode,
-                "forcing tunnel transport after protocol-detect switch"
-            );
-        }
+        let effective_protocol_mode =
+            effective_transport(config_result.dot.protocol_mode, request.protocol_mode);
 
         let mut tunnel_config = TunnelConfig::from_vpn_conn(
             data,
             local_params.clone(),
             config_result.endpoint.wireguard_endpoint.clone(),
             effective_protocol_mode,
-            config_result.dot.protocol_detect_enabled(),
+            vpn_route_mode(request.mode),
         )
         .map_err(|error| {
             TunnelSnafu {
@@ -589,51 +538,41 @@ impl Daemon {
     }
 
     /// Run the supervisor over a live session with a periodic `/vpn/report`.
+    ///
+    /// `dot_client` must address the selected dot's API host (the periodic
+    /// keepalive report is posted through it).
     async fn supervise(
-        &self, session: &mut TunnelSession, client: &ApiClient, report: &ReportParams,
-        cancel: &CancellationToken, last_udp_to_tcp: Option<Instant>,
+        &self, session: &mut TunnelSession, dot_client: &ApiClient, report: &ReportParams,
+        cancel: &CancellationToken,
     ) -> SupervisorOutcome {
         let outbound = {
             let inner = self.inner.lock().await;
             inner.config.outbound_interface.clone()
         };
-        let protocol_mode = report.dot.protocol_mode.and_then(ProtocolMode::from_repr);
-        let runtime_protocol_mode = session
-            .config
-            .protocol_mode
-            .and_then(ProtocolMode::from_repr);
-        let protocol_detect_options = supervisor::ProtocolDetectOptions {
-            config: report.dot.protocol_detect_config.clone(),
-            dot_protocol_mode: protocol_mode,
-            last_udp_to_tcp,
-        };
         let report_daemon = self.clone();
-        let report_client = client.clone();
+        let report_client = dot_client.clone();
         let report = report.clone();
-        supervisor::run(
-            session,
-            runtime_protocol_mode,
-            outbound,
-            protocol_detect_options,
-            cancel.clone(),
-            move || {
-                let daemon = report_daemon.clone();
-                let client = report_client.clone();
-                let report = report.clone();
-                async move {
-                    daemon
-                        .send_report(&client, &report, VpnReportType::Connected)
-                        .await
-                }
-            },
-        )
+        supervisor::run(session, outbound, cancel.clone(), move || {
+            let daemon = report_daemon.clone();
+            let client = report_client.clone();
+            let report = report.clone();
+            async move {
+                daemon
+                    .send_report(&client, &report, VpnReportType::Connected)
+                    .await
+            }
+        })
         .await
     }
 
     /// Send a `/vpn/report` (`Connected` keepalive / `Disconnected`).  Returns
     /// `true` if the server signalled a force-logout (kickout).
+    ///
+    /// `dot_client` must address the *selected dot's* API host (built via
+    /// [`build_dot_api_client`]), matching the Android `VpnReportOperator`.
+    /// The tenant host has no `/vpn/report` route and answers 405.
     async fn send_report(
-        &self, client: &ApiClient, report: &ReportParams, report_type: VpnReportType,
+        &self, dot_client: &ApiClient, report: &ReportParams, report_type: VpnReportType,
     ) -> bool {
         let request = VpnReportRequest {
             r#type: report_type.wire(),
@@ -641,7 +580,7 @@ impl Daemon {
             public_key: report.pub_key.clone(),
             mode: report.mode.android_name(),
         };
-        match rustylink_core::vpn::report_vpn(client, &request).await {
+        match rustylink_core::vpn::report_vpn(dot_client, &request).await {
             Ok(response) => response.is_force_logout(),
             Err(error) => {
                 tracing::warn!(%error, ?report_type, "vpn report failed (non-fatal)");
@@ -790,9 +729,36 @@ impl DaemonConfig {
 /// `https://{vpn_domain}:{port}` and override DNS so that name resolves to the
 /// dot's IP. rustls then validates the chain and the name against `vpn_domain`.
 ///
+/// Per-attempt dot API client factories:
+/// - `config` builds the client for `POST /vpn/conn` (called per selected dot).
+/// - `probe` resolves a [`VpnDot`] to its endpoint and builds the client used
+///   to time `GET /vpn/ping` for latency ranking. Auto dot selection feeds it
+///   into [`crate::latency::rank_dots_by_latency`].
+fn dot_client_builders(
+    pool: reqwest::Client, hooks: ApiHooks, vpn_domain: Option<String>,
+) -> (
+    impl Fn(&DotEndpoint) -> ApiClient + Clone,
+    impl Fn(&VpnDot) -> Option<ApiClient> + Clone,
+) {
+    let probe = {
+        let pool = pool.clone();
+        let hooks = hooks.clone();
+        let vpn_domain = vpn_domain.clone();
+        move |dot: &VpnDot| {
+            DotEndpoint::from_dot(dot, false).ok().map(|endpoint| {
+                build_dot_api_client(&endpoint, &pool, &hooks, vpn_domain.as_deref())
+            })
+        }
+    };
+    let config = move |endpoint: &DotEndpoint| {
+        build_dot_api_client(endpoint, &pool, &hooks, vpn_domain.as_deref())
+    };
+    (config, probe)
+}
+
 /// Falls back to a plain client against the original (IP) endpoint when no
 /// `vpn_domain` is known or the host is not a bare IP.
-fn build_dot_api_client(
+pub fn build_dot_api_client(
     endpoint: &DotEndpoint, pool: &reqwest::Client, hooks: &ApiHooks, vpn_domain: Option<&str>,
 ) -> ApiClient {
     if let Some(domain) = vpn_domain
@@ -843,22 +809,64 @@ pub fn project_user_info(user: Option<UserInfo>) -> pb::UserInfo {
 
 /// Project a core [`VpnDot`] to the wire type.
 pub fn project_vpn_location(dot: VpnDot) -> pb::VpnLocation {
+    let (protocol_mode, supported_protocols) = protocol_modes_from_dot(dot.protocol_mode);
     pb::VpnLocation {
         id: dot.id.unwrap_or_default(),
         name: dot.name.clone().unwrap_or_default(),
         display_name: dot.name.unwrap_or_default(),
         mode: mode_from_dot(dot.mode).into(),
+        protocol_mode: protocol_mode.into(),
+        supported_protocols: supported_protocols.into_iter().map(Into::into).collect(),
         delay_ms: 0,
         ..Default::default()
     }
 }
 
+/// Map the dot's wire `protocol_mode` (Udp=0, FeilianTcp=1, Dual=2 — the dual
+/// value is api-only) to the proto `ProtocolMode` (UDP=0/TCP=1) plus the
+/// supported-protocol set this dot accepts. Unknown / missing → UDP.
+fn protocol_modes_from_dot(mode: Option<i32>) -> (pb::ProtocolMode, Vec<pb::ProtocolMode>) {
+    use pb::ProtocolMode as P;
+    match mode {
+        Some(DOT_PROTOCOL_TCP) => (P::Tcp, vec![P::Tcp]),
+        Some(DOT_PROTOCOL_DUAL) => (P::Udp, vec![P::Udp, P::Tcp]),
+        Some(DOT_PROTOCOL_UDP | _) | None => (P::Udp, vec![P::Udp]),
+    }
+}
+
+/// Decide which transport to bring up given the dot's advertised protocol mode
+/// and the caller's request. A dual-capable dot (api wire value 2) honors the
+/// caller's choice. A single-protocol dot serves only its own mode (a
+/// mismatched request is silently overridden — it can't make the dot something
+/// it isn't).
+fn effective_transport(dot_mode: Option<i32>, requested: ProtocolMode) -> ProtocolMode {
+    match dot_mode {
+        Some(DOT_PROTOCOL_UDP) => ProtocolMode::Udp,
+        Some(DOT_PROTOCOL_TCP) => ProtocolMode::FeilianTcp,
+        // Dual or unknown: caller's choice wins.
+        _ => requested,
+    }
+}
+
+/// Dot capability wire values from `VpnDot.protocol_mode`. Matches both the
+/// `rustylink_tunnel` and Android `IProtocol` ids; `Dual` is api-only because
+/// the tunnel itself only ever runs as UDP or TCP.
+const DOT_PROTOCOL_UDP: i32 = ProtocolMode::Udp as i32;
+const DOT_PROTOCOL_TCP: i32 = ProtocolMode::FeilianTcp as i32;
+const DOT_PROTOCOL_DUAL: i32 = 2;
+
 fn mode_from_dot(mode: Option<i32>) -> pb::VpnMode {
     match mode.and_then(VpnConnectMode::from_repr) {
         Some(VpnConnectMode::Full) => pb::VpnMode::Full,
         Some(VpnConnectMode::Split) => pb::VpnMode::Split,
-        Some(VpnConnectMode::Relay) => pb::VpnMode::Relay,
         None => pb::VpnMode::Unspecified,
+    }
+}
+
+fn vpn_route_mode(mode: VpnConnectMode) -> VpnRouteMode {
+    match mode {
+        VpnConnectMode::Full => VpnRouteMode::Full,
+        VpnConnectMode::Split => VpnRouteMode::Split,
     }
 }
 
@@ -883,7 +891,11 @@ impl<T: Default + PartialEq> DefaultOrExt for T {}
 
 #[cfg(test)]
 mod tests {
-    use super::DefaultOrExt;
+    use rustylink_api::ProtocolMode;
+
+    use super::{
+        DOT_PROTOCOL_DUAL, DOT_PROTOCOL_TCP, DOT_PROTOCOL_UDP, DefaultOrExt, effective_transport,
+    };
 
     #[test]
     fn non_default_or_falls_back_only_on_default() {
@@ -891,6 +903,25 @@ mod tests {
         assert_eq!("scan".non_default_or("login"), "scan");
         assert_eq!(0_i32.non_default_or(7), 7);
         assert_eq!(3_i32.non_default_or(7), 3);
+    }
+
+    #[test]
+    fn effective_transport_honors_request_only_on_dual_dots() {
+        let udp = ProtocolMode::Udp;
+        let tcp = ProtocolMode::FeilianTcp;
+
+        // Dual dot (wire value 2) honors the caller's choice.
+        assert_eq!(effective_transport(Some(DOT_PROTOCOL_DUAL), udp), udp);
+        assert_eq!(effective_transport(Some(DOT_PROTOCOL_DUAL), tcp), tcp);
+
+        // Single-protocol dots ignore mismatched requests (dot wins).
+        assert_eq!(effective_transport(Some(DOT_PROTOCOL_UDP), tcp), udp);
+        assert_eq!(effective_transport(Some(DOT_PROTOCOL_TCP), udp), tcp);
+        assert_eq!(effective_transport(Some(DOT_PROTOCOL_UDP), udp), udp);
+
+        // No dot mode advertised: caller wins.
+        assert_eq!(effective_transport(None, tcp), tcp);
+        assert_eq!(effective_transport(None, udp), udp);
     }
 
     /// Live, network + real-credentials check (run with

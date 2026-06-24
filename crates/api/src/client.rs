@@ -471,25 +471,25 @@ impl TenantEndpoint {
 
 impl DotEndpoint {
     pub fn from_dot(dot: &VpnDot, use_vpn_ip_for_api: bool) -> Result<Self> {
-        // WireGuard endpoint uses the VPN host (ip4Domain ?: ip); the config
-        // API uses the API host (ip4Domain ?: fastIp ?: apiIp ?: ip).
-        let vpn_host = dot.vpn_host().context(MissingVpnDotFieldSnafu {
-            field: "ip/ip4Domain",
-        })?;
-        let api_host_for_conn =
-            dot.config_api_host(use_vpn_ip_for_api)
-                .context(MissingVpnDotFieldSnafu {
-                    field: "apiIp/ip4Domain/fastIp/ip",
-                })?;
         let api_port = dot
             .api_port
             .context(MissingVpnDotFieldSnafu { field: "api_port" })?;
         let vpn_port = dot
             .vpn_port
             .context(MissingVpnDotFieldSnafu { field: "vpn_port" })?;
+        // Config API host: the API frontend (ip4Domain ?: fastIp ?: apiIp ?: ip),
+        // unless operator IP-delay routing forces the raw node `ip`. WireGuard
+        // always dials the raw `ip` (corplink-rs) — the frontends are HTTPS/CDN
+        // endpoints that don't answer the handshake. Empty `ip` is rejected by
+        // `url_from_host_port` with a clear `host` error.
+        let api_host = if use_vpn_ip_for_api {
+            dot.ip.as_str()
+        } else {
+            dot.api_host()
+        };
         Ok(Self {
-            api_base_url: url_from_host_port("https", api_host_for_conn, api_port)?,
-            wireguard_endpoint: url_from_host_port("udp", vpn_host, vpn_port)?,
+            api_base_url: url_from_host_port("https", api_host, api_port)?,
+            wireguard_endpoint: url_from_host_port("udp", &dot.ip, vpn_port)?,
         })
     }
 }
@@ -597,48 +597,24 @@ impl ApiClient {
 /// connect mode (kept in sync with `rustylink_core::vpn::VpnConnectMode`).
 const MODE_FULL: i32 = 0;
 const MODE_SPLIT: i32 = 1;
-const MODE_RELAY: i32 = 2;
 
 impl VpnDot {
+    /// Host for the config API (HTTPS), mirroring Android `getApiIp()`
+    /// (ip4Domain ?: fastIp ?: apiIp) with a final fallback to the node `ip`.
+    /// Infallible: `ip` is the required address, so a host is always available.
     #[must_use]
-    pub fn api_host(&self) -> Option<&str> {
-        // Mirrors Android `VpnDotBean.getApiIp()` (ip4Domain ?: fastIp ?: apiIp)
-        // with a final fallback to the VPN IP (`ip`) — many deployments only
-        // populate `ip` and rely on it for the API host too (the app's
-        // `setApiIp` backfills it the same way).
+    pub fn api_host(&self) -> &str {
         self.ip4_domain
             .as_deref()
             .filter(|value| !value.is_empty())
             .or_else(|| self.fast_ip.as_deref().filter(|value| !value.is_empty()))
             .or_else(|| self.api_ip.as_deref().filter(|value| !value.is_empty()))
-            .or_else(|| self.ip.as_deref().filter(|value| !value.is_empty()))
-    }
-
-    /// Host for the `WireGuard` endpoint — the IPv4 domain override, else the
-    /// VPN IP (`ip`). Mirrors Android `VpnDotBean.getVpnIp()`.
-    #[must_use]
-    pub fn vpn_host(&self) -> Option<&str> {
-        self.ip4_domain
-            .as_deref()
-            .filter(|value| !value.is_empty())
-            .or_else(|| self.ip.as_deref().filter(|value| !value.is_empty()))
-    }
-
-    #[must_use]
-    pub fn config_api_host(&self, use_vpn_ip_for_api: bool) -> Option<&str> {
-        if use_vpn_ip_for_api {
-            self.ip
-                .as_deref()
-                .filter(|value| !value.is_empty())
-                .or_else(|| self.api_host())
-        } else {
-            self.api_host()
-        }
+            .unwrap_or(&self.ip)
     }
 
     #[must_use]
     pub fn should_use_vpn_ip_for_config_api(&self, is_auto_location: bool) -> bool {
-        if is_auto_location || self.ip.as_deref().is_none_or(str::is_empty) {
+        if is_auto_location || self.ip.is_empty() {
             return false;
         }
         self.ip_delay_routing_policy
@@ -656,21 +632,9 @@ impl VpnDot {
     #[must_use]
     pub fn supports_android_mode(&self, requested_mode: i32) -> bool {
         // Android VPN mode ids (shared with `VpnConnectMode`): 0 = Full,
-        // 1 = Split, 2 = Relay. A node only serves requests at or above its own
-        // capability tier, so a Relay node can't serve Split and a Split node
-        // can't serve Full.
-        !matches!(
-            (self.mode, requested_mode),
-            (Some(MODE_RELAY), MODE_SPLIT) | (Some(MODE_SPLIT), MODE_FULL)
-        )
-    }
-
-    #[must_use]
-    pub fn protocol_detect_enabled(&self) -> bool {
-        self.protocol_detect_config
-            .as_ref()
-            .and_then(|config| config.enable)
-            .unwrap_or(false)
+        // 1 = Split. A node only serves requests at or above its own capability
+        // tier, so a Split node can't serve Full.
+        !matches!((self.mode, requested_mode), (Some(MODE_SPLIT), MODE_FULL))
     }
 }
 
@@ -830,7 +794,8 @@ mod tests {
 
         let endpoint = DotEndpoint::from_dot(&dot, false).expect("endpoint");
 
-        // Config API uses the API host (apiIp); WireGuard uses the VPN IP.
+        // Config API uses the API host (apiIp); WireGuard dials the node's raw
+        // `ip`, mirroring corplink-rs.
         assert_eq!(endpoint.api_base_url.as_str(), "https://api.example:8443/");
         assert_eq!(
             endpoint.wireguard_endpoint.as_str(),
@@ -839,9 +804,32 @@ mod tests {
     }
 
     #[test]
-    fn dot_endpoint_falls_back_to_ip_when_only_ip_present() {
-        // Many deployments only populate `ip` (no apiIp/fastIp/ip4Domain); both
-        // the API host and the WireGuard endpoint must fall back to it.
+    fn dot_endpoint_uses_ip4domain_for_api_and_ip_for_wireguard() {
+        // When a dot advertises a CDN/HTTPS frontend (ip4Domain/fastIp/apiIp),
+        // the config API uses it (ip4Domain wins) while WireGuard still dials the
+        // raw node `ip` — matching corplink-rs. Using the frontend for WireGuard
+        // caused the handshake timeout.
+        let dot = serde_json::from_value::<VpnDot>(json!({
+            "ip4Domain": "vpn.example.com",
+            "fastIp": "1.1.1.1",
+            "apiIp": "2.2.2.2",
+            "ip": "3.3.3.3",
+            "api_port": 443,
+            "vpn_port": 51820
+        }))
+        .expect("dot");
+
+        let endpoint = DotEndpoint::from_dot(&dot, false).expect("endpoint");
+
+        assert_eq!(endpoint.api_base_url.as_str(), "https://vpn.example.com/");
+        assert_eq!(endpoint.wireguard_endpoint.as_str(), "udp://3.3.3.3:51820/");
+        assert_eq!(dot.api_host(), "vpn.example.com");
+    }
+
+    #[test]
+    fn dot_endpoint_uses_ip_when_only_ip_present() {
+        // Most dots only populate `ip` (the corplink-rs single-address model);
+        // both the API host and the WireGuard endpoint use it.
         let dot = serde_json::from_value::<VpnDot>(json!({
             "ip": "10.0.0.12",
             "api_port": 8443,
@@ -856,7 +844,21 @@ mod tests {
             endpoint.wireguard_endpoint.as_str(),
             "udp://10.0.0.12:51820/"
         );
-        assert_eq!(dot.api_host(), Some("10.0.0.12"));
-        assert_eq!(dot.vpn_host(), Some("10.0.0.12"));
+        assert_eq!(dot.api_host(), "10.0.0.12");
+    }
+
+    #[test]
+    fn dot_endpoint_rejects_missing_ip() {
+        // A dot without `ip` deserializes (struct-level default → ip = "") but
+        // cannot build an endpoint: `from_dot` rejects the empty WireGuard host
+        // with a single, clear `host` field error.
+        let dot = serde_json::from_value::<VpnDot>(json!({
+            "apiIp": "api.example",
+            "api_port": 8443,
+            "vpn_port": 51820
+        }))
+        .expect("dot deserializes with default ip");
+        assert!(dot.ip.is_empty());
+        assert!(DotEndpoint::from_dot(&dot, false).is_err());
     }
 }

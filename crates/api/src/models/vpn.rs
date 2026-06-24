@@ -1,9 +1,27 @@
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
+use strum::{Display, EnumIter, FromRepr};
 
 use super::{BaseResponse, JsonObject};
 
 pub type VpnExportInfo = JsonObject;
+
+/// `WireGuard` transport choice for the tunnel: native UDP or the `FeiLian`
+/// TCP framing.
+///
+/// Wire values match the dot's advertised mode (`VpnDot.protocol_mode`, where
+/// `2` historically meant "dual-capable" — a state we no longer carry). The
+/// proto3 default ([`Self::Udp`]) is the natural fallback when a client does
+/// not set `ConnectTunnelRequest.protocol_mode`.
+#[derive(
+    Clone, Copy, Debug, Default, Deserialize, Display, EnumIter, Eq, FromRepr, PartialEq, Serialize,
+)]
+#[repr(i32)]
+pub enum ProtocolMode {
+    #[default]
+    Udp        = 0,
+    FeilianTcp = 1,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GetVpnSettingRequest;
@@ -68,20 +86,23 @@ pub struct VpnLocation {
 #[serde(default)]
 pub struct VpnDot {
     pub id: Option<i32>,
+    /// The node's address (host or IP). `WireGuard` dials this raw address
+    /// (matching corplink-rs's `ip:vpn_port`) and it is the final fallback for
+    /// the config-API host. Non-optional: an absent/empty `ip` is rejected when
+    /// the endpoint is built ([`crate::DotEndpoint::from_dot`]) with a single,
+    /// clear `host` error rather than silently producing a hostless URL.
+    pub ip: String,
     #[serde(rename = "apiIp", alias = "api_ip")]
     pub api_ip: Option<String>,
     pub api_port: Option<i32>,
-    pub ip: Option<String>,
+    #[serde(alias = "vpnPort")]
     pub vpn_port: Option<i32>,
     pub protocol_mode: Option<i32>,
-    #[serde(alias = "protocolDetectConfig")]
-    pub protocol_detect_config: Option<VpnProtocolDetectConfig>,
     pub timeout: Option<i32>,
     pub mode: Option<i32>,
     pub r#type: Option<String>,
     pub name: Option<String>,
     pub display_name: Option<String>,
-    pub domain_name: Option<String>,
     #[serde(rename = "fastIp", alias = "fast_ip")]
     pub fast_ip: Option<String>,
     #[serde(rename = "ip4Domain", alias = "ip4_domain")]
@@ -115,21 +136,6 @@ impl IpDelayRoutingPolicy {
     pub fn is_operator_routing(&self) -> bool {
         self.is_operator.unwrap_or(false) && self.policy_type == Some(Self::OPERATOR)
     }
-}
-
-#[skip_serializing_none]
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct VpnProtocolDetectConfig {
-    pub enable: Option<bool>,
-    #[serde(alias = "badNetworkCount")]
-    pub bad_network_count: Option<i32>,
-    #[serde(alias = "refreshTimeoutCount")]
-    pub refresh_timeout_count: Option<i32>,
-    #[serde(alias = "tcp2udpAvailableCount")]
-    pub tcp2udp_available_count: Option<i32>,
-    #[serde(alias = "udp2tcpTimeoutCount")]
-    pub udp2tcp_timeout_count: Option<i32>,
 }
 
 #[skip_serializing_none]

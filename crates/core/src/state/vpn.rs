@@ -1,10 +1,12 @@
 //! Pure VPN connection state and transitions.
 //!
-//! [`VpnState`] is the runtime-agnostic state of the tunnel: the daemon owns the
-//! live OS resources (the `WireGuard` session, cancellation token) separately
-//! and drives this state through the pure transition methods below. Each
-//! transition consumes the current state and returns the next one, so the only
-//! place state is *assigned* is the daemon's single transition helper.
+//! [`VpnState`] is the runtime-agnostic state of the tunnel: the daemon owns
+//! the live OS resources (the `WireGuard` session, cancellation token)
+//! separately and drives this state through the pure transition methods below.
+//! Each transition consumes the current state and returns the next one, so the
+//! only place state is *assigned* is the daemon's single transition helper.
+
+use rustylink_api::ProtocolMode;
 
 use crate::vpn::VpnConnectMode;
 
@@ -16,6 +18,10 @@ pub struct VpnRequest {
     pub preferred_dot_id: Option<i32>,
     pub otp: Option<String>,
     pub reconnect: bool,
+    /// Caller-requested `WireGuard` transport. Must be either `Udp` or
+    /// `FeilianTcp`; the dot's advertised mode is consulted at session start
+    /// to allow or override (see `daemon::effective_transport`).
+    pub protocol_mode: ProtocolMode,
 }
 
 impl Default for VpnRequest {
@@ -26,6 +32,7 @@ impl Default for VpnRequest {
             preferred_dot_id: None,
             otp: None,
             reconnect: true,
+            protocol_mode: ProtocolMode::Udp,
         }
     }
 }

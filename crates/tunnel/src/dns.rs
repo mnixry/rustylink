@@ -1,90 +1,511 @@
+//! DNS hijacking on the TUN path.
+//!
+//! [`VpnTun`] is the gotatun TUN device (merging the old `IpTun` + hijacker):
+//! it forwards normal IP packets and intercepts UDP/53, handing the query to a
+//! [`DnsResolver`]. The resolver routes each query over one of two pluggable
+//! [`DnsQueryTransport`]s — **routed** (bound to the TUN, reaches the VPN
+//! resolver through the tunnel, used for intranet / full-tunnel) or
+//! **directed** (bound to the physical outbound interface, reaches the system
+//! resolver directly, used for public split-tunnel names) — and always returns
+//! a DNS response (the upstream answer, or a synthesized `SERVFAIL`).
+
 use std::{
     collections::BTreeSet,
-    io,
+    io, iter,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-    sync::Arc,
-    time::Duration,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
+use async_trait::async_trait;
 use etherparse::{NetSlice, PacketBuilder, SlicedPacket, TransportSlice};
 use gotatun::{
     packet::{Ip, Packet, PacketBufPool},
     tun::{IpRecv, IpSend, MtuWatcher},
 };
-use hickory_proto::op::Message as DnsMessage;
+use hickory_proto::{
+    op::{Message as DnsMessage, MessageType, OpCode, Query, ResponseCode},
+    rr::{Name, RecordType},
+};
 use rustylink_api::VpnConnResponse;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use snafu::prelude::*;
-use tokio::{
-    net::{UdpSocket, lookup_host},
-    task::JoinHandle,
-};
+use tokio::net::lookup_host;
 use url::{Host, Url};
 use wildmatch::WildMatch;
 
-use crate::{IpTun, OutboundInterface};
+use crate::OutboundInterface;
 
 const DNS_PORT: u16 = 53;
-const DNS_PROXY_PORT: u16 = 2913;
 const DNS_RESPONSE_HOP_LIMIT: u8 = 64;
 const DNS_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_DNS_PACKET: usize = 4096;
+/// Used for directed (public) resolution when the OS exposes no system
+/// resolver.
+const DEFAULT_SYSTEM_DNS: IpAddr = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
 
+/// Errors raised while hijacking and forwarding DNS over the TUN path.
+///
+/// Socket failures keep their originating [`std::io::Error`] as `source`. The
+/// gotatun [`IpRecv`] / [`IpSend`] adapters require [`std::io::Result`], so
+/// [`From<Error>`] for [`std::io::Error`] re-wraps these (preserving the snafu
+/// source chain) at that boundary.
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
 pub enum Error {
-    #[snafu(display("failed to bind DNS proxy listener at {bind_addr}: {source}"))]
-    BindProxy {
-        bind_addr: SocketAddr,
+    #[snafu(display("failed to bind DNS query socket: {source}"))]
+    BindSocket { source: io::Error },
+
+    #[snafu(display("failed to send DNS query to `{server}`: {source}"))]
+    SendQuery {
+        server: SocketAddr,
         source: io::Error,
     },
 
-    #[snafu(display("no DNS proxy listener started"))]
-    NoProxyListener,
+    #[snafu(display("failed to receive DNS reply from `{server}`: {source}"))]
+    RecvReply {
+        server: SocketAddr,
+        source: io::Error,
+    },
+
+    #[snafu(display("DNS query to `{server}` timed out"))]
+    QueryTimeout { server: SocketAddr },
+
+    #[snafu(display("failed to resolve DNS server `{server}`: {source}"))]
+    ResolveServer { server: String, source: io::Error },
+
+    #[snafu(display("DNS server `{server}` resolved to no usable address"))]
+    NoServerAddress { server: String },
+
+    #[snafu(display("failed to build DNS response packet: {source}"))]
+    BuildResponse {
+        source: etherparse::err::packet::BuildWriteError,
+    },
+
+    #[snafu(display("DNS response IP family mismatch"))]
+    AddressFamilyMismatch,
+
+    #[snafu(display("malformed IP packet from TUN: {reason}"))]
+    InvalidIpPacket { reason: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct DnsRule {
-    pub domain: String,
-    pub endpoint: String,
+impl From<Error> for io::Error {
+    fn from(error: Error) -> Self {
+        Self::other(error)
+    }
 }
 
+/// Parsed, serializable DNS configuration carried in [`crate::TunnelConfig`].
+///
+/// Built once from the `/vpn/conn` response (plus optional local DNS override)
+/// and consumed by [`DnsResolver::build`] at session start.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DnsHijackPlan {
-    pub primary_dns: Option<String>,
-    pub backup_dns: Option<String>,
-    pub local_dns: Option<String>,
-    pub central_dns: Option<String>,
-    pub ip_nats: Option<String>,
-    pub dynamic_domain_split: Option<String>,
-    pub dynamic_domain_split_v6: Option<String>,
-    pub dynamic_domain_split_wildcard: Option<String>,
-    pub dynamic_suffix_wildcard_domain: Option<String>,
-    pub dynamic_domain: Option<String>,
-    pub domain_rules: Vec<DnsRule>,
-    pub proxy_port: u16,
+    /// `host:port` VPN resolver endpoints, de-duplicated, used by the routed
+    /// (intranet) transport.
+    pub vpn_servers: Vec<String>,
+    /// Normalized lowercase domain patterns; each matches both `domain` and
+    /// `*.domain` and routes the query through the VPN resolver.
+    pub split_domains: Vec<String>,
 }
 
+impl DnsHijackPlan {
+    #[must_use]
+    pub fn from_vpn_conn(conn: &VpnConnResponse, local_dns: Option<&str>) -> Self {
+        let setting = &conn.setting;
+        let vpn_servers = collect_vpn_servers([
+            local_dns,
+            setting.vpn_dns.as_deref(),
+            setting.vpn_dns_backup.as_deref(),
+        ]);
+        let mut split_domains = BTreeSet::new();
+        if let Some(list) = setting.vpn_dns_domain_split.as_deref() {
+            for raw in list {
+                accept_domain(raw, &mut split_domains);
+            }
+        }
+        for raw in [
+            setting.vpn_dynamic_domain_route_split.as_deref(),
+            setting.v6_vpn_dynamic_domain_route_split.as_deref(),
+            setting.vpn_wildcard_dynamic_domain_route_split.as_deref(),
+            setting
+                .suffix_wildcard_dynamic_domain_route_split
+                .as_deref(),
+            setting.dynamic_domain.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            extract_domains(raw, &mut split_domains);
+        }
+        Self {
+            vpn_servers,
+            split_domains: split_domains.into_iter().collect(),
+        }
+    }
+}
+
+/// Sends a DNS wire query to an upstream and returns the wire response. A trait
+/// so non-UDP transports can be added later.
+#[async_trait]
+pub trait DnsQueryTransport: Send + Sync {
+    async fn query(&self, server: SocketAddr, request: &[u8]) -> Result<Vec<u8>>;
+}
+
+/// UDP DNS transport bound to a fixed interface via `IP_BOUND_IF`. Two are
+/// used: **directed** (physical outbound interface) and **routed** (TUN
+/// interface).
+#[derive(Clone, Debug)]
+pub struct UdpDnsTransport {
+    interface: Option<OutboundInterface>,
+}
+
+impl UdpDnsTransport {
+    #[must_use]
+    pub const fn new(interface: Option<OutboundInterface>) -> Self {
+        Self { interface }
+    }
+}
+
+#[async_trait]
+impl DnsQueryTransport for UdpDnsTransport {
+    async fn query(&self, server: SocketAddr, request: &[u8]) -> Result<Vec<u8>> {
+        let bind = if server.is_ipv4() {
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+        } else {
+            SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
+        };
+        let socket =
+            crate::outbound::bind_udp(bind, self.interface.as_ref()).context(BindSocketSnafu)?;
+        socket
+            .send_to(request, server)
+            .await
+            .context(SendQuerySnafu { server })?;
+        let mut response = vec![0_u8; MAX_DNS_PACKET];
+        let (len, _) = tokio::time::timeout(DNS_TIMEOUT, socket.recv_from(&mut response))
+            .await
+            .map_err(|_| QueryTimeoutSnafu { server }.build())?
+            .context(RecvReplySnafu { server })?;
+        response.truncate(len);
+        Ok(response)
+    }
+}
+
+/// Routes DNS queries to the VPN resolver (routed) or the system resolver
+/// (directed) by rule, and always yields a DNS response.
+pub struct DnsResolver {
+    full_tunnel: bool,
+    vpn_servers: Vec<String>,
+    /// Pre-extracted IPs of the VPN resolver(s). Used by [`VpnTun`] to skip
+    /// hijacking the routed transport's own forwarding traffic (which would
+    /// otherwise re-enter the TUN and loop indefinitely).
+    vpn_dns_ips: Vec<IpAddr>,
+    system_servers: Vec<String>,
+    matchers: Vec<WildMatch>,
+    directed: Arc<dyn DnsQueryTransport>,
+    routed: Arc<dyn DnsQueryTransport>,
+}
+
+impl DnsResolver {
+    /// Build the resolver. Returns `None` (hijack disabled) when the VPN
+    /// provided no resolver. `system_servers` is read once via
+    /// [`system_dns_servers`] so the same set can also be host-routed into
+    /// the tunnel (split mode).
+    #[must_use]
+    pub fn build(
+        plan: &DnsHijackPlan, full_tunnel: bool, system_servers: &[IpAddr],
+        directed: Arc<dyn DnsQueryTransport>, routed: Arc<dyn DnsQueryTransport>,
+    ) -> Option<Self> {
+        if plan.vpn_servers.is_empty() {
+            tracing::info!("DNS hijack disabled: VPN provided no resolver");
+            return None;
+        }
+        let vpn_dns_ips = plan
+            .vpn_servers
+            .iter()
+            .filter_map(|server| server.parse::<SocketAddr>().ok().map(|addr| addr.ip()))
+            .collect();
+        let system_servers = system_servers
+            .iter()
+            .map(|ip| SocketAddr::new(*ip, DNS_PORT).to_string())
+            .collect();
+        let matchers = plan
+            .split_domains
+            .iter()
+            .flat_map(|domain| {
+                [
+                    WildMatch::new(domain),
+                    WildMatch::new(&format!("*.{domain}")),
+                ]
+            })
+            .collect();
+        Some(Self {
+            full_tunnel,
+            vpn_servers: plan.vpn_servers.clone(),
+            vpn_dns_ips,
+            system_servers,
+            matchers,
+            directed,
+            routed,
+        })
+    }
+
+    /// Resolve a hijacked query, always returning a DNS wire response (the
+    /// upstream answer, or a synthesized `SERVFAIL`).
+    async fn resolve(&self, query: &DnsWireQuery) -> Vec<u8> {
+        let domain = query
+            .domain
+            .clone()
+            .or_else(|| parse_dns_question_domain(&query.payload));
+        let routed = self.full_tunnel
+            || domain
+                .as_deref()
+                .is_some_and(|value| self.matches_split_domain(value));
+        let (transport, servers, route) = if routed {
+            (self.routed.as_ref(), &self.vpn_servers, "routed")
+        } else {
+            (self.directed.as_ref(), &self.system_servers, "directed")
+        };
+        let name = domain.as_deref().unwrap_or("<unknown>");
+
+        let start = Instant::now();
+        for server in servers {
+            match query_server(transport, server, &query.payload).await {
+                Ok(response) => {
+                    tracing::debug!(
+                        domain = name,
+                        route,
+                        %server,
+                        rtt_ms = start.elapsed().as_millis(),
+                        rcode = ?response_code(&response),
+                        "DNS resolved"
+                    );
+                    return response;
+                }
+                Err(error) => {
+                    tracing::warn!(domain = name, route, %server, %error, "DNS upstream failed");
+                }
+            }
+        }
+        tracing::warn!(
+            domain = name,
+            route,
+            "DNS resolution failed; returning SERVFAIL"
+        );
+        synthesize_failure(&query.payload, ResponseCode::ServFail)
+    }
+
+    fn matches_split_domain(&self, domain: &str) -> bool {
+        let domain = normalize_domain(domain);
+        self.matchers.iter().any(|matcher| matcher.matches(&domain))
+    }
+}
+
+/// Read the host's configured system DNS servers (via `hickory-resolver`'s
+/// system config). Falls back to a public default if none are configured.
+#[must_use]
+pub fn system_dns_servers() -> Vec<IpAddr> {
+    let servers = match hickory_resolver::system_conf::read_system_conf() {
+        Ok((config, _opts)) => {
+            let mut seen = BTreeSet::new();
+            config
+                .name_servers()
+                .iter()
+                .map(|server| server.ip)
+                .filter(|ip| seen.insert(*ip))
+                .collect::<Vec<_>>()
+        }
+        Err(error) => {
+            tracing::warn!(%error, "failed to read system DNS config");
+            Vec::new()
+        }
+    };
+    if servers.is_empty() {
+        tracing::warn!(default = %DEFAULT_SYSTEM_DNS, "no system DNS servers; using default");
+        vec![DEFAULT_SYSTEM_DNS]
+    } else {
+        servers
+    }
+}
+
+/// Probe interval. A constant DNS query is sent through the routed transport
+/// every tick; the first one also triggers gotatun's lazy `WireGuard`
+/// handshake (gotatun has no force-handshake API and only handshakes when an
+/// outbound TUN packet asks for the first transport).
+const PROBE_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Active-liveness probe owned by the [`crate::TunnelSession`].
+///
+/// Sends a constant `localhost. IN A` query through the routed (TUN-pinned)
+/// transport every [`PROBE_INTERVAL`]. Any reply updates `last_rx`, which the
+/// supervisor reads via `TunnelSession::last_probe_rx_elapsed` to detect a
+/// stalled tunnel (no probe traffic returning).
+pub struct LivenessProbe {
+    last_rx: Arc<Mutex<Option<Instant>>>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl LivenessProbe {
+    #[must_use]
+    pub fn start(routed: Arc<dyn DnsQueryTransport>, servers: Vec<String>) -> Self {
+        let last_rx = Arc::new(Mutex::new(None));
+        let handle = tokio::spawn(run_probe(routed, servers, last_rx.clone()));
+        Self { last_rx, handle }
+    }
+
+    /// Elapsed time since the most recent probe reply. `None` if no probe has
+    /// yet succeeded (initial-connect window).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned (i.e. the probe task itself
+    /// panicked while holding it — a programming error).
+    #[must_use]
+    pub fn last_rx_elapsed(&self) -> Option<Duration> {
+        let now = Instant::now();
+        self.last_rx
+            .lock()
+            .expect("liveness probe state lock poisoned")
+            .map(|rx| now.saturating_duration_since(rx))
+    }
+}
+
+impl Drop for LivenessProbe {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+async fn run_probe(
+    routed: Arc<dyn DnsQueryTransport>, servers: Vec<String>, last_rx: Arc<Mutex<Option<Instant>>>,
+) {
+    let query = liveness_probe_query();
+    let mut tick = tokio::time::interval(PROBE_INTERVAL);
+    loop {
+        tick.tick().await;
+        for server in &servers {
+            match query_server(routed.as_ref(), server, &query).await {
+                Ok(_) => {
+                    *last_rx.lock().expect("liveness probe state lock poisoned") =
+                        Some(Instant::now());
+                    break;
+                }
+                Err(error) => {
+                    tracing::debug!(%server, %error, "liveness probe attempt failed");
+                }
+            }
+        }
+    }
+}
+
+/// Pre-encoded `localhost. IN A` query payload — constant across probes so the
+/// VPN DNS sees an obviously synthetic request (NXDOMAIN/NOERROR both count as
+/// liveness).
+fn liveness_probe_query() -> Vec<u8> {
+    let mut message = DnsMessage::new(0, MessageType::Query, OpCode::Query);
+    message.add_query(Query::query(
+        Name::from_ascii("localhost.").expect("static name"),
+        RecordType::A,
+    ));
+    message.to_vec().expect("static probe message serializes")
+}
+
+async fn query_server(
+    transport: &dyn DnsQueryTransport, server: &str, request: &[u8],
+) -> Result<Vec<u8>> {
+    let mut last_error = None;
+    for addr in lookup_host(server)
+        .await
+        .context(ResolveServerSnafu { server })?
+    {
+        match transport.query(addr, request).await {
+            Ok(response) => return Ok(response),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    last_error.map_or_else(|| NoServerAddressSnafu { server }.fail(), Err)
+}
+
+/// The TUN device, merging the basic gotatun adapter with the DNS hijacker.
 #[derive(Clone)]
-pub struct DnsHijacker {
-    plan: Arc<DnsHijackPlan>,
-    /// Per-rule wildcard matchers (`{domain}` + `*.{domain}`), precomputed once
-    /// so split-domain matching doesn't rebuild patterns per DNS query.
-    domain_matchers: Arc<Vec<WildMatch>>,
-    outbound_interface: Option<OutboundInterface>,
+pub struct VpnTun {
+    device: Arc<tun_rs::AsyncDevice>,
+    name: String,
+    mtu: MtuWatcher,
+    resolver: Option<Arc<DnsResolver>>,
 }
 
-pub struct DnsProxyRuntime {
-    tasks: Vec<JoinHandle<()>>,
+impl VpnTun {
+    pub fn new(
+        device: tun_rs::AsyncDevice, resolver: Option<Arc<DnsResolver>>,
+    ) -> io::Result<Self> {
+        let name = device.name()?;
+        let mtu = MtuWatcher::new(device.mtu()?);
+        Ok(Self {
+            device: Arc::new(device),
+            name,
+            mtu,
+            resolver,
+        })
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
 }
 
-#[derive(Clone)]
-pub struct DnsHijackTun {
-    inner: IpTun,
-    hijacker: Option<DnsHijacker>,
+impl IpSend for VpnTun {
+    async fn send(&mut self, packet: Packet<Ip>) -> io::Result<()> {
+        self.device.send(&packet.into_bytes()).await?;
+        Ok(())
+    }
+}
+
+impl IpRecv for VpnTun {
+    async fn recv<'a>(
+        &'a mut self, pool: &mut PacketBufPool,
+    ) -> io::Result<impl Iterator<Item = Packet<Ip>> + Send + 'a> {
+        loop {
+            let mut packet = pool.get();
+            let len = self.device.recv(&mut packet).await?;
+            packet.truncate(len);
+
+            if let Some(resolver) = self.resolver.clone()
+                && let Some(query) = DnsWireQuery::from_ip_packet(&packet)
+                && !resolver.vpn_dns_ips.contains(&query.destination)
+            {
+                let device = self.device.clone();
+                tokio::spawn(async move {
+                    let response = resolver.resolve(&query).await;
+                    match query.response_packet(&response) {
+                        Ok(bytes) => {
+                            if let Err(error) = device.send(&bytes).await {
+                                tracing::warn!(%error, "failed to write DNS response to TUN");
+                            }
+                        }
+                        Err(error) => tracing::warn!(%error, "failed to build DNS response packet"),
+                    }
+                });
+                continue;
+            }
+
+            let packet = packet.try_into_ip().map_err(|error| {
+                InvalidIpPacketSnafu {
+                    reason: error.to_string(),
+                }
+                .build()
+            })?;
+            return Ok(iter::once(packet));
+        }
+    }
+
+    fn mtu(&self) -> MtuWatcher {
+        self.mtu.clone()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -95,291 +516,6 @@ struct DnsWireQuery {
     destination_port: u16,
     payload: Vec<u8>,
     domain: Option<String>,
-}
-
-impl DnsHijackPlan {
-    #[must_use]
-    pub fn from_vpn_conn(conn: &VpnConnResponse) -> Self {
-        let primary_dns = clean_string(conn.setting.vpn_dns.clone());
-        let backup_dns = clean_string(conn.setting.vpn_dns_backup.clone());
-        let central_dns = clean_string(conn.setting.central_dns.clone());
-        let ip_nats = clean_string(conn.setting.ip_nats.clone());
-        let dynamic_domain_split =
-            clean_string(conn.setting.vpn_dynamic_domain_route_split.clone());
-        let dynamic_domain_split_v6 =
-            clean_string(conn.setting.v6_vpn_dynamic_domain_route_split.clone());
-        let dynamic_domain_split_wildcard =
-            clean_string(conn.setting.vpn_wildcard_dynamic_domain_route_split.clone());
-        let dynamic_suffix_wildcard_domain = clean_string(
-            conn.setting
-                .suffix_wildcard_dynamic_domain_route_split
-                .clone(),
-        );
-        let dynamic_domain = clean_string(conn.setting.dynamic_domain.clone());
-
-        let mut domains = BTreeSet::new();
-        for domain in conn
-            .setting
-            .vpn_dns_domain_split
-            .as_deref()
-            .unwrap_or_default()
-        {
-            add_domain_pattern(&mut domains, domain);
-        }
-        for raw in [
-            dynamic_domain_split.as_deref(),
-            dynamic_domain_split_v6.as_deref(),
-            dynamic_domain_split_wildcard.as_deref(),
-            dynamic_suffix_wildcard_domain.as_deref(),
-            dynamic_domain.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            collect_domain_patterns(&mut domains, raw);
-        }
-
-        let endpoint = primary_dns
-            .clone()
-            .or_else(|| backup_dns.clone())
-            .unwrap_or_else(|| "127.0.0.1:53".to_string());
-        let domain_rules = domains
-            .into_iter()
-            .map(|domain| DnsRule {
-                domain,
-                endpoint: endpoint.clone(),
-            })
-            .collect();
-
-        Self {
-            primary_dns,
-            backup_dns,
-            local_dns: None,
-            central_dns,
-            ip_nats,
-            dynamic_domain_split,
-            dynamic_domain_split_v6,
-            dynamic_domain_split_wildcard,
-            dynamic_suffix_wildcard_domain,
-            dynamic_domain,
-            domain_rules,
-            proxy_port: DNS_PROXY_PORT,
-        }
-    }
-
-    #[must_use]
-    pub fn with_local_dns(mut self, local_dns: Option<String>) -> Self {
-        self.local_dns = clean_string(local_dns);
-        self
-    }
-
-    #[must_use]
-    pub fn enabled(&self) -> bool {
-        !self.upstreams_for_domain(None, &[]).is_empty()
-    }
-
-    #[must_use]
-    pub fn hijacker(&self, outbound_interface: Option<OutboundInterface>) -> Option<DnsHijacker> {
-        self.enabled().then(|| DnsHijacker {
-            plan: Arc::new(self.clone()),
-            domain_matchers: Arc::new(build_domain_matchers(&self.domain_rules)),
-            outbound_interface,
-        })
-    }
-
-    fn upstreams_for_domain(&self, domain: Option<&str>, matchers: &[WildMatch]) -> Vec<String> {
-        let mut upstreams = Vec::new();
-        if domain.is_some_and(|value| matches_split_domain(matchers, value)) {
-            for rule in &self.domain_rules {
-                push_dns_endpoints(&mut upstreams, &rule.endpoint);
-            }
-        } else {
-            push_optional_dns_endpoints(&mut upstreams, self.local_dns.as_deref());
-        }
-        push_optional_dns_endpoints(&mut upstreams, self.primary_dns.as_deref());
-        push_optional_dns_endpoints(&mut upstreams, self.backup_dns.as_deref());
-        dedupe(upstreams)
-    }
-}
-
-impl DnsProxyRuntime {
-    pub async fn start(
-        plan: &DnsHijackPlan, outbound_interface: Option<OutboundInterface>,
-    ) -> Result<Option<Self>> {
-        let Some(hijacker) = plan.hijacker(outbound_interface) else {
-            tracing::info!("DNS hijack disabled because no DNS upstream was configured");
-            return Ok(None);
-        };
-
-        let mut tasks = Vec::new();
-        let mut last_error = None;
-        for bind_addr in [
-            SocketAddr::from((Ipv4Addr::LOCALHOST, plan.proxy_port)),
-            SocketAddr::from((Ipv6Addr::LOCALHOST, plan.proxy_port)),
-        ] {
-            match UdpSocket::bind(bind_addr).await {
-                Ok(socket) => {
-                    tracing::info!(%bind_addr, "started FeiLian-compatible DNS proxy");
-                    tasks.push(tokio::spawn(run_dns_proxy(
-                        Arc::new(socket),
-                        hijacker.clone(),
-                    )));
-                }
-                Err(error) => {
-                    tracing::warn!(%bind_addr, %error, "failed to bind DNS proxy listener");
-                    last_error = Some((bind_addr, error));
-                }
-            }
-        }
-
-        if tasks.is_empty() {
-            return match last_error {
-                Some((bind_addr, source)) => Err(Error::BindProxy { bind_addr, source }),
-                None => NoProxyListenerSnafu.fail(),
-            };
-        }
-        Ok(Some(Self { tasks }))
-    }
-
-    pub fn stop(self) {
-        for task in self.tasks {
-            task.abort();
-        }
-    }
-}
-
-impl DnsHijackTun {
-    #[must_use]
-    pub fn new(
-        inner: IpTun, plan: &DnsHijackPlan, outbound_interface: Option<OutboundInterface>,
-    ) -> Self {
-        Self {
-            inner,
-            hijacker: plan.hijacker(outbound_interface),
-        }
-    }
-}
-
-impl IpSend for DnsHijackTun {
-    async fn send(&mut self, packet: Packet<Ip>) -> io::Result<()> {
-        self.inner.send(packet).await
-    }
-}
-
-impl IpRecv for DnsHijackTun {
-    async fn recv<'a>(
-        &'a mut self, pool: &mut PacketBufPool,
-    ) -> io::Result<impl Iterator<Item = Packet<Ip>> + Send + 'a> {
-        loop {
-            let packets = self.inner.recv(pool).await?.collect::<Vec<_>>();
-            let mut forward = Vec::new();
-            for packet in packets {
-                let raw_packet = packet.into_bytes();
-                let Some(hijacker) = self.hijacker.clone() else {
-                    forward.push(raw_packet.try_into_ip().map_err(to_io_error)?);
-                    continue;
-                };
-                let Some(query) = DnsWireQuery::from_ip_packet(&raw_packet) else {
-                    forward.push(raw_packet.try_into_ip().map_err(to_io_error)?);
-                    continue;
-                };
-                tracing::debug!(
-                    source = %query.source,
-                    destination = %query.destination,
-                    source_port = query.source_port,
-                    destination_port = query.destination_port,
-                    domain = query.domain.as_deref().unwrap_or("<unknown>"),
-                    "DNS hijack triggered for TUN packet"
-                );
-                let mut tun = self.inner.clone();
-                tokio::spawn(async move {
-                    match hijacker.resolve_wire_query(query).await {
-                        Ok(Some(response)) => {
-                            if let Err(error) = tun.send(response).await {
-                                tracing::warn!(%error, "failed to write DNS hijack response to TUN");
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(error) => tracing::warn!(%error, "DNS hijack query failed"),
-                    }
-                });
-            }
-            if !forward.is_empty() {
-                return Ok(forward.into_iter());
-            }
-        }
-    }
-
-    fn mtu(&self) -> MtuWatcher {
-        self.inner.mtu()
-    }
-}
-
-impl DnsHijacker {
-    async fn resolve_wire_query(&self, query: DnsWireQuery) -> io::Result<Option<Packet<Ip>>> {
-        let Some(response_payload) = self
-            .resolve_dns_payload(&query.payload, query.domain.as_deref())
-            .await?
-        else {
-            return Ok(None);
-        };
-        let response = query.response_packet(&response_payload)?;
-        let packet = Packet::copy_from(response.as_slice())
-            .try_into_ip()
-            .map_err(to_io_error)?;
-        Ok(Some(packet))
-    }
-
-    async fn resolve_dns_payload(
-        &self, payload: &[u8], domain_hint: Option<&str>,
-    ) -> io::Result<Option<Vec<u8>>> {
-        let domain = domain_hint
-            .map(ToOwned::to_owned)
-            .or_else(|| parse_dns_question_domain(payload));
-        let request_payload = normalize_dns_payload(payload)?;
-        let upstreams = self
-            .plan
-            .upstreams_for_domain(domain.as_deref(), &self.domain_matchers);
-        if upstreams.is_empty() {
-            return Ok(None);
-        }
-        tracing::trace!(
-            domain = domain.as_deref().unwrap_or("<unknown>"),
-            upstream_count = upstreams.len(),
-            "selected DNS upstreams"
-        );
-
-        let mut last_error = None;
-        for upstream in upstreams {
-            match query_dns_upstream(
-                &upstream,
-                &request_payload,
-                self.outbound_interface.as_ref(),
-            )
-            .await
-            {
-                Ok(response) => {
-                    tracing::debug!(
-                        domain = domain.as_deref().unwrap_or("<unknown>"),
-                        upstream,
-                        "DNS hijack query resolved"
-                    );
-                    return Ok(Some(response));
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        domain = domain.as_deref().unwrap_or("<unknown>"),
-                        upstream,
-                        %error,
-                        "DNS upstream query failed"
-                    );
-                    last_error = Some(error);
-                }
-            }
-        }
-        Err(last_error
-            .unwrap_or_else(|| io::Error::other("DNS query failed without an upstream error")))
-    }
 }
 
 impl DnsWireQuery {
@@ -414,7 +550,7 @@ impl DnsWireQuery {
         })
     }
 
-    fn response_packet(&self, dns_payload: &[u8]) -> io::Result<Vec<u8>> {
+    fn response_packet(&self, dns_payload: &[u8]) -> Result<Vec<u8>> {
         match (self.source, self.destination) {
             (IpAddr::V4(source), IpAddr::V4(destination)) => build_ipv4_udp_response(
                 destination.octets(),
@@ -430,97 +566,14 @@ impl DnsWireQuery {
                 self.source_port,
                 dns_payload,
             ),
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "DNS response IP family mismatch",
-            )),
+            _ => AddressFamilyMismatchSnafu.fail(),
         }
     }
-}
-
-async fn run_dns_proxy(socket: Arc<UdpSocket>, hijacker: DnsHijacker) {
-    let mut buf = [0_u8; MAX_DNS_PACKET];
-    loop {
-        let (len, peer) = match socket.recv_from(&mut buf).await {
-            Ok(value) => value,
-            Err(error) => {
-                tracing::warn!(%error, "DNS proxy listener stopped");
-                return;
-            }
-        };
-        let payload = buf[..len].to_vec();
-        let domain = parse_dns_question_domain(&payload);
-        tracing::debug!(
-            %peer,
-            domain = domain.as_deref().unwrap_or("<unknown>"),
-            "DNS hijack triggered for proxy query"
-        );
-        let socket = socket.clone();
-        let hijacker = hijacker.clone();
-        tokio::spawn(async move {
-            match hijacker
-                .resolve_dns_payload(&payload, domain.as_deref())
-                .await
-            {
-                Ok(Some(response)) => {
-                    if let Err(error) = socket.send_to(&response, peer).await {
-                        tracing::warn!(%peer, %error, "failed to send DNS proxy response");
-                    }
-                }
-                Ok(None) => {}
-                Err(error) => tracing::warn!(%peer, %error, "DNS proxy query failed"),
-            }
-        });
-    }
-}
-
-async fn query_dns_upstream(
-    upstream: &str, payload: &[u8], outbound_interface: Option<&OutboundInterface>,
-) -> io::Result<Vec<u8>> {
-    let addrs = lookup_host(upstream).await?;
-    let mut last_error = None;
-    for addr in addrs {
-        let bind_addr = if addr.is_ipv4() {
-            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
-        } else {
-            SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
-        };
-        match query_dns_addr(bind_addr, addr, payload, outbound_interface).await {
-            Ok(response) => return Ok(response),
-            Err(error) => last_error = Some(error),
-        }
-    }
-    Err(last_error.unwrap_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::AddrNotAvailable,
-            format!("DNS upstream `{upstream}` resolved to no addresses"),
-        )
-    }))
-}
-
-async fn query_dns_addr(
-    bind_addr: SocketAddr, upstream: SocketAddr, payload: &[u8],
-    outbound_interface: Option<&OutboundInterface>,
-) -> io::Result<Vec<u8>> {
-    let socket = crate::outbound::bind_udp_socket(bind_addr, outbound_interface)?;
-    tracing::trace!(
-        %upstream,
-        outbound_interface = outbound_interface
-            .map_or("<default>", |interface| interface.name.as_str()),
-        "sending DNS hijack query to upstream"
-    );
-    socket.send_to(payload, upstream).await?;
-    let mut response = vec![0_u8; MAX_DNS_PACKET];
-    let (len, _) = tokio::time::timeout(DNS_TIMEOUT, socket.recv_from(&mut response))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "DNS upstream timed out"))??;
-    response.truncate(len);
-    normalize_dns_payload(&response)
 }
 
 fn build_ipv4_udp_response(
     source: [u8; 4], destination: [u8; 4], source_port: u16, destination_port: u16, payload: &[u8],
-) -> io::Result<Vec<u8>> {
+) -> Result<Vec<u8>> {
     write_udp_packet(
         PacketBuilder::ipv4(source, destination, DNS_RESPONSE_HOP_LIMIT)
             .udp(source_port, destination_port),
@@ -531,7 +584,7 @@ fn build_ipv4_udp_response(
 fn build_ipv6_udp_response(
     source: [u8; 16], destination: [u8; 16], source_port: u16, destination_port: u16,
     payload: &[u8],
-) -> io::Result<Vec<u8>> {
+) -> Result<Vec<u8>> {
     write_udp_packet(
         PacketBuilder::ipv6(source, destination, DNS_RESPONSE_HOP_LIMIT)
             .udp(source_port, destination_port),
@@ -541,20 +594,17 @@ fn build_ipv6_udp_response(
 
 fn write_udp_packet(
     builder: etherparse::PacketBuilderStep<etherparse::UdpHeader>, payload: &[u8],
-) -> io::Result<Vec<u8>> {
+) -> Result<Vec<u8>> {
     let mut packet = Vec::with_capacity(builder.size(payload.len()));
-    builder.write(&mut packet, payload).map_err(to_io_error)?;
+    builder
+        .write(&mut packet, payload)
+        .context(BuildResponseSnafu)?;
     Ok(packet)
 }
 
 fn parse_dns_question_domain(payload: &[u8]) -> Option<String> {
     let message = DnsMessage::from_vec(payload).ok()?;
     first_query_domain(&message)
-}
-
-fn normalize_dns_payload(payload: &[u8]) -> io::Result<Vec<u8>> {
-    let message = DnsMessage::from_vec(payload).map_err(to_io_error)?;
-    message.to_vec().map_err(to_io_error)
 }
 
 fn first_query_domain(message: &DnsMessage) -> Option<String> {
@@ -564,147 +614,109 @@ fn first_query_domain(message: &DnsMessage) -> Option<String> {
         .map(|query| normalize_domain(&query.name().to_ascii()))
 }
 
-fn push_optional_dns_endpoints(upstreams: &mut Vec<String>, value: Option<&str>) {
-    if let Some(value) = value {
-        push_dns_endpoints(upstreams, value);
+fn response_code(payload: &[u8]) -> ResponseCode {
+    DnsMessage::from_vec(payload).map_or(ResponseCode::ServFail, |message| {
+        message.metadata.response_code
+    })
+}
+
+/// Turn a query into a response with the given code (e.g. `SERVFAIL`).
+fn synthesize_failure(query_payload: &[u8], code: ResponseCode) -> Vec<u8> {
+    match DnsMessage::from_vec(query_payload) {
+        Ok(mut message) => {
+            message.metadata.message_type = MessageType::Response;
+            message.metadata.response_code = code;
+            message.metadata.recursion_available = true;
+            message.to_vec().unwrap_or_else(|_| query_payload.to_vec())
+        }
+        Err(_) => query_payload.to_vec(),
     }
 }
 
-fn push_dns_endpoints(upstreams: &mut Vec<String>, value: &str) {
-    for token in split_config_tokens(value) {
-        if let Some(endpoint) = dns_endpoint(&token) {
-            upstreams.push(endpoint);
+/// Parse VPN DNS resolver endpoints from a set of free-form config values
+/// (`vpn_dns`/`vpn_dns_backup`/local override). Each value may be a single
+/// `host[:port]` token, a `dns://` or `udp://` URL, or a comma/semicolon/
+/// whitespace-separated list of those. Returns de-duplicated `host:port`
+/// strings ready for [`tokio::net::lookup_host`].
+fn collect_vpn_servers<const N: usize>(sources: [Option<&str>; N]) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut servers = Vec::new();
+    for raw in sources.into_iter().flatten() {
+        for token in split_config_tokens(raw) {
+            if let Some(endpoint) = parse_dns_endpoint(&token)
+                && seen.insert(endpoint.clone())
+            {
+                servers.push(endpoint);
+            }
         }
     }
+    servers
 }
 
-fn dns_endpoint(value: &str) -> Option<String> {
+/// Parse a single token into a `host:port` DNS endpoint, accepting bare IPs,
+/// `socket_addr`, hostnames, and `dns://` / `udp://` URLs. Returns `None` for
+/// path-bearing URLs (e.g. `DoH`) or non-DNS schemes.
+fn parse_dns_endpoint(value: &str) -> Option<String> {
     let value = value.trim().trim_matches('"').trim_matches('\'');
-    if value.is_empty() {
-        return None;
-    }
-    if value.contains("://") {
-        return dns_endpoint_from_url(value);
-    }
-    if value.contains('/') {
+    if value.is_empty() || value.contains('/') && !value.contains("://") {
         return None;
     }
     if value.parse::<SocketAddr>().is_ok() {
-        return Some(value.to_string());
+        return Some(value.to_owned());
     }
     if let Ok(ip) = value.parse::<IpAddr>() {
-        let host = match ip {
-            IpAddr::V4(ip) => Host::Ipv4(ip),
-            IpAddr::V6(ip) => Host::Ipv6(ip),
-        };
-        return Some(format_dns_host_port(host, DNS_PORT));
+        return Some(SocketAddr::new(ip, DNS_PORT).to_string());
     }
-    dns_endpoint_from_url(&format!("dns://{value}")).or_else(|| {
-        Host::parse(value)
-            .ok()
-            .map(|host| format_dns_host_port(host, DNS_PORT))
-    })
-}
-
-fn dns_endpoint_from_url(value: &str) -> Option<String> {
-    let url = Url::parse(value).ok()?;
-    if !matches!(url.scheme(), "dns" | "udp") {
+    let url = if value.contains("://") {
+        Url::parse(value).ok()?
+    } else {
+        Url::parse(&format!("dns://{value}")).ok()?
+    };
+    if !matches!(url.scheme(), "dns" | "udp") || !matches!(url.path(), "" | "/") {
         return None;
     }
-    if !url.path().is_empty() && url.path() != "/" {
-        return None;
-    }
-    let host = url.host()?.to_owned();
-    Some(format_dns_host_port(host, url.port().unwrap_or(DNS_PORT)))
-}
-
-fn format_dns_host_port(host: Host<String>, port: u16) -> String {
-    match host {
+    let port = url.port().unwrap_or(DNS_PORT);
+    Some(match url.host()? {
         Host::Domain(domain) => format!("{domain}:{port}"),
         Host::Ipv4(ip) => SocketAddr::from((ip, port)).to_string(),
         Host::Ipv6(ip) => SocketAddr::from((ip, port)).to_string(),
-    }
-}
-
-fn dedupe(values: Vec<String>) -> Vec<String> {
-    let mut seen = BTreeSet::new();
-    values
-        .into_iter()
-        .filter(|value| seen.insert(value.clone()))
-        .collect()
-}
-
-fn clean_string(value: Option<String>) -> Option<String> {
-    value.and_then(|value| {
-        let value = value.trim().to_string();
-        (!value.is_empty()).then_some(value)
     })
 }
 
-fn collect_domain_patterns(domains: &mut BTreeSet<String>, raw: &str) {
+/// Extract split-tunnel domain patterns from a config value that may itself be
+/// JSON (string / array / object of strings) or a comma/semicolon-separated
+/// list. Accepts entries that look like real domains and rejects IPs, CIDRs,
+/// and host:port forms.
+fn extract_domains(raw: &str, out: &mut BTreeSet<String>) {
     if let Ok(value) = serde_json::from_str::<Value>(raw) {
-        collect_json_domain_patterns(domains, &value);
+        walk_json_for_domains(&value, out);
     } else {
         for token in split_config_tokens(raw) {
-            add_domain_pattern(domains, &token);
+            accept_domain(&token, out);
         }
     }
 }
 
-fn collect_json_domain_patterns(domains: &mut BTreeSet<String>, value: &Value) {
+fn walk_json_for_domains(value: &Value, out: &mut BTreeSet<String>) {
     match value {
-        Value::String(value) => add_domain_pattern(domains, value),
-        Value::Array(values) => {
-            for value in values {
-                collect_json_domain_patterns(domains, value);
-            }
-        }
-        Value::Object(values) => {
-            for value in values.values() {
-                collect_json_domain_patterns(domains, value);
-            }
-        }
+        Value::String(value) => accept_domain(value, out),
+        Value::Array(values) => values.iter().for_each(|v| walk_json_for_domains(v, out)),
+        Value::Object(values) => values.values().for_each(|v| walk_json_for_domains(v, out)),
         Value::Null | Value::Bool(_) | Value::Number(_) => {}
     }
 }
 
-fn add_domain_pattern(domains: &mut BTreeSet<String>, value: &str) {
+fn accept_domain(value: &str, out: &mut BTreeSet<String>) {
     let domain = normalize_domain(value);
     if domain.is_empty()
         || domain.contains('/')
+        || !domain.contains('.')
         || domain.parse::<IpAddr>().is_ok()
         || domain.parse::<SocketAddr>().is_ok()
     {
         return;
     }
-    if domain.contains('.') {
-        domains.insert(domain);
-    }
-}
-
-/// Build the per-rule wildcard matchers used for split-domain matching.
-///
-/// Each rule yields two [`WildMatch`] patterns: the exact host (`example.com`)
-/// and a subdomain wildcard (`*.example.com`). `*` spans dots, so the wildcard
-/// matches any depth of subdomain — reproducing the previous
-/// `domain.ends_with(".{rule}")` behaviour without hand-rolled string work.
-fn build_domain_matchers(rules: &[DnsRule]) -> Vec<WildMatch> {
-    rules
-        .iter()
-        .flat_map(|rule| {
-            let domain = normalize_domain(&rule.domain);
-            [
-                WildMatch::new(&domain),
-                WildMatch::new(&format!("*.{domain}")),
-            ]
-        })
-        .collect()
-}
-
-/// True when `domain` matches any split-tunnel rule matcher.
-fn matches_split_domain(matchers: &[WildMatch], domain: &str) -> bool {
-    let domain = normalize_domain(domain);
-    matchers.iter().any(|matcher| matcher.matches(&domain))
+    out.insert(domain);
 }
 
 fn normalize_domain(value: &str) -> String {
@@ -726,10 +738,6 @@ fn split_config_tokens(value: &str) -> impl Iterator<Item = String> + '_ {
         .map(ToOwned::to_owned)
 }
 
-fn to_io_error(error: impl std::fmt::Display) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, error.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use hickory_proto::{
@@ -737,28 +745,27 @@ mod tests {
         rr::{Name, RecordType},
     };
 
-    use super::{dns_endpoint, normalize_domain, parse_dns_question_domain};
+    use super::{normalize_domain, parse_dns_endpoint, parse_dns_question_domain};
 
     #[test]
     fn normalizes_dns_upstreams() {
-        assert_eq!(dns_endpoint("8.8.8.8"), Some("8.8.8.8:53".to_string()));
         assert_eq!(
-            dns_endpoint("2001:4860:4860::8888"),
+            parse_dns_endpoint("8.8.8.8"),
+            Some("8.8.8.8:53".to_string())
+        );
+        assert_eq!(
+            parse_dns_endpoint("2001:4860:4860::8888"),
             Some("[2001:4860:4860::8888]:53".to_string())
         );
         assert_eq!(
-            dns_endpoint("dns.example:5353"),
+            parse_dns_endpoint("dns.example:5353"),
             Some("dns.example:5353".to_string())
         );
         assert_eq!(
-            dns_endpoint("udp://8.8.8.8:5353"),
+            parse_dns_endpoint("udp://8.8.8.8:5353"),
             Some("8.8.8.8:5353".to_string())
         );
-        assert_eq!(
-            dns_endpoint("dns://[2001:4860:4860::8888]:5353"),
-            Some("[2001:4860:4860::8888]:5353".to_string())
-        );
-        assert_eq!(dns_endpoint("https://dns.example/dns-query"), None);
+        assert_eq!(parse_dns_endpoint("https://dns.example/dns-query"), None);
     }
 
     #[test]

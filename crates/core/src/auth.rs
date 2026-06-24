@@ -35,9 +35,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 // Activate
 // ---------------------------------------------------------------------------
 
-pub async fn activate(
-    client: &ApiClient, code: &str,
-) -> Result<BaseResponse<ActivateInfo>> {
+pub async fn activate(client: &ApiClient, code: &str) -> Result<BaseResponse<ActivateInfo>> {
     ActivateRequest {
         code: code.to_owned(),
     }
@@ -404,7 +402,10 @@ pub fn next_login_step(result: Option<&LoginV2Result>) -> LoginStep {
             masked_email: next.email.clone().unwrap_or_default(),
         };
     }
-    if matches!(action.to_ascii_lowercase().as_str(), "goto_link" | "gotolink") {
+    if matches!(
+        action.to_ascii_lowercase().as_str(),
+        "goto_link" | "gotolink"
+    ) {
         return LoginStep::Authenticated;
     }
     if result.result.as_deref() == Some("success") {
