@@ -1,6 +1,7 @@
 use std::{
     net::{Ipv4Addr, Ipv6Addr, UdpSocket},
     sync::Arc,
+    time::Duration,
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -11,19 +12,20 @@ use gotatun::{
 };
 use ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
 use rustylink_api::{ProtocolMode, VpnConnResponse};
+use rustylink_outbound::{Dialer, OutboundConfig, OutboundContext, Resolver};
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
-use tokio::net::lookup_host;
 use url::{Host, Url};
 
 use crate::{
     BoundUdpSocketFactory, DnsHijackPlan, DnsQueryTransport, DnsResolver,
-    FeilianTcpTransportFactory, LivenessProbe, OutboundInterface, UdpDnsTransport, VpnTun,
+    FeilianTcpTransportFactory, LivenessProbe, UdpDnsTransport, VpnTun,
     route::{self, AppliedRoutes, VpnRouteMode},
 };
 
 const ANDROID_LOCAL_PORT_START: u16 = 12912;
 const WIREGUARD_KEEPALIVE_SECS: u16 = 25;
+const TCP_DIAL_TIMEOUT: Duration = Duration::from_secs(3);
 const STANDARD_NOISE_CONSTRUCTION: &[u8] = b"Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s";
 const FEILIAN_V2_PROTOCOL_IDENTIFIER: &[u8] = b"CorpLink v1 vpn@feilian-----------";
 
@@ -76,8 +78,10 @@ pub enum Error {
     #[snafu(display("TUN device creation failed: {source}"))]
     TunCreate { source: std::io::Error },
 
-    #[snafu(display("outbound interface selection failed: {source}"))]
-    Outbound { source: crate::outbound::Error },
+    #[snafu(display("outbound setup failed: {source}"))]
+    Outbound {
+        source: rustylink_outbound::ContextError,
+    },
 
     #[snafu(display("gotatun device setup failed: {source}"))]
     Device { source: gotatun::device::Error },
@@ -85,7 +89,7 @@ pub enum Error {
     #[snafu(display("failed to resolve WireGuard endpoint `{endpoint}`: {source}"))]
     ResolveEndpoint {
         endpoint: String,
-        source: std::io::Error,
+        source: rustylink_outbound::ResolverError,
     },
 
     #[snafu(display("WireGuard endpoint `{endpoint}` did not resolve to any address"))]
@@ -276,19 +280,13 @@ impl TunnelSession {
     /// via its `dst ∈ vpn_dns_ips` check (otherwise the resolver would catch
     /// its own traffic and loop indefinitely).
     fn build_vpn_tun(
-        &self, tun_device: tun_rs::AsyncDevice, tun_name: &str,
-        outbound_interface: Option<&OutboundInterface>, system_servers: &[std::net::IpAddr],
+        &self, tun_device: tun_rs::AsyncDevice, directed_dialer: &Dialer, routed_dialer: &Dialer,
+        system_servers: &[std::net::IpAddr],
     ) -> Result<(VpnTun, Arc<dyn DnsQueryTransport>)> {
-        let tun_outbound = OutboundInterface::lookup(tun_name);
-        if tun_outbound.is_none() {
-            tracing::warn!(
-                tun = %tun_name,
-                "TUN interface index not yet visible; routed DNS will use OS routing only"
-            );
-        }
         let directed_dns: Arc<dyn DnsQueryTransport> =
-            Arc::new(UdpDnsTransport::new(outbound_interface.cloned()));
-        let routed_dns: Arc<dyn DnsQueryTransport> = Arc::new(UdpDnsTransport::new(tun_outbound));
+            Arc::new(UdpDnsTransport::new(directed_dialer.clone()));
+        let routed_dns: Arc<dyn DnsQueryTransport> =
+            Arc::new(UdpDnsTransport::new(routed_dialer.clone()));
         let resolver = DnsResolver::build(
             &self.config.dns_plan,
             self.config.full_tunnel,
@@ -316,50 +314,43 @@ impl TunnelSession {
             split_domain_rules = self.config.dns_plan.split_domains.len(),
             "selected tunnel runtime options"
         );
-        let system_servers = crate::dns::system_dns_servers();
-        self.route_system_dns_into_tunnel(&system_servers);
-        let endpoint = resolve_endpoint(&self.config.endpoint).await?;
         let private_key = StaticSecret::from(decode_key(
             "local_private_key",
             &self.config.local_private_key,
         )?);
-        let peer = tunnel_peer(&self.config, endpoint)?;
 
         let (tun_device, actual_interface_name) = self.open_tun()?;
-        let outbound_interface = OutboundInterface::resolve(
-            self.config.outbound_interface.as_deref(),
-            Some(&actual_interface_name),
-        )
+
+        let ctx = OutboundContext::build(OutboundConfig {
+            configured_interface: self.config.outbound_interface.clone(),
+            excluded_tun: actual_interface_name.clone(),
+            full_tunnel: self.config.full_tunnel,
+            connect_timeout: TCP_DIAL_TIMEOUT,
+        })
+        .await
         .context(OutboundSnafu)?;
-        if let Some(outbound_interface) = &outbound_interface {
-            tracing::info!(
-                outbound_interface = %outbound_interface.name,
-                outbound_interface_index = outbound_interface.index,
-                tunnel_interface = %actual_interface_name,
-                "binding tunnel outbound sockets to physical interface"
-            );
-        } else {
-            tracing::warn!(
-                tunnel_interface = %actual_interface_name,
-                "no outbound interface selected; tunnel sockets will use OS routing"
-            );
-        }
+
+        let system_servers: Vec<std::net::IpAddr> = ctx
+            .dns_servers()
+            .iter()
+            .map(std::net::SocketAddr::ip)
+            .collect();
+        self.route_system_dns_into_tunnel(&system_servers);
+
+        let endpoint = resolve_endpoint(&self.config.endpoint, ctx.resolver()).await?;
+        let peer = tunnel_peer(&self.config, endpoint)?;
         let routes = self.config.routes.as_slice();
         let routes = route::apply(&actual_interface_name, routes)
             .await
             .context(RouteSnafu)?;
         self.routes = Some(routes);
         self.status = TunnelStatus::RoutesApplied;
-        let (tun, routed_dns) = self.build_vpn_tun(
-            tun_device,
-            &actual_interface_name,
-            outbound_interface.as_ref(),
-            &system_servers,
-        )?;
+        let (tun, routed_dns) =
+            self.build_vpn_tun(tun_device, ctx.directed(), ctx.routed(), &system_servers)?;
         let device = match self.config.protocol_mode {
             ProtocolMode::Udp => {
                 let builder = DeviceBuilder::new()
-                    .with_udp(BoundUdpSocketFactory::new(outbound_interface.clone()))
+                    .with_udp(BoundUdpSocketFactory::new(ctx.directed().clone()))
                     .with_ip(tun)
                     .with_private_key(private_key)
                     .with_listen_port(self.config.local_port)
@@ -369,7 +360,7 @@ impl TunnelSession {
             }
             ProtocolMode::FeilianTcp => {
                 let builder = DeviceBuilder::new()
-                    .with_udp(FeilianTcpTransportFactory::new(outbound_interface.clone()))
+                    .with_udp(FeilianTcpTransportFactory::new(ctx.directed().clone()))
                     .with_ip(tun)
                     .with_private_key(private_key)
                     .with_listen_port(self.config.local_port)
@@ -621,7 +612,7 @@ fn feilian_protocol_identifier(config: &TunnelConfig) -> Option<ProtocolIdentifi
     }
 }
 
-async fn resolve_endpoint(endpoint: &Url) -> Result<std::net::SocketAddr> {
+async fn resolve_endpoint(endpoint: &Url, resolver: &Resolver) -> Result<std::net::SocketAddr> {
     let host = endpoint.host().context(InvalidConfigSnafu {
         reason: "WireGuard endpoint URL must include a host".to_string(),
     })?;
@@ -630,26 +621,17 @@ async fn resolve_endpoint(endpoint: &Url) -> Result<std::net::SocketAddr> {
         .context(InvalidConfigSnafu {
             reason: "WireGuard endpoint URL must include a port".to_string(),
         })?;
-    let addrs = match host {
-        Host::Domain(domain) => lookup_host((domain, port))
-            .await
-            .context(ResolveEndpointSnafu {
-                endpoint: endpoint.to_string(),
-            })?
-            .collect::<Vec<_>>(),
-        Host::Ipv4(address) => lookup_host((address, port))
-            .await
-            .context(ResolveEndpointSnafu {
-                endpoint: endpoint.to_string(),
-            })?
-            .collect::<Vec<_>>(),
-        Host::Ipv6(address) => lookup_host((address, port))
-            .await
-            .context(ResolveEndpointSnafu {
-                endpoint: endpoint.to_string(),
-            })?
-            .collect::<Vec<_>>(),
+    let host_str = match host {
+        Host::Domain(domain) => domain.to_string(),
+        Host::Ipv4(address) => address.to_string(),
+        Host::Ipv6(address) => address.to_string(),
     };
+    let addrs = resolver
+        .resolve_host(&host_str, port)
+        .await
+        .context(ResolveEndpointSnafu {
+            endpoint: endpoint.to_string(),
+        })?;
     let mut addrs = addrs.into_iter();
     addrs.next().context(EmptyEndpointResolutionSnafu {
         endpoint: endpoint.to_string(),

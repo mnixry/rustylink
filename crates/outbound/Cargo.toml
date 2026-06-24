@@ -1,0 +1,29 @@
+[package]
+edition.workspace = true
+name              = "rustylink-outbound"
+version.workspace = true
+
+[dependencies]
+default-net.workspace      = true
+hickory-proto.workspace    = true
+hickory-resolver.workspace = true
+http.workspace             = true
+hyper.workspace            = true
+hyper-util.workspace       = true
+serde.workspace            = true
+snafu.workspace            = true
+socket2.workspace          = true
+tokio.workspace            = true
+tower.workspace            = true
+tracing.workspace          = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Networking_WinSock"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+hyper = { workspace = true, features = ["server"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+
+[lints]
+workspace = true

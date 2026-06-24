@@ -20,6 +20,7 @@
 
 use std::time::Duration;
 
+use rustylink_outbound::{NetworkSnapshot, pinned_present};
 use rustylink_tunnel::{ReconnectEvent, TunnelSession};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -42,29 +43,16 @@ const LIVENESS_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Clone, Debug)]
 pub enum SupervisorOutcome {
     /// A reconnect trigger fired; the actor should run the reconnect policy.
-    Trigger(ReconnectEvent),
+    /// `was_healthy` is true if the session received at least one liveness-
+    /// probe reply before this trigger fired.
+    Trigger {
+        event: ReconnectEvent,
+        was_healthy: bool,
+    },
     /// The server forced a logout via a `/vpn/report` response.
-    ServerKickOut,
+    ServerKickOut { was_healthy: bool },
     /// Disconnect was requested (cancellation).
     Cancelled,
-}
-
-/// Network-state snapshot used to detect changes.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct NetSnapshot {
-    default_iface: Option<String>,
-}
-
-fn current_net() -> NetSnapshot {
-    NetSnapshot {
-        default_iface: default_net::get_default_interface().ok().map(|i| i.name),
-    }
-}
-
-/// Returns true if the pinned interface is present in the system interface
-/// list.
-fn interface_present(name: &str) -> bool {
-    default_net::get_interfaces().iter().any(|i| i.name == name)
 }
 
 /// Liveness verdict from the probe state.
@@ -103,7 +91,13 @@ where
     // Skip the immediate first tick on the report timer.
     report_tick.tick().await;
 
-    let last_net = current_net();
+    let last_net = match NetworkSnapshot::capture().await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(%e, "initial network snapshot failed");
+            NetworkSnapshot::default()
+        }
+    };
     let started = Instant::now();
 
     loop {
@@ -111,15 +105,15 @@ where
             () = cancel.cancelled() => return SupervisorOutcome::Cancelled,
 
             () = session.wait() => {
+                let was_healthy = session.last_probe_rx_elapsed().is_some();
                 tracing::warn!("tunnel transport failed (device stopped)");
-                return SupervisorOutcome::Trigger(ReconnectEvent::TransportFailed);
+                return SupervisorOutcome::Trigger {
+                    event: ReconnectEvent::TransportFailed,
+                    was_healthy,
+                };
             }
 
             _ = liveness_tick.tick() => {
-                // Per-peer tx/rx + handshake age are debug-only diagnostic
-                // signals now: the supervisor's verdict comes from the routed
-                // probe, not the `WireGuard` handshake age (the Android client
-                // does the same — see `mLastRxBytes`/`mIdleCount`).
                 for peer in session.peer_stats().await {
                     tracing::debug!(
                         tx_bytes = peer.stats.tx_bytes,
@@ -132,35 +126,53 @@ where
                 let probe_age = session.last_probe_rx_elapsed();
                 let status = liveness_status(probe_age, started.elapsed());
                 if status != LivenessStatus::Healthy {
+                    let was_healthy = probe_age.is_some();
                     tracing::warn!(
                         ?status,
                         probe_age_secs = probe_age.map(|d| d.as_secs()),
                         session_age_secs = started.elapsed().as_secs(),
                         "tunnel liveness probe stalled"
                     );
-                    return SupervisorOutcome::Trigger(ReconnectEvent::HandshakeTimeout);
+                    return SupervisorOutcome::Trigger {
+                        event: ReconnectEvent::HandshakeTimeout,
+                        was_healthy,
+                    };
                 }
             }
 
             _ = network_tick.tick() => {
+                let was_healthy = session.last_probe_rx_elapsed().is_some();
                 if let Some(name) = &outbound {
-                    if !interface_present(name) {
+                    if !pinned_present(name).await.unwrap_or(false) {
                         tracing::warn!(interface = %name, "pinned outbound interface lost");
-                        return SupervisorOutcome::Trigger(ReconnectEvent::NetworkChanged);
+                        return SupervisorOutcome::Trigger {
+                            event: ReconnectEvent::NetworkChanged,
+                            was_healthy,
+                        };
                     }
                 } else {
-                    let now = current_net();
+                    let now = match NetworkSnapshot::capture().await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!(%e, "network snapshot failed");
+                            continue;
+                        }
+                    };
                     if now != last_net {
                         tracing::info!(?last_net, ?now, "default network changed");
-                        return SupervisorOutcome::Trigger(ReconnectEvent::NetworkChanged);
+                        return SupervisorOutcome::Trigger {
+                            event: ReconnectEvent::NetworkChanged,
+                            was_healthy,
+                        };
                     }
                 }
             }
 
             _ = report_tick.tick() => {
                 if report().await {
+                    let was_healthy = session.last_probe_rx_elapsed().is_some();
                     tracing::warn!("server kickout detected from /vpn/report");
-                    return SupervisorOutcome::ServerKickOut;
+                    return SupervisorOutcome::ServerKickOut { was_healthy };
                 }
             }
         }
@@ -175,13 +187,10 @@ mod tests {
 
     #[test]
     fn initial_connect_window_tolerates_silence_then_fails() {
-        // Before the connect timeout, silence is acceptable (handshake still
-        // pending lazy-trigger via the first probe).
         assert_eq!(
             liveness_status(None, CONNECT_TIMEOUT.saturating_sub(Duration::from_secs(1))),
             LivenessStatus::Healthy
         );
-        // Past the connect timeout, silence is a hard failure.
         assert_eq!(
             liveness_status(None, CONNECT_TIMEOUT + Duration::from_secs(1)),
             LivenessStatus::ConnectTimeout

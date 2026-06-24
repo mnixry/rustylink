@@ -13,10 +13,11 @@ path = "src/main.rs"
 embed-ui = ["dep:rust-embed", "dep:mime_guess"]
 
 [dependencies]
-rustylink-api.path    = "../api"
-rustylink-core.path   = "../core"
-rustylink-proto.path  = "../proto"
-rustylink-tunnel.path = "../tunnel"
+rustylink-api.path      = "../api"
+rustylink-core.path     = "../core"
+rustylink-outbound.path = "../outbound"
+rustylink-proto.path    = "../proto"
+rustylink-tunnel.path   = "../tunnel"
 
 axum.workspace                  = true
 buffa.workspace                 = true

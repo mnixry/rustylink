@@ -30,6 +30,8 @@ hickory-resolver      = "0.26.1"
 hmac                  = "0.13.0"
 http                  = "1.4.2"
 http-body             = "1.0.1"
+hyper                 = { version = "1.6.0", features = ["client", "http1"] }
+hyper-util            = { version = "0.1.14", features = ["tokio", "client-legacy", "http1"] }
 ipnetwork             = { version = "0.21.1", features = ["serde"] }
 jiff                  = { version = "0.2.28", features = ["serde"] }
 machine-uid           = "0.6.0"

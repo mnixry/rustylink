@@ -12,7 +12,7 @@
 use std::{
     collections::BTreeSet,
     io, iter,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -28,14 +28,13 @@ use hickory_proto::{
     rr::{Name, RecordType},
 };
 use rustylink_api::VpnConnResponse;
+use rustylink_outbound::Dialer;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use snafu::prelude::*;
 use tokio::net::lookup_host;
 use url::{Host, Url};
 use wildmatch::WildMatch;
-
-use crate::OutboundInterface;
 
 const DNS_PORT: u16 = 53;
 const DNS_RESPONSE_HOP_LIMIT: u8 = 64;
@@ -55,7 +54,9 @@ const DEFAULT_SYSTEM_DNS: IpAddr = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
 #[snafu(visibility(pub(crate)))]
 pub enum Error {
     #[snafu(display("failed to bind DNS query socket: {source}"))]
-    BindSocket { source: io::Error },
+    BindSocket {
+        source: rustylink_outbound::DialerError,
+    },
 
     #[snafu(display("failed to send DNS query to `{server}`: {source}"))]
     SendQuery {
@@ -160,26 +161,20 @@ pub trait DnsQueryTransport: Send + Sync {
 /// interface).
 #[derive(Clone, Debug)]
 pub struct UdpDnsTransport {
-    interface: Option<OutboundInterface>,
+    dialer: Dialer,
 }
 
 impl UdpDnsTransport {
     #[must_use]
-    pub const fn new(interface: Option<OutboundInterface>) -> Self {
-        Self { interface }
+    pub fn new(dialer: Dialer) -> Self {
+        Self { dialer }
     }
 }
 
 #[async_trait]
 impl DnsQueryTransport for UdpDnsTransport {
     async fn query(&self, server: SocketAddr, request: &[u8]) -> Result<Vec<u8>> {
-        let bind = if server.is_ipv4() {
-            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
-        } else {
-            SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
-        };
-        let socket =
-            crate::outbound::bind_udp(bind, self.interface.as_ref()).context(BindSocketSnafu)?;
+        let socket = self.dialer.bind_udp_to(server).context(BindSocketSnafu)?;
         socket
             .send_to(request, server)
             .await

@@ -3125,6 +3125,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustylink-outbound"
+version = "0.1.0"
+dependencies = [
+ "default-net",
+ "hickory-proto",
+ "hickory-resolver",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "serde",
+ "snafu",
+ "socket2",
+ "tokio",
+ "tower",
+ "tracing",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "rustylink-proto"
 version = "0.1.0"
 dependencies = [
@@ -3143,7 +3163,6 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64",
- "default-net",
  "etherparse",
  "gotatun",
  "hex",
@@ -3153,10 +3172,10 @@ dependencies = [
  "rand 0.10.1",
  "route_manager",
  "rustylink-api",
+ "rustylink-outbound",
  "serde",
  "serde_json",
  "snafu",
- "socket2",
  "strum",
  "tokio",
  "tracing",
@@ -3186,6 +3205,7 @@ dependencies = [
  "rust-embed",
  "rustylink-api",
  "rustylink-core",
+ "rustylink-outbound",
  "rustylink-proto",
  "rustylink-tunnel",
  "serde",

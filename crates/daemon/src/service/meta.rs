@@ -122,6 +122,10 @@ impl MetaService for MetaServiceImpl {
 
         self.daemon.persist_config().await;
 
+        // When the outbound interface changes while a tunnel is active,
+        // reconnect so the new selection takes effect immediately.
+        self.daemon.reconnect_if_outbound_changed().await;
+
         let configuration = {
             let inner = self.daemon.inner.lock().await;
             inner.config.to_configuration_proto()
@@ -135,32 +139,25 @@ impl MetaService for MetaServiceImpl {
     async fn list_network_interfaces(
         &self, _ctx: RequestContext, _request: ServiceRequest<'_, pb::ListNetworkInterfacesRequest>,
     ) -> ServiceResult<pb::ListNetworkInterfacesResponse> {
-        let interfaces = default_net::get_interfaces();
-        let default_iface = default_net::get_default_interface().ok();
-        let auto_selected = default_iface
-            .as_ref()
-            .map(|iface| iface.name.clone())
+        let interfaces = rustylink_outbound::list_interfaces().await;
+        let auto_selected = interfaces
+            .iter()
+            .find(|i| i.is_default)
+            .map(|i| i.name.clone())
             .unwrap_or_default();
 
         let proto_interfaces = interfaces
             .into_iter()
-            .map(|iface| {
-                let is_default = default_iface
-                    .as_ref()
-                    .is_some_and(|d| d.index == iface.index);
-                let ipv4_addrs = iface.ipv4.iter().map(|net| net.addr.to_string()).collect();
-                let ipv6_addrs = iface.ipv6.iter().map(|net| net.addr.to_string()).collect();
-                pb::NetworkInterface {
-                    name: iface.name,
-                    index: iface.index,
-                    is_up: iface.if_type != default_net::interface::InterfaceType::Unknown,
-                    is_loopback: iface.if_type == default_net::interface::InterfaceType::Loopback,
-                    has_gateway: iface.gateway.is_some(),
-                    is_default,
-                    ipv4_addrs,
-                    ipv6_addrs,
-                    ..Default::default()
-                }
+            .map(|info| pb::NetworkInterface {
+                name: info.name,
+                index: info.index,
+                is_up: info.is_up,
+                is_loopback: info.is_loopback,
+                has_gateway: info.has_gateway,
+                is_default: info.is_default,
+                ipv4_addrs: info.ipv4_addrs.iter().map(ToString::to_string).collect(),
+                ipv6_addrs: info.ipv6_addrs.iter().map(ToString::to_string).collect(),
+                ..Default::default()
             })
             .collect();
 

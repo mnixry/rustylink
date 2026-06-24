@@ -55,6 +55,10 @@ pub struct DaemonInner {
     pub(crate) vpn_watch_tx: watch::Sender<pb::Tunnel>,
     /// Handle to the active connect/supervise background task.
     pub(crate) tunnel_task: Option<JoinHandle<()>>,
+    /// The outbound interface that was active when the current tunnel session
+    /// started.  Compared against `config.outbound_interface` to detect
+    /// mid-session config changes that require a reconnect.
+    pub(crate) active_outbound: Option<String>,
 }
 
 /// Cloneable handle to the daemon core.
@@ -82,7 +86,14 @@ impl Daemon {
         credentials: Option<PersistedCredentials>,
     ) -> Self {
         let identity = config.to_client_identity();
-        let http_pool = reqwest::Client::new();
+        let http_pool =
+            rustylink_api::build_http_client(&rustylink_api::ApiClientOptions {
+                outbound_interface: config.outbound_interface.clone(),
+            })
+            .unwrap_or_else(|e| {
+                tracing::warn!(%e, "failed to build HTTP client with interface binding; falling back to default");
+                reqwest::Client::new()
+            });
         let (vpn_watch_tx, vpn_watch_rx) = watch::channel(pb::Tunnel::default());
 
         let auth_machine = if let Some(creds) = credentials {
@@ -111,6 +122,7 @@ impl Daemon {
             credential_path,
             vpn_watch_tx,
             tunnel_task: None,
+            active_outbound: None,
         };
 
         Self {
@@ -332,6 +344,39 @@ impl Daemon {
         Ok(tunnel)
     }
 
+    /// If the configured outbound interface has changed since the current
+    /// tunnel session was started, cancel the running connect/supervise loop
+    /// and restart with the updated config.  No-op when no tunnel is active or
+    /// when the interface hasn't changed.
+    #[allow(clippy::significant_drop_tightening)]
+    pub async fn reconnect_if_outbound_changed(&self) {
+        let (request, cancel, task) = {
+            let mut inner = self.inner.lock().await;
+            if inner.config.outbound_interface == inner.active_outbound {
+                return;
+            }
+            let request = inner
+                .vpn
+                .as_ref()
+                .and_then(|vpn| vpn.state.current_request().cloned());
+            let Some(request) = request else {
+                return;
+            };
+            let vpn = inner.vpn.as_mut().unwrap();
+            let cancel = vpn.cancel_token.clone();
+            let task = inner.tunnel_task.take();
+            (request, cancel, task)
+        };
+        cancel.cancel();
+        if let Some(task) = task {
+            let _ = task.await;
+        }
+        tracing::info!("outbound interface changed; reconnecting tunnel");
+        if let Err(error) = self.connect_tunnel(request).await {
+            tracing::warn!(%error, "reconnect after outbound change failed");
+        }
+    }
+
     async fn run_connect_loop(self, request: VpnRequest, cancel: CancellationToken) {
         let mut controller =
             ReconnectController::new(ReconnectPolicy::android_compatible_default());
@@ -341,13 +386,19 @@ impl Daemon {
                     self.mark_disconnected().await;
                     return;
                 }
-                Ok(SupervisorOutcome::ServerKickOut) => {
+                Ok(SupervisorOutcome::ServerKickOut { was_healthy }) => {
+                    if was_healthy {
+                        controller.reset();
+                    }
                     let decision = controller.record(ReconnectEvent::ServerKickOut);
                     if !self.handle_decision(decision, &cancel).await {
                         return;
                     }
                 }
-                Ok(SupervisorOutcome::Trigger(event)) => {
+                Ok(SupervisorOutcome::Trigger { event, was_healthy }) => {
+                    if was_healthy {
+                        controller.reset();
+                    }
                     let decision = controller.record(event);
                     if !self.handle_decision(decision, &cancel).await {
                         return;
@@ -484,7 +535,9 @@ impl Daemon {
         local_params: &LocalTunnelParams, request: &VpnRequest,
     ) -> Result<TunnelSession> {
         let (outbound_iface, tun_interface) = {
-            let inner = self.inner.lock().await;
+            let mut inner = self.inner.lock().await;
+            let outbound = inner.config.outbound_interface.clone();
+            inner.active_outbound = outbound;
             (
                 inner.config.outbound_interface.clone(),
                 inner.config.tun_interface.clone(),
@@ -633,11 +686,23 @@ impl Daemon {
     }
 
     async fn mark_disconnected(&self) {
-        self.vpn_transition(VpnMachine::set_disconnected).await;
+        let mut inner = self.inner.lock().await;
+        inner.active_outbound = None;
+        if let Some(vpn) = &mut inner.vpn {
+            vpn.set_disconnected();
+            let tunnel = vpn.to_tunnel_proto();
+            let _ = inner.vpn_watch_tx.send(tunnel);
+        }
     }
 
     async fn mark_failed(&self, error: String) {
-        self.vpn_transition(move |vpn| vpn.set_failed(error)).await;
+        let mut inner = self.inner.lock().await;
+        inner.active_outbound = None;
+        if let Some(vpn) = &mut inner.vpn {
+            vpn.set_failed(error);
+            let tunnel = vpn.to_tunnel_proto();
+            let _ = inner.vpn_watch_tx.send(tunnel);
+        }
     }
 
     /// Mutate the VPN machine via a transition method, then broadcast.

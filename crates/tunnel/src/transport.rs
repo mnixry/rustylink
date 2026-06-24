@@ -1,9 +1,10 @@
-use std::{io, net::SocketAddr, sync::Arc, time::Duration};
+use std::{io, net::SocketAddr, sync::Arc};
 
 use gotatun::{
     packet::{Packet, PacketBufPool},
     udp::{UdpRecv, UdpSend, UdpTransportFactory, UdpTransportFactoryParams},
 };
+use rustylink_outbound::Dialer;
 use snafu::prelude::*;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -11,9 +12,6 @@ use tokio::{
     sync::{Mutex, mpsc},
 };
 
-use crate::OutboundInterface;
-
-const TCP_DIAL_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_FEILIAN_TCP_FRAME: u32 = 65_535;
 
 /// Errors on the `WireGuard` data path (UDP datagrams and the `FeiLian` TCP
@@ -29,7 +27,7 @@ pub(crate) enum TunnelTransportError {
     Dial {
         transport: &'static str,
         destination: SocketAddr,
-        source: io::Error,
+        source: rustylink_outbound::DialerError,
     },
     #[snafu(display("failed to send {len}-byte datagram to {destination}: {source}"))]
     Send {
@@ -55,9 +53,8 @@ pub(crate) enum TunnelTransportError {
 impl TunnelTransportError {
     fn io_kind(&self) -> io::ErrorKind {
         match self {
-            Self::Dial { source, .. } | Self::Send { source, .. } | Self::Recv { source, .. } => {
-                source.kind()
-            }
+            Self::Dial { .. } => io::ErrorKind::Other,
+            Self::Send { source, .. } | Self::Recv { source, .. } => source.kind(),
             Self::RecvClosed { .. } => io::ErrorKind::ConnectionAborted,
             Self::InvalidFrame { .. } => io::ErrorKind::InvalidData,
         }
@@ -76,9 +73,9 @@ impl From<TunnelTransportError> for io::Error {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct FeilianTcpTransportFactory {
-    outbound_interface: Option<OutboundInterface>,
+    dialer: Dialer,
 }
 
 #[derive(Clone)]
@@ -86,7 +83,7 @@ pub struct FeilianTcpSend {
     local_addr: SocketAddr,
     incoming: mpsc::Sender<(Vec<u8>, SocketAddr)>,
     state: Arc<Mutex<Option<TcpWriterState>>>,
-    outbound_interface: Option<OutboundInterface>,
+    dialer: Dialer,
 }
 
 pub struct FeilianTcpRecv {
@@ -100,8 +97,8 @@ struct TcpWriterState {
 
 impl FeilianTcpTransportFactory {
     #[must_use]
-    pub const fn new(outbound_interface: Option<OutboundInterface>) -> Self {
-        Self { outbound_interface }
+    pub fn new(dialer: Dialer) -> Self {
+        Self { dialer }
     }
 }
 
@@ -116,11 +113,11 @@ impl UdpTransportFactory for FeilianTcpTransportFactory {
     ) -> io::Result<((Self::SendV4, Self::RecvV4), (Self::SendV6, Self::RecvV6))> {
         let v4 = tcp_pair(
             SocketAddr::from((params.addr_v4, params.port)),
-            self.outbound_interface.clone(),
+            self.dialer.clone(),
         );
         let v6 = tcp_pair(
             SocketAddr::from((params.addr_v6, params.port)),
-            self.outbound_interface.clone(),
+            self.dialer.clone(),
         );
         Ok((v4, v6))
     }
@@ -148,21 +145,19 @@ impl UdpSend for FeilianTcpSend {
             tracing::info!(
                 %destination,
                 outbound_interface = self
-                    .outbound_interface
-                    .as_ref()
-                    .map_or("<default>", |interface| interface.name.as_str()),
+                    .dialer
+                    .interface()
+                    .map_or("<default>", |i| i.name.as_str()),
                 "dialing FeiLian TCP WireGuard transport"
             );
-            let stream = crate::outbound::connect_tcp(
-                destination,
-                self.outbound_interface.as_ref(),
-                TCP_DIAL_TIMEOUT,
-            )
-            .await
-            .context(DialSnafu {
-                transport: "FeiLian TCP",
-                destination,
-            })?;
+            let stream = self
+                .dialer
+                .connect_tcp(destination)
+                .await
+                .context(DialSnafu {
+                    transport: "FeiLian TCP",
+                    destination,
+                })?;
             let (reader, writer) = stream.into_split();
             tokio::spawn(read_feilian_tcp_frames(
                 reader,
@@ -216,16 +211,14 @@ impl UdpRecv for FeilianTcpRecv {
     }
 }
 
-fn tcp_pair(
-    local_addr: SocketAddr, outbound_interface: Option<OutboundInterface>,
-) -> (FeilianTcpSend, FeilianTcpRecv) {
+fn tcp_pair(local_addr: SocketAddr, dialer: Dialer) -> (FeilianTcpSend, FeilianTcpRecv) {
     let (tx, rx) = mpsc::channel(256);
     (
         FeilianTcpSend {
             local_addr,
             incoming: tx,
             state: Arc::new(Mutex::new(None)),
-            outbound_interface,
+            dialer,
         },
         FeilianTcpRecv { incoming: rx },
     )
