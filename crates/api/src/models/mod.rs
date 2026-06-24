@@ -4,7 +4,7 @@ macro_rules! impl_json_request {
         impl $crate::models::SendableRequest for $ty {
             type Response = $response;
 
-            const METHOD: reqwest::Method = reqwest::Method::$method;
+            const METHOD: http::Method = http::Method::$method;
 
             fn path(&self) -> std::borrow::Cow<'static, str> {
                 std::borrow::Cow::Borrowed($path)
@@ -23,7 +23,7 @@ macro_rules! impl_empty_request {
         impl $crate::models::SendableRequest for $ty {
             type Response = $response;
 
-            const METHOD: reqwest::Method = reqwest::Method::$method;
+            const METHOD: http::Method = http::Method::$method;
 
             fn path(&self) -> std::borrow::Cow<'static, str> {
                 std::borrow::Cow::Borrowed($path)

@@ -6,6 +6,7 @@
 //! resolution immune to TUN routing state regardless of when it runs.
 
 use std::{
+    collections::HashMap,
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     time::Duration,
@@ -82,17 +83,28 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// An interface-bound DNS resolver that sends raw UDP queries through the
 /// [`Dialer`]'s outbound interface.
+///
+/// An optional static override map can pin specific hostnames to fixed
+/// addresses (bypassing DNS entirely for those names).  This is used by the
+/// API client's per-dot TLS pinning, where the request URL carries the tenant
+/// `vpn_domain` (for correct SNI / cert validation) but the socket must
+/// connect to the dot's raw IP.
 #[derive(Clone, Debug)]
 pub struct Resolver {
     dialer: Dialer,
     servers: Vec<SocketAddr>,
+    overrides: HashMap<String, Vec<SocketAddr>>,
 }
 
 impl Resolver {
     /// Create a resolver with explicit DNS server addresses.
     #[must_use]
     pub fn new(dialer: Dialer, servers: Vec<SocketAddr>) -> Self {
-        Self { dialer, servers }
+        Self {
+            dialer,
+            servers,
+            overrides: HashMap::new(),
+        }
     }
 
     /// Create a resolver using the system's configured DNS servers.
@@ -101,7 +113,29 @@ impl Resolver {
         if servers.is_empty() {
             return Err(Error::NoServers);
         }
-        Ok(Self { dialer, servers })
+        Ok(Self {
+            dialer,
+            servers,
+            overrides: HashMap::new(),
+        })
+    }
+
+    /// Return a clone of this resolver with a static host→addr override.
+    ///
+    /// When `resolve_host` is called with `hostname`, the pinned address is
+    /// returned immediately — no DNS query is sent.  All other hostnames
+    /// resolve normally.
+    ///
+    /// This mirrors reqwest's `.resolve(host, addr)` and is used for per-dot
+    /// TLS pinning: the request URL carries `vpn_domain` (for SNI / cert
+    /// validation) while the socket connects to the dot's raw IP.
+    #[must_use]
+    pub fn with_override(mut self, hostname: impl Into<String>, pinned_addr: SocketAddr) -> Self {
+        self.overrides
+            .entry(hostname.into())
+            .or_default()
+            .push(pinned_addr);
+        self
     }
 
     /// The DNS server addresses this resolver queries.
@@ -112,7 +146,15 @@ impl Resolver {
 
     /// Resolve a hostname to socket addresses (A + AAAA), querying each
     /// configured server in turn until one succeeds.
+    ///
+    /// Static overrides (from [`with_override`](Self::with_override)) are
+    /// checked first and returned without hitting DNS.
     pub async fn resolve_host(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>> {
+        // Check static overrides first.
+        if let Some(addrs) = self.overrides.get(host) {
+            return Ok(addrs.clone());
+        }
+
         // If the host is already an IP literal, return it directly.
         if let Ok(ip) = host.parse::<IpAddr>() {
             return Ok(vec![SocketAddr::new(ip, port)]);
@@ -320,5 +362,18 @@ mod tests {
             matches!(err, super::Error::NoRecords { .. }),
             "unexpected error: {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn static_override_bypasses_dns() {
+        let dialer = Dialer::default();
+        let pinned = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 42)), 8443);
+        let resolver =
+            super::Resolver::new(dialer, vec![]).with_override("vpn.example.com", pinned);
+        let addrs = resolver
+            .resolve_host("vpn.example.com", 8443)
+            .await
+            .unwrap();
+        assert_eq!(addrs, vec![pinned]);
     }
 }

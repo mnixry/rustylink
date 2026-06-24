@@ -7,11 +7,15 @@
 //! data) instead of mutating shared storage.  Errors are returned synchronously
 //! so the caller surfaces them in real time — no out-of-band error field.
 
-use rustylink_api::{ApiClient, LoginV2Result};
+use rustylink_api::{
+    ApiClient, GetThirdPartyLoginLinksRequest, LoginV2Result, OAuthCallbackRequest,
+    SendCodeRequest, SendableRequest, V1LoginSkipRequest, V1MfaSendRequest, V1SendCodeRequest,
+    V1VerifyCodeRequest, VerifyCodeRequest,
+};
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 
-use crate::auth::{LoginStep, next_login_step};
+use crate::auth::{ApiSnafu as AuthApiSnafu, LoginStep, next_login_step};
 
 /// Which login API variant the tenant uses.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,9 +139,25 @@ pub async fn send_login_code(
     login_type: String, account: String,
 ) -> Result<()> {
     if version == LoginApiVersion::V1 {
-        crate::auth::v1_send_code(client, login_scene, account_type, login_type, account).await
+        V1SendCodeRequest {
+            login_scene,
+            account_type,
+            login_type,
+            account,
+        }
+        .send(client)
+        .await
+        .context(AuthApiSnafu)
     } else {
-        crate::auth::send_code(client, login_scene, account_type, login_type, account).await
+        SendCodeRequest {
+            login_scene,
+            account_type,
+            login_type,
+            account,
+        }
+        .send(client)
+        .await
+        .context(AuthApiSnafu)
     }
     .context(AuthSnafu)?;
     Ok(())
@@ -149,10 +169,27 @@ pub async fn verify_login_code(
     login_type: String, account: String, code: String,
 ) -> Result<AuthState> {
     let response = if version == LoginApiVersion::V1 {
-        crate::auth::v1_verify_code(client, login_scene, account_type, login_type, account, code)
-            .await
+        V1VerifyCodeRequest {
+            login_scene,
+            account_type,
+            login_type,
+            account,
+            code,
+        }
+        .send(client)
+        .await
+        .context(AuthApiSnafu)
     } else {
-        crate::auth::verify_code(client, login_scene, account_type, login_type, account, code).await
+        VerifyCodeRequest {
+            login_scene,
+            account_type,
+            login_type,
+            account,
+            code,
+        }
+        .send(client)
+        .await
+        .context(AuthApiSnafu)
     }
     .context(AuthSnafu)?;
     Ok(next_auth_state(response.data.as_ref()))
@@ -167,9 +204,15 @@ pub async fn send_mfa_code(
     if version != LoginApiVersion::V1 {
         return Ok(());
     }
-    crate::auth::v1_mfa_send(client, login_scene, mfa_type, account)
-        .await
-        .context(AuthSnafu)?;
+    V1MfaSendRequest {
+        login_scene,
+        mfa_type,
+        account,
+    }
+    .send(client)
+    .await
+    .context(AuthApiSnafu)
+    .context(AuthSnafu)?;
     Ok(())
 }
 
@@ -189,9 +232,14 @@ pub async fn verify_mfa(
 
 /// Skip a skippable MFA challenge (v1 flow). Returns the next state.
 pub async fn skip_challenge(client: &ApiClient, login_scene: String) -> Result<AuthState> {
-    let response = crate::auth::v1_login_skip(client, login_scene, String::new())
-        .await
-        .context(AuthSnafu)?;
+    let response = V1LoginSkipRequest {
+        login_scene,
+        account: String::new(),
+    }
+    .send(client)
+    .await
+    .context(AuthApiSnafu)
+    .context(AuthSnafu)?;
     Ok(next_auth_state(response.data.as_ref()))
 }
 
@@ -232,14 +280,15 @@ pub async fn start_oauth(client: &ApiClient, alias_key: &str) -> Result<OAuthPen
 pub async fn complete_oauth(
     client: &ApiClient, pending: &OAuthPending, code: String, state: String,
 ) -> Result<()> {
-    crate::auth::oauth_callback(
-        client,
-        pending.alias_key.clone(),
+    OAuthCallbackRequest {
+        alias_key: pending.alias_key.clone(),
         code,
         state,
-        pending.pkce_verifier.clone(),
-    )
+        code_verifier: pending.pkce_verifier.clone(),
+    }
+    .send(client)
     .await
+    .context(AuthApiSnafu)
     .context(AuthSnafu)?;
     Ok(())
 }
@@ -247,9 +296,13 @@ pub async fn complete_oauth(
 /// Begin a device/QR login: fetch the provider list (without PKCE) so the
 /// server returns a poll token, and build the pending flow.
 pub async fn start_device_login(client: &ApiClient, alias_key: &str) -> Result<DeviceLoginPending> {
-    let response = crate::auth::device_login_links(client)
-        .await
-        .context(AuthSnafu)?;
+    let response = GetThirdPartyLoginLinksRequest {
+        code_challenge: None,
+    }
+    .send(client)
+    .await
+    .context(AuthApiSnafu)
+    .context(AuthSnafu)?;
     let provider = response
         .data
         .unwrap_or_default()

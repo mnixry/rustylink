@@ -17,7 +17,8 @@
 
 use jiff::Timestamp;
 use rustylink_api::{
-    ApiClient, ApiHooks, ClientIdentity, CookieJar, CookieStore, MatchEndpoint, ProtocolMode,
+    ActivateRequest, ApiClient, ApiHooks, ClientIdentity, CookieJar, CookieStore,
+    GetLoginSettingRequest, LogoutRequest, MatchEndpoint, ProtocolMode, SendableRequest,
     SigningConfig, SigningContext, TenantEndpoint,
 };
 pub use rustylink_core::state::{
@@ -44,7 +45,7 @@ pub struct AuthMachine {
     /// Current pure auth state.
     pub(crate) state: AuthState,
     /// Shared HTTP connection pool (clone-cheap, `Arc`-backed).
-    pub(crate) http_pool: reqwest::Client,
+    pub(crate) http_pool: rustylink_api::HttpClient,
     /// Device identity used for API request decoration.
     pub(crate) identity: ClientIdentity,
     /// Tenant connection parameters (set after activation).
@@ -77,7 +78,16 @@ impl AuthMachine {
         match_base_url: Option<&str>,
     ) -> Result<()> {
         let match_client = self.build_match_client(match_base_url);
-        let response = rustylink_core::auth::activate(&match_client, code).await?;
+        let response = ActivateRequest {
+            code: code.to_owned(),
+        }
+        .send(&match_client)
+        .await
+        .map_err(|e| {
+            DaemonError::from(rustylink_core::auth::Error::Api {
+                source: Box::new(e),
+            })
+        })?;
         if let Some(data) = &response.data {
             let update = rustylink_core::auth::extract_activation_update(data);
             self.tenant = Some(TenantConfig {
@@ -106,7 +116,7 @@ impl AuthMachine {
         let Some(client) = self.build_tenant_client() else {
             return;
         };
-        if let Ok(setting) = rustylink_core::vpn::login_setting(&client).await
+        if let Ok(setting) = GetLoginSettingRequest.send(&client).await
             && let Some(data) = setting.data.as_ref()
             && data.is_v1()
         {
@@ -248,7 +258,7 @@ impl AuthMachine {
     /// fall back to `Configured`.
     pub async fn logout(&mut self, logout_all: bool) {
         if let Some(client) = self.build_tenant_client()
-            && let Err(error) = rustylink_core::auth::logout(&client, logout_all).await
+            && let Err(error) = (LogoutRequest { logout_all }).send(&client).await
         {
             tracing::debug!(
                 %error,
@@ -455,7 +465,7 @@ impl AuthMachine {
     /// right state.
     #[must_use]
     pub fn restore_from_credentials(
-        creds: PersistedCredentials, http_pool: reqwest::Client, identity: ClientIdentity,
+        creds: PersistedCredentials, http_pool: rustylink_api::HttpClient, identity: ClientIdentity,
     ) -> Self {
         Self {
             state: AuthState::Unconfigured,

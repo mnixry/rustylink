@@ -6,7 +6,7 @@ use cbc::{
     cipher::{BlockModeEncrypt, KeyIvInit, block_padding::Pkcs7},
 };
 use hmac::{Hmac, KeyInit, Mac};
-use reqwest::header::HeaderMap;
+use http::header::HeaderMap;
 use rustylink_proto::{buffa::Message, proto::rustylink::signing::v1::HttpSignHeader};
 use sha1::Sha1;
 use sha2::{Digest as _, Sha256};
@@ -343,7 +343,7 @@ fn encode_http_sign_header(
 #[cfg(test)]
 mod tests {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
-    use reqwest::header::{HeaderMap, HeaderValue};
+    use http::header::{HeaderMap, HeaderValue};
     use rustylink_proto::buffa::Message;
     use sha2::{Digest as _, Sha256};
     use url::Url;

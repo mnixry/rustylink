@@ -16,8 +16,8 @@ use std::{
 };
 
 use rustylink_api::{
-    ApiClient, ApiHooks, ClientIdentity, DotEndpoint, ProtocolMode, UserInfo, VpnConnResponse,
-    VpnDot, VpnReportRequest, VpnReportType,
+    ApiClient, ApiHooks, ClientIdentity, DotEndpoint, GetVpnSettingRequest, ProtocolMode,
+    SendableRequest as _, UserInfo, VpnConnResponse, VpnDot, VpnReportRequest, VpnReportType,
 };
 use rustylink_core::vpn::{VpnConfigRequest, VpnConfigResult, VpnConnectMode};
 use rustylink_proto::proto::rustylink::daemon::v1 as pb;
@@ -81,19 +81,24 @@ struct ReportParams {
 impl Daemon {
     /// Build the daemon core from config, paths, and optional restored
     /// credentials.
-    pub fn new(
+    pub async fn new(
         config: DaemonConfig, config_path: PathBuf, credential_path: PathBuf,
         credentials: Option<PersistedCredentials>,
     ) -> Self {
         let identity = config.to_client_identity();
-        let http_pool =
-            rustylink_api::build_http_client(&rustylink_api::ApiClientOptions {
-                outbound_interface: config.outbound_interface.clone(),
-            })
-            .unwrap_or_else(|e| {
+        let http_pool = match rustylink_api::build_http_client(&rustylink_api::ApiClientOptions {
+            outbound_interface: config.outbound_interface.clone(),
+        })
+        .await
+        {
+            Ok(client) => client,
+            Err(e) => {
                 tracing::warn!(%e, "failed to build HTTP client with interface binding; falling back to default");
-                reqwest::Client::new()
-            });
+                rustylink_api::build_http_client(&rustylink_api::ApiClientOptions::default())
+                    .await
+                    .expect("failed to build default HTTP client")
+            }
+        };
         let (vpn_watch_tx, vpn_watch_rx) = watch::channel(pb::Tunnel::default());
 
         let auth_machine = if let Some(creds) = credentials {
@@ -438,7 +443,8 @@ impl Daemon {
         // `vpn_domain`; fetch it so the dot config client validates the cert
         // against the right name (matching the Android client) rather than the
         // IP we dial.
-        let vpn_domain = rustylink_core::vpn::vpn_setting(&client)
+        let vpn_domain = GetVpnSettingRequest
+            .send(&client)
             .await
             .ok()
             .and_then(|resp| resp.data)
@@ -459,11 +465,16 @@ impl Daemon {
             preferred_dot_id: request.preferred_dot_id,
         };
 
-        let (pool, hooks) = {
+        let (pool, hooks, outbound_interface) = {
             let inner = self.inner.lock().await;
-            (inner.auth.http_pool.clone(), inner.auth.build_hooks())
+            (
+                inner.auth.http_pool.clone(),
+                inner.auth.build_hooks(),
+                inner.config.outbound_interface.clone(),
+            )
         };
-        let (build_dot_client, probe_client) = dot_client_builders(pool, hooks, vpn_domain.clone());
+        let (build_dot_client, probe_client) =
+            dot_client_builders(pool, hooks, vpn_domain.clone(), outbound_interface);
         let config_result = rustylink_core::vpn::vpn_config_from_dot_list(
             &client,
             &config_request,
@@ -495,13 +506,16 @@ impl Daemon {
             let inner = self.inner.lock().await;
             let hooks = inner.auth.build_hooks();
             let pool = inner.auth.http_pool.clone();
+            let outbound_interface = inner.config.outbound_interface.clone();
             drop(inner);
             build_dot_api_client(
                 &config_result.endpoint,
                 &pool,
                 &hooks,
                 vpn_domain.as_deref(),
+                outbound_interface.as_deref(),
             )
+            .await
         };
 
         let report = ReportParams {
@@ -633,7 +647,7 @@ impl Daemon {
             public_key: report.pub_key.clone(),
             mode: report.mode.android_name(),
         };
-        match rustylink_core::vpn::report_vpn(dot_client, &request).await {
+        match request.clone().send(dot_client).await {
             Ok(response) => response.is_force_logout(),
             Err(error) => {
                 tracing::warn!(%error, ?report_type, "vpn report failed (non-fatal)");
@@ -800,7 +814,8 @@ impl DaemonConfig {
 ///   to time `GET /vpn/ping` for latency ranking. Auto dot selection feeds it
 ///   into [`crate::latency::rank_dots_by_latency`].
 fn dot_client_builders(
-    pool: reqwest::Client, hooks: ApiHooks, vpn_domain: Option<String>,
+    pool: rustylink_api::HttpClient, hooks: ApiHooks, vpn_domain: Option<String>,
+    outbound_interface: Option<String>,
 ) -> (
     impl Fn(&DotEndpoint) -> ApiClient + Clone,
     impl Fn(&VpnDot) -> Option<ApiClient> + Clone,
@@ -809,22 +824,40 @@ fn dot_client_builders(
         let pool = pool.clone();
         let hooks = hooks.clone();
         let vpn_domain = vpn_domain.clone();
+        let outbound_interface = outbound_interface.clone();
         move |dot: &VpnDot| {
             DotEndpoint::from_dot(dot, false).ok().map(|endpoint| {
-                build_dot_api_client(&endpoint, &pool, &hooks, vpn_domain.as_deref())
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(build_dot_api_client(
+                        &endpoint,
+                        &pool,
+                        &hooks,
+                        vpn_domain.as_deref(),
+                        outbound_interface.as_deref(),
+                    ))
+                })
             })
         }
     };
     let config = move |endpoint: &DotEndpoint| {
-        build_dot_api_client(endpoint, &pool, &hooks, vpn_domain.as_deref())
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(build_dot_api_client(
+                endpoint,
+                &pool,
+                &hooks,
+                vpn_domain.as_deref(),
+                outbound_interface.as_deref(),
+            ))
+        })
     };
     (config, probe)
 }
 
 /// Falls back to a plain client against the original (IP) endpoint when no
 /// `vpn_domain` is known or the host is not a bare IP.
-pub fn build_dot_api_client(
-    endpoint: &DotEndpoint, pool: &reqwest::Client, hooks: &ApiHooks, vpn_domain: Option<&str>,
+pub async fn build_dot_api_client(
+    endpoint: &DotEndpoint, pool: &rustylink_api::HttpClient, hooks: &ApiHooks,
+    vpn_domain: Option<&str>, outbound_interface: Option<&str>,
 ) -> ApiClient {
     if let Some(domain) = vpn_domain
         && let Some(host) = endpoint.api_base_url.host_str()
@@ -833,9 +866,12 @@ pub fn build_dot_api_client(
     {
         let tls_host = tls_host_for(domain);
         if let Ok(tls_url) = url::Url::parse(&format!("https://{tls_host}:{port}"))
-            && let Ok(client) = reqwest::Client::builder()
-                .resolve(&tls_host, SocketAddr::new(ip, port))
-                .build()
+            && let Ok(client) = rustylink_api::build_dot_http_client(
+                &tls_host,
+                SocketAddr::new(ip, port),
+                outbound_interface,
+            )
+            .await
         {
             let tls_endpoint = DotEndpoint {
                 api_base_url: tls_url,
@@ -997,7 +1033,10 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires network and an authenticated credentials.json"]
     async fn live_dot_connect() {
-        use rustylink_api::{ClientIdentity, SendableRequest as _, VpnConnRequest};
+        use rustylink_api::{
+            ClientIdentity, GetVpnLocationsRequest, GetVpnSettingRequest, SendableRequest as _,
+            VpnConnRequest,
+        };
 
         use crate::{
             daemon::build_dot_api_client, persist::PersistedCredentials, state::AuthMachine,
@@ -1012,7 +1051,9 @@ mod tests {
             .expect("read creds")
             .expect("credentials.json present");
 
-        let pool = reqwest::Client::new();
+        let pool = rustylink_api::build_http_client(&rustylink_api::ApiClientOptions::default())
+            .await
+            .expect("build http client");
         let machine =
             AuthMachine::restore_from_credentials(creds, pool.clone(), ClientIdentity::default());
         let client = machine.build_tenant_client().expect("tenant client");
@@ -1026,14 +1067,16 @@ mod tests {
 
         // Authenticated tenant APIs — confirm the session is valid; the shared
         // jar absorbs any Set-Cookie mutations (e.g. open-time, vpn-token).
-        let setting = rustylink_core::vpn::vpn_setting(&client)
+        let setting = GetVpnSettingRequest
+            .send(&client)
             .await
             .expect("vpn setting");
         snapshot("after /api/setting", hooks.cookies.snapshot().await);
         let vpn_domain = setting.data.and_then(|s| s.vpn_domain);
         eprintln!("vpn_domain = {vpn_domain:?}");
 
-        let locations = rustylink_core::vpn::vpn_locations(&client)
+        let locations = GetVpnLocationsRequest
+            .send(&client)
             .await
             .expect("vpn locations");
         snapshot("after /api/vpn/list", hooks.cookies.snapshot().await);
@@ -1049,7 +1092,8 @@ mod tests {
             let Ok(endpoint) = rustylink_api::DotEndpoint::from_dot(dot, use_vpn_ip) else {
                 continue;
             };
-            let dot_client = build_dot_api_client(&endpoint, &pool, &hooks, vpn_domain.as_deref());
+            let dot_client =
+                build_dot_api_client(&endpoint, &pool, &hooks, vpn_domain.as_deref(), None).await;
             let body = VpnConnRequest {
                 mode: Some("Full".to_owned()),
                 public_key: rustylink_tunnel::LocalTunnelParams::generate().local_public_key,

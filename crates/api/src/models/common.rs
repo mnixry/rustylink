@@ -1,6 +1,6 @@
 use std::{borrow::Cow, collections::HashMap};
 
-use reqwest::Method;
+use http::Method;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_with::skip_serializing_none;
 

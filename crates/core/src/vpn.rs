@@ -1,8 +1,6 @@
 use rustylink_api::{
-    ApiClient, BaseResponse, DotEndpoint, FetchOtpRequest, GetLoginSettingRequest,
-    GetTenantConfigRequest, GetUserInfoRequest, GetVpnLocationsRequest, GetVpnSettingRequest,
-    LoginSetting, OtpProvision, SendableRequest, TenantConfig, UserInfo, VpnConnRequest,
-    VpnConnResponse, VpnDot, VpnPingRequest, VpnReportRequest, VpnSetting,
+    ApiClient, BaseResponse, DotEndpoint, FetchOtpRequest, GetVpnLocationsRequest, OtpProvision,
+    SendableRequest, TenantConfig, VpnConnRequest, VpnConnResponse, VpnDot, VpnPingRequest,
 };
 use snafu::prelude::*;
 use strum::{Display, EnumIter, EnumString, FromRepr, IntoStaticStr};
@@ -158,42 +156,8 @@ pub struct TotpConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Profile / settings
+// VPN config negotiation
 // ---------------------------------------------------------------------------
-
-pub async fn user_info(client: &ApiClient) -> Result<BaseResponse<UserInfo>> {
-    GetUserInfoRequest.send(client).await.context(ApiSnafu)
-}
-
-pub async fn tenant_config(client: &ApiClient) -> Result<BaseResponse<TenantConfig>> {
-    GetTenantConfigRequest.send(client).await.context(ApiSnafu)
-}
-
-pub async fn login_setting(client: &ApiClient) -> Result<BaseResponse<LoginSetting>> {
-    GetLoginSettingRequest.send(client).await.context(ApiSnafu)
-}
-
-// ---------------------------------------------------------------------------
-// VPN settings / locations
-// ---------------------------------------------------------------------------
-
-pub async fn vpn_setting(client: &ApiClient) -> Result<BaseResponse<VpnSetting>> {
-    GetVpnSettingRequest.send(client).await.context(ApiSnafu)
-}
-
-pub async fn vpn_locations(client: &ApiClient) -> Result<BaseResponse<Vec<VpnDot>>> {
-    GetVpnLocationsRequest.send(client).await.context(ApiSnafu)
-}
-
-// ---------------------------------------------------------------------------
-// VPN connection
-// ---------------------------------------------------------------------------
-
-pub async fn vpn_conn(
-    client: &ApiClient, request: &VpnConnRequest,
-) -> Result<BaseResponse<VpnConnResponse>> {
-    request.clone().send(client).await.context(ApiSnafu)
-}
 
 /// Fetch the dot list, select a suitable dot, and negotiate a VPN config.
 ///
@@ -309,12 +273,6 @@ where
         mode: request.mode.android_name(),
     }
     .fail()
-}
-
-pub async fn report_vpn(
-    client: &ApiClient, request: &VpnReportRequest,
-) -> Result<BaseResponse<serde_json::Value>> {
-    request.clone().send(client).await.context(ApiSnafu)
 }
 
 /// Time a `GET /vpn/ping` against a dot's API server, used to measure latency

@@ -32,7 +32,6 @@ http.workspace                  = true
 jiff.workspace                  = true
 mime_guess                      = { workspace = true, optional = true }
 rand.workspace                  = true
-reqwest.workspace               = true
 rust-embed                      = { workspace = true, optional = true }
 serde.workspace                 = true
 serde_json.workspace            = true

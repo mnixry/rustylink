@@ -313,7 +313,7 @@ pub struct LogoutRequest {
 impl SendableRequest for LogoutRequest {
     type Response = BaseResponse<serde_json::Value>;
 
-    const METHOD: reqwest::Method = reqwest::Method::GET;
+    const METHOD: http::Method = http::Method::GET;
 
     fn path(&self) -> Cow<'static, str> {
         Cow::Borrowed("/api/logout")
@@ -354,7 +354,7 @@ pub struct OAuthQueryCallbackRequest {
 impl SendableRequest for OAuthQueryCallbackRequest {
     type Response = BaseResponse<LoginResult>;
 
-    const METHOD: reqwest::Method = reqwest::Method::GET;
+    const METHOD: http::Method = http::Method::GET;
 
     fn path(&self) -> Cow<'static, str> {
         Cow::Owned(format!(
@@ -396,7 +396,7 @@ pub struct GetThirdPartyLoginLinksRequest {
 impl SendableRequest for GetThirdPartyLoginLinksRequest {
     type Response = BaseResponse<Vec<ThirdPartyLoginInfo>>;
 
-    const METHOD: reqwest::Method = reqwest::Method::GET;
+    const METHOD: http::Method = http::Method::GET;
 
     fn path(&self) -> Cow<'static, str> {
         Cow::Borrowed("/api/tpslogin/link")

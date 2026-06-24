@@ -6,6 +6,7 @@
 //! surfaces errors directly), and projects the result back to a proto response.
 
 use connectrpc::{RequestContext, Response, ServiceRequest, ServiceResult};
+use rustylink_api::{SecurityReportRequest, SendableRequest, ThirdPartyTokenCheckRequest};
 use rustylink_proto::proto::rustylink::daemon::{v1 as pb, v1::AuthService};
 
 use crate::{
@@ -405,8 +406,11 @@ impl AuthService for AuthServiceImpl {
                 .into());
             }
 
-            match rustylink_core::auth::check_third_party_login_token(&client, poll_token.clone())
-                .await
+            match (ThirdPartyTokenCheckRequest {
+                token: poll_token.clone(),
+            })
+            .send(&client)
+            .await
             {
                 Ok(_response) => {
                     // Success: the session cookies were absorbed into the shared
@@ -510,12 +514,37 @@ impl AuthServiceImpl {
                 None => return,
             }
         };
-        let report = rustylink_core::security::all_green_security_report();
-        match rustylink_core::security::report_security(&client, &report).await {
+        let report = all_green_security_report();
+        match report.clone().send(&client).await {
             Ok(_response) => {}
             Err(error) => {
                 tracing::warn!(%error, "security report failed (non-fatal)");
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Security report builder (moved from core::security)
+// ---------------------------------------------------------------------------
+
+/// Build the "all safe" device security report.
+///
+/// Byte-for-byte matches the Android `SecurityConfigViewModel.reportResult`
+/// wire shape.
+fn all_green_security_report() -> SecurityReportRequest {
+    serde_json::from_value(serde_json::json!({
+        "items": [
+            { "key": "root", "level": 0 },
+            { "key": "certificate", "level": 0 },
+            { "key": "wifi", "level": 0 },
+            { "key": "wifi_wep", "level": 0 },
+            { "key": "network", "level": 0, "data": {} },
+            { "key": "password", "level": 0 },
+            { "key": "lock_image", "level": 0 },
+            { "key": "debug_off", "level": 0, "data": { "usbStatus": -1 } },
+            { "key": "debug_on", "level": 0, "data": { "usbStatus": -1 } },
+        ]
+    }))
+    .expect("static all-green security report is valid")
 }

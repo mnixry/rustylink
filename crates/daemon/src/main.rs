@@ -126,7 +126,7 @@ async fn main() -> Result<(), InitError> {
                 path: credential_path.clone(),
             })?;
 
-    let daemon = Daemon::new(config, config_path, credential_path, credentials);
+    let daemon = Daemon::new(config, config_path, credential_path, credentials).await;
 
     // Persist refreshed session cookies as the shared jar absorbs them.
     daemon.install_cookie_persist_listener().await;

@@ -7,6 +7,7 @@
 use std::time::Duration;
 
 use connectrpc::{RequestContext, Response, ServiceRequest, ServiceResult, ServiceStream};
+use rustylink_api::{GetVpnLocationsRequest, GetVpnSettingRequest, SendableRequest};
 use rustylink_proto::proto::rustylink::daemon::{v1 as pb, v1::VpnService};
 use tokio_stream::{StreamExt as _, wrappers::WatchStream};
 
@@ -87,9 +88,11 @@ impl VpnService for VpnServiceImpl {
                 .build_tenant_client()
                 .ok_or_else(|| DaemonError::from(RpcFault::NotAuthenticated))?
         };
-        let resp = rustylink_core::vpn::vpn_locations(&client)
-            .await
-            .map_err(DaemonError::from)?;
+        let resp = GetVpnLocationsRequest.send(&client).await.map_err(|e| {
+            DaemonError::from(rustylink_core::vpn::Error::Api {
+                source: Box::new(e),
+            })
+        })?;
         let locations = resp
             .data
             .unwrap_or_default()
@@ -113,22 +116,29 @@ impl VpnService for VpnServiceImpl {
                 .build_tenant_client()
                 .ok_or_else(|| DaemonError::from(RpcFault::NotAuthenticated))?
         };
-        let resp = rustylink_core::vpn::vpn_locations(&client)
-            .await
-            .map_err(DaemonError::from)?;
+        let resp = GetVpnLocationsRequest.send(&client).await.map_err(|e| {
+            DaemonError::from(rustylink_core::vpn::Error::Api {
+                source: Box::new(e),
+            })
+        })?;
         let dots = resp.data.unwrap_or_default();
 
         // Reach each dot's API host with the tenant TLS name (matching the dot
         // config call) and time `GET /vpn/ping` to measure latency.
-        let vpn_domain = rustylink_core::vpn::vpn_setting(&client)
+        let vpn_domain = GetVpnSettingRequest
+            .send(&client)
             .await
             .ok()
             .and_then(|resp| resp.data)
             .and_then(|setting| setting.vpn_domain)
             .filter(|domain| !domain.trim().is_empty());
-        let (pool, hooks) = {
+        let (pool, hooks, outbound_interface) = {
             let inner = self.daemon.inner.lock().await;
-            (inner.auth.http_pool.clone(), inner.auth.build_hooks())
+            (
+                inner.auth.http_pool.clone(),
+                inner.auth.build_hooks(),
+                inner.config.outbound_interface.clone(),
+            )
         };
 
         // Probe each dot in parallel using a JoinSet.
@@ -136,11 +146,19 @@ impl VpnService for VpnServiceImpl {
         for dot in &dots {
             let dot_id = dot.id.unwrap_or_default();
             let dot_name = dot.name.clone().unwrap_or_default();
-            let client = rustylink_api::DotEndpoint::from_dot(dot, false)
-                .ok()
-                .map(|endpoint| {
-                    build_dot_api_client(&endpoint, &pool, &hooks, vpn_domain.as_deref())
-                });
+            let client = match rustylink_api::DotEndpoint::from_dot(dot, false).ok() {
+                Some(endpoint) => Some(
+                    build_dot_api_client(
+                        &endpoint,
+                        &pool,
+                        &hooks,
+                        vpn_domain.as_deref(),
+                        outbound_interface.as_deref(),
+                    )
+                    .await,
+                ),
+                None => None,
+            };
             join_set.spawn(async move {
                 let rtt = match client {
                     Some(client) => {

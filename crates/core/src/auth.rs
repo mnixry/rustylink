@@ -1,11 +1,8 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use rustylink_api::{
-    ActivateInfo, ActivateRequest, ApiClient, BaseResponse, CommonStringResult,
-    DeviceOAuthCallbackRequest, GetThirdPartyLoginLinksRequest, LoginResult, LoginV2Result,
-    LogoutRequest, OAuthCallbackRequest, OAuthQueryCallbackRequest, PasswordLoginRequest,
-    SendCodeRequest, SendableRequest, ThirdPartyLoginInfo, ThirdPartyTokenCheckRequest,
-    V1LoginRequest, V1LoginSkipRequest, V1MfaSendRequest, V1MfaVerifyRequest, V1SendCodeRequest,
-    V1VerifyCodeRequest, VerifyCodeRequest, VerifyMfaRequest,
+    ActivateInfo, ApiClient, BaseResponse, GetThirdPartyLoginLinksRequest, LoginV2Result,
+    PasswordLoginRequest, SendableRequest, ThirdPartyLoginInfo, V1LoginRequest, V1MfaVerifyRequest,
+    VerifyMfaRequest,
 };
 use sha2::{Digest as _, Sha256};
 use snafu::prelude::*;
@@ -34,15 +31,6 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 // ---------------------------------------------------------------------------
 // Activate
 // ---------------------------------------------------------------------------
-
-pub async fn activate(client: &ApiClient, code: &str) -> Result<BaseResponse<ActivateInfo>> {
-    ActivateRequest {
-        code: code.to_owned(),
-    }
-    .send(client)
-    .await
-    .context(ApiSnafu)
-}
 
 /// Resolved tenant fields extracted from an [`ActivateInfo`] response.
 ///
@@ -88,37 +76,6 @@ pub async fn login_password(
         .send(client)
         .await
         .context(ApiSnafu)
-}
-
-pub async fn send_code(
-    client: &ApiClient, login_scene: String, account_type: String, login_type: String,
-    account: String,
-) -> Result<BaseResponse<CommonStringResult>> {
-    SendCodeRequest {
-        login_scene,
-        account_type,
-        login_type,
-        account,
-    }
-    .send(client)
-    .await
-    .context(ApiSnafu)
-}
-
-pub async fn verify_code(
-    client: &ApiClient, login_scene: String, account_type: String, login_type: String,
-    account: String, code: String,
-) -> Result<BaseResponse<LoginV2Result>> {
-    VerifyCodeRequest {
-        login_scene,
-        account_type,
-        login_type,
-        account,
-        code,
-    }
-    .send(client)
-    .await
-    .context(ApiSnafu)
 }
 
 pub async fn verify_mfa(
@@ -188,67 +145,6 @@ pub async fn third_party_login_links(client: &ApiClient) -> Result<ThirdPartyLog
     })
 }
 
-/// Fetch third-party login links WITHOUT a PKCE challenge. The server then
-/// returns a poll `token` per provider for the device/QR login flow
-/// (`/api/tpslogin/token/check`), as corplink-rs does.
-pub async fn device_login_links(
-    client: &ApiClient,
-) -> Result<BaseResponse<Vec<ThirdPartyLoginInfo>>> {
-    GetThirdPartyLoginLinksRequest {
-        code_challenge: None,
-    }
-    .send(client)
-    .await
-    .context(ApiSnafu)
-}
-
-pub async fn oauth_callback(
-    client: &ApiClient, alias_key: String, code: String, state: String, code_verifier: String,
-) -> Result<BaseResponse<LoginResult>> {
-    OAuthCallbackRequest {
-        alias_key,
-        code,
-        state,
-        code_verifier,
-    }
-    .send(client)
-    .await
-    .context(ApiSnafu)
-}
-
-pub async fn device_oauth_callback(
-    client: &ApiClient, alias_key: String, code: String, state: String,
-    code_verifier: Option<String>,
-) -> Result<BaseResponse<LoginV2Result>> {
-    DeviceOAuthCallbackRequest {
-        alias_key,
-        code,
-        state,
-        code_verifier,
-    }
-    .send(client)
-    .await
-    .context(ApiSnafu)
-}
-
-pub async fn oauth_query_callback(
-    client: &ApiClient, alias: String, code: String, state: String,
-) -> Result<BaseResponse<LoginResult>> {
-    OAuthQueryCallbackRequest { alias, code, state }
-        .send(client)
-        .await
-        .context(ApiSnafu)
-}
-
-pub async fn check_third_party_login_token(
-    client: &ApiClient, token: String,
-) -> Result<BaseResponse<LoginResult>> {
-    ThirdPartyTokenCheckRequest { token }
-        .send(client)
-        .await
-        .context(ApiSnafu)
-}
-
 // ---------------------------------------------------------------------------
 // V1 login flow
 // ---------------------------------------------------------------------------
@@ -264,81 +160,12 @@ pub async fn v1_login_password(
         .context(ApiSnafu)
 }
 
-pub async fn v1_send_code(
-    client: &ApiClient, login_scene: String, account_type: String, login_type: String,
-    account: String,
-) -> Result<BaseResponse<CommonStringResult>> {
-    V1SendCodeRequest {
-        login_scene,
-        account_type,
-        login_type,
-        account,
-    }
-    .send(client)
-    .await
-    .context(ApiSnafu)
-}
-
-pub async fn v1_verify_code(
-    client: &ApiClient, login_scene: String, account_type: String, login_type: String,
-    account: String, code: String,
-) -> Result<BaseResponse<LoginV2Result>> {
-    V1VerifyCodeRequest {
-        login_scene,
-        account_type,
-        login_type,
-        account,
-        code,
-    }
-    .send(client)
-    .await
-    .context(ApiSnafu)
-}
-
-pub async fn v1_mfa_send(
-    client: &ApiClient, login_scene: String, mfa_type: String, account: String,
-) -> Result<BaseResponse<CommonStringResult>> {
-    V1MfaSendRequest {
-        login_scene,
-        mfa_type,
-        account,
-    }
-    .send(client)
-    .await
-    .context(ApiSnafu)
-}
-
 pub async fn v1_mfa_verify(
     client: &ApiClient, login_scene: String, mfa_type: String, account: String,
     code: Option<String>, password: Option<String>,
 ) -> Result<BaseResponse<LoginV2Result>> {
     V1MfaVerifyRequest::encrypted(login_scene, mfa_type, account, code, password)
         .context(ApiSnafu)?
-        .send(client)
-        .await
-        .context(ApiSnafu)
-}
-
-pub async fn v1_login_skip(
-    client: &ApiClient, login_scene: String, account: String,
-) -> Result<BaseResponse<LoginV2Result>> {
-    V1LoginSkipRequest {
-        login_scene,
-        account,
-    }
-    .send(client)
-    .await
-    .context(ApiSnafu)
-}
-
-// ---------------------------------------------------------------------------
-// Logout
-// ---------------------------------------------------------------------------
-
-pub async fn logout(
-    client: &ApiClient, logout_all: bool,
-) -> Result<BaseResponse<serde_json::Value>> {
-    LogoutRequest { logout_all }
         .send(client)
         .await
         .context(ApiSnafu)

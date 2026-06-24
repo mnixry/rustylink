@@ -6,6 +6,7 @@
 //! reading the current config or auth state for API calls.
 
 use connectrpc::{RequestContext, Response, ServiceRequest, ServiceResult};
+use rustylink_api::{GetUserInfoRequest, SendableRequest};
 use rustylink_proto::proto::rustylink::daemon::{v1 as pb, v1::MetaService};
 
 use crate::{
@@ -49,9 +50,11 @@ impl MetaService for MetaServiceImpl {
                 .build_tenant_client()
                 .ok_or_else(|| DaemonError::from(RpcFault::NotAuthenticated))?
         };
-        let resp = rustylink_core::vpn::user_info(&client)
-            .await
-            .map_err(DaemonError::from)?;
+        let resp = GetUserInfoRequest.send(&client).await.map_err(|e| {
+            DaemonError::from(rustylink_core::vpn::Error::Api {
+                source: Box::new(e),
+            })
+        })?;
         Response::ok(pb::GetUserInfoResponse {
             user_info: project_user_info(resp.data).into(),
             ..Default::default()

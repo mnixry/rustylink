@@ -3,15 +3,15 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use jiff::Timestamp;
-use reqwest::{
-    Request,
-    header::{
-        ACCEPT, ACCEPT_LANGUAGE, CONTENT_TYPE, COOKIE, HeaderMap, HeaderName, HeaderValue,
-        SET_COOKIE, USER_AGENT,
-    },
+use bytes::Bytes;
+use http::header::{
+    ACCEPT, ACCEPT_LANGUAGE, CONTENT_TYPE, COOKIE, HeaderMap, HeaderName, HeaderValue, SET_COOKIE,
+    USER_AGENT,
 };
-use reqwest_middleware::{ClientBuilder, ClientWithMiddleware, Middleware, Next};
+use http_body_util::{BodyExt, Full};
+use hyper_rustls::HttpsConnectorBuilder;
+use jiff::Timestamp;
+use rustylink_outbound::{Dialer, HyperConnector, OutboundInterface, Resolver};
 use snafu::prelude::*;
 use tracing::Instrument as _;
 use url::Url;
@@ -24,6 +24,20 @@ use crate::{
 
 pub const DEFAULT_MATCH_BASE_URL: &str = "https://corplink.volcengine.cn";
 
+// ---------------------------------------------------------------------------
+// Type aliases for the hyper-based HTTP client stack
+// ---------------------------------------------------------------------------
+
+/// TLS connector wrapping the outbound [`HyperConnector`] with rustls.
+pub type HttpsConn = hyper_rustls::HttpsConnector<HyperConnector>;
+
+/// The shared, pooled HTTP client.  Clone-cheap (`Arc`-backed).
+pub type HttpClient = hyper_util::client::legacy::Client<HttpsConn, Full<Bytes>>;
+
+// ---------------------------------------------------------------------------
+// Error
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub(crate)))]
 pub enum Error {
@@ -34,19 +48,20 @@ pub enum Error {
     },
 
     #[snafu(display("failed to build HTTP client: {source}"))]
-    BuildHttpClient { source: reqwest::Error },
+    BuildHttpClient {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 
     #[snafu(display("failed to encode API request body: {source}"))]
     Encode { source: serde_json::Error },
 
     #[snafu(display("failed to build API request: {source}"))]
-    BuildRequest { source: reqwest::Error },
+    BuildRequest { source: http::Error },
 
     #[snafu(display("API request failed: {source}"))]
-    Request { source: reqwest::Error },
-
-    #[snafu(display("request middleware failed: {message}"))]
-    MiddlewareFailed { message: String },
+    Request {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 
     #[snafu(display("failed to decode response (content: {content}): {source}"))]
     Decode {
@@ -56,20 +71,20 @@ pub enum Error {
 
     #[snafu(display("HTTP API status {status}: {content}"))]
     HttpStatus {
-        status: reqwest::StatusCode,
+        status: http::StatusCode,
         content: String,
     },
 
     #[snafu(display("failed to build header `{name}`: {source}"))]
     HeaderValue {
         name: String,
-        source: reqwest::header::InvalidHeaderValue,
+        source: http::header::InvalidHeaderValue,
     },
 
     #[snafu(display("failed to build header name `{name}`: {source}"))]
     HeaderName {
         name: String,
-        source: reqwest::header::InvalidHeaderName,
+        source: http::header::InvalidHeaderName,
     },
 
     #[snafu(display("failed to sign request: {source}"))]
@@ -97,6 +112,10 @@ pub enum Error {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+// ---------------------------------------------------------------------------
+// Cookie jar
+// ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
 pub struct SessionCookies {
@@ -239,6 +258,10 @@ fn parse_set_cookies(headers: &HeaderMap) -> Vec<(String, String)> {
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// ApiHooks — request decoration (headers, cookies, signing)
+// ---------------------------------------------------------------------------
+
 /// Request-decoration hooks (snapshot). All fields are plain owned values.
 /// A new `ApiHooks` is built from the current `PersistedState` each time the
 /// actor refreshes the `AppContext`.
@@ -316,90 +339,15 @@ impl ApiHooks {
     }
 }
 
-/// reqwest middleware that signs each outgoing request.
-///
-/// It decorates the request with identity query params, base headers (UA,
-/// Accept-Language, Cookie, csrf-token, knock-token, jwt-token), and an HMAC
-/// signature.  It holds an [`ApiHooks`] snapshot captured when the owning
-/// [`ApiClient`] was built.
-#[derive(Clone, Debug)]
-pub struct SigningMiddleware {
-    hooks: ApiHooks,
-}
-
-impl SigningMiddleware {
-    #[must_use]
-    pub fn new(hooks: ApiHooks) -> Self {
-        Self { hooks }
-    }
-
-    async fn decorate(&self, request: &mut Request) -> Result<()> {
-        {
-            let mut query = request.url_mut().query_pairs_mut();
-            for (key, value) in self.hooks.identity.query_pairs(Timestamp::now()) {
-                query.append_pair(key, &value);
-            }
-        }
-        request
-            .headers_mut()
-            .extend(self.hooks.base_headers().await?);
-        let body = request
-            .body()
-            .and_then(reqwest::Body::as_bytes)
-            .map_or_else(Vec::new, ToOwned::to_owned);
-        let signed_headers = self
-            .hooks
-            .signer
-            .sign(
-                request.method().as_str(),
-                request.url(),
-                request.headers(),
-                &body,
-            )
-            .context(SignRequestSnafu)?;
-        let signed_header_count = signed_headers.len();
-        for signed in signed_headers {
-            let name = HeaderName::from_bytes(signed.name.as_bytes()).context(HeaderNameSnafu {
-                name: signed.name.clone(),
-            })?;
-            let value = HeaderValue::from_str(&signed.value)
-                .context(HeaderValueSnafu { name: signed.name })?;
-            request.headers_mut().insert(name, value);
-        }
-        tracing::debug!(
-            method = %request.method(),
-            host = request.url().host_str().unwrap_or("<none>"),
-            path = request.url().path(),
-            signed_header_count,
-            "prepared API request"
-        );
-        Ok(())
-    }
-}
-
-#[async_trait::async_trait]
-impl Middleware for SigningMiddleware {
-    async fn handle(
-        &self, mut request: Request, extensions: &mut http::Extensions, next: Next<'_>,
-    ) -> reqwest_middleware::Result<reqwest::Response> {
-        self.decorate(&mut request)
-            .await
-            .map_err(reqwest_middleware::Error::middleware)?;
-        let response = next.run(request, extensions).await?;
-        // Absorb any Set-Cookie mutations into the shared jar so later requests
-        // (including ones to other hosts, e.g. the dot config call) carry them.
-        self.hooks
-            .cookies
-            .merge(parse_set_cookies(response.headers()))
-            .await;
-        Ok(response)
-    }
-}
+// ---------------------------------------------------------------------------
+// ApiClient
+// ---------------------------------------------------------------------------
 
 #[derive(Clone)]
 pub struct ApiClient {
     base_url: Url,
-    http: ClientWithMiddleware,
+    client: HttpClient,
+    hooks: ApiHooks,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -494,43 +442,101 @@ impl DotEndpoint {
     }
 }
 
-/// Build a `reqwest::Client` with optional outbound interface binding.
+// ---------------------------------------------------------------------------
+// HTTP client builder
+// ---------------------------------------------------------------------------
+
+/// Build a TLS-capable HTTP connector wrapping the outbound [`HyperConnector`].
+fn build_https_connector(connector: HyperConnector) -> HttpsConn {
+    HttpsConnectorBuilder::new()
+        .with_platform_verifier()
+        .https_or_http()
+        .enable_http1()
+        .wrap_connector(connector)
+}
+
+/// Build a [`Dialer`] and [`Resolver`] for the given outbound interface.
+async fn build_dialer_and_resolver(
+    outbound_interface: Option<&str>,
+) -> std::result::Result<(Dialer, Resolver), Box<dyn std::error::Error + Send + Sync>> {
+    let interface = match outbound_interface {
+        Some(name) => {
+            tracing::debug!(
+                outbound_interface = name,
+                "binding HTTP client to outbound interface"
+            );
+            OutboundInterface::lookup(name).await
+        }
+        None => None,
+    };
+    let dialer = Dialer::new(interface);
+    let servers = rustylink_outbound::system_dns_servers()
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
+    let resolver = Resolver::new(dialer.clone(), servers);
+    Ok((dialer, resolver))
+}
+
+/// Build a pooled [`HttpClient`] with optional outbound interface binding.
 ///
 /// The returned client is the shared connection pool — clone it (cheap; it is
 /// `Arc`-backed) into each [`ApiClient`] for connection/TLS reuse.
-pub fn build_http_client(options: &ApiClientOptions) -> Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::limited(10));
-    if let Some(interface) = options.outbound_interface.as_deref() {
-        tracing::debug!(
-            outbound_interface = interface,
-            "binding HTTP client to outbound interface"
-        );
-        builder = builder.interface(interface);
-    }
-    builder.build().context(BuildHttpClientSnafu)
+///
+/// DNS is resolved via the interface-bound [`Resolver`] (raw UDP to system
+/// servers over the bound NIC), making it immune to TUN routing state.
+pub async fn build_http_client(options: &ApiClientOptions) -> Result<HttpClient> {
+    let (_dialer, resolver) = build_dialer_and_resolver(options.outbound_interface.as_deref())
+        .await
+        .context(BuildHttpClientSnafu)?;
+    let dialer_for_conn = build_dialer_and_resolver(options.outbound_interface.as_deref())
+        .await
+        .context(BuildHttpClientSnafu)?
+        .0;
+    let connector = HyperConnector::new(dialer_for_conn, resolver);
+    let https = build_https_connector(connector);
+    let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+        .build(https);
+    Ok(client)
+}
+
+/// Build a per-dot [`HttpClient`] with DNS pinning for TLS host validation.
+///
+/// The request URL carries `tls_host` (derived from the tenant's `vpn_domain`)
+/// so that rustls validates the certificate against that name, but the
+/// [`Resolver`] returns `pinned_addr` for `tls_host` so the socket connects to
+/// the dot's raw IP.
+pub async fn build_dot_http_client(
+    tls_host: &str, pinned_addr: std::net::SocketAddr, outbound_interface: Option<&str>,
+) -> Result<HttpClient> {
+    let (dialer, resolver) = build_dialer_and_resolver(outbound_interface)
+        .await
+        .context(BuildHttpClientSnafu)?;
+    let resolver = resolver.with_override(tls_host, pinned_addr);
+    let connector = HyperConnector::new(dialer, resolver);
+    let https = build_https_connector(connector);
+    let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+        .build(https);
+    Ok(client)
 }
 
 impl ApiClient {
-    /// Build an `ApiClient` addressing `endpoint`, wrapping a clone of the
-    /// shared connection `pool` with a [`SigningMiddleware`] carrying the
-    /// given auth hooks snapshot.  This is the canonical constructor.
+    /// Build an `ApiClient` addressing `endpoint`, using the given shared
+    /// connection `pool` and auth `hooks` snapshot.
     #[must_use]
-    pub fn for_endpoint(
-        endpoint: &impl ApiEndpoint, pool: reqwest::Client, hooks: ApiHooks,
-    ) -> Self {
+    pub fn for_endpoint(endpoint: &impl ApiEndpoint, pool: HttpClient, hooks: ApiHooks) -> Self {
         let base_url = endpoint.base_url().clone();
-        let http = ClientBuilder::new(pool)
-            .with(SigningMiddleware::new(hooks))
-            .build();
         tracing::debug!(%base_url, "created API client");
-        Self { base_url, http }
+        Self {
+            base_url,
+            client: pool,
+            hooks,
+        }
     }
 
     /// Send a typed request and return the decoded response body.
     ///
-    /// Any `Set-Cookie` headers on the response are absorbed into the shared
-    /// cookie jar by [`SigningMiddleware`], so callers never need to inspect
-    /// response cookies or CSRF tokens directly.
+    /// The request is decorated with identity query params, base headers,
+    /// and an HMAC signature.  Any `Set-Cookie` headers on the response are
+    /// absorbed into the shared cookie jar.
     pub async fn send<R>(&self, request: R) -> Result<R::Response>
     where
         R: SendableRequest, {
@@ -543,42 +549,98 @@ impl ApiClient {
     async fn execute<R>(&self, request: R) -> Result<Vec<u8>>
     where
         R: SendableRequest, {
-        let url = endpoint_url(&self.base_url, request.path().as_ref())?;
-        // Span covering the whole request so signing/cookie logs and any error
-        // are grouped under the target method + host + path.
+        let mut url = endpoint_url(&self.base_url, request.path().as_ref())?;
+
         let span = tracing::debug_span!(
             "api_request",
             method = %R::METHOD,
             host = url.host_str().unwrap_or("<unknown>"),
             path = url.path(),
         );
+
         async move {
-            let endpoint_query = request.query_pairs();
-            let body = request.body().context(EncodeSnafu)?;
-            let mut builder = self
-                .http
-                .request(R::METHOD, url)
-                .header(ACCEPT, "application/json");
-            if let Some(body) = body {
-                builder = builder.header(CONTENT_TYPE, "application/json").body(body);
-            }
-            let mut http_request = builder.build().context(BuildRequestSnafu)?;
+            // 1. Append endpoint query pairs + identity query pairs to URL.
             {
-                let mut query = http_request.url_mut().query_pairs_mut();
-                for (key, value) in endpoint_query {
+                let mut query = url.query_pairs_mut();
+                for (key, value) in request.query_pairs() {
+                    query.append_pair(key, &value);
+                }
+                for (key, value) in self.hooks.identity.query_pairs(Timestamp::now()) {
                     query.append_pair(key, &value);
                 }
             }
-            // Request decoration + signing is performed by `SigningMiddleware`,
-            // which also absorbs `Set-Cookie` into the shared jar.
-            let response = self
-                .http
-                .execute(http_request)
-                .await
-                .map_err(map_middleware_error)?;
 
+            // 2. Build body bytes.
+            let body_bytes = request.body().context(EncodeSnafu)?;
+
+            // 3. Build headers: base headers + Accept + Content-Type.
+            let mut headers = self.hooks.base_headers().await?;
+            headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+            if body_bytes.is_some() {
+                headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            }
+
+            // 4. Sign the request (HMAC over method + url + headers + body).
+            let body_for_sign = body_bytes.as_deref().unwrap_or(&[]);
+            let signed_headers = self
+                .hooks
+                .signer
+                .sign(R::METHOD.as_str(), &url, &headers, body_for_sign)
+                .context(SignRequestSnafu)?;
+            let signed_header_count = signed_headers.len();
+            for signed in signed_headers {
+                let name =
+                    HeaderName::from_bytes(signed.name.as_bytes()).context(HeaderNameSnafu {
+                        name: signed.name.clone(),
+                    })?;
+                let value = HeaderValue::from_str(&signed.value)
+                    .context(HeaderValueSnafu { name: signed.name })?;
+                headers.insert(name, value);
+            }
+
+            tracing::debug!(
+                method = %R::METHOD,
+                host = url.host_str().unwrap_or("<none>"),
+                path = url.path(),
+                signed_header_count,
+                "prepared API request"
+            );
+
+            // 5. Build http::Request<Full<Bytes>>.
+            let uri: http::Uri = url
+                .as_str()
+                .parse()
+                .map_err(|e: http::uri::InvalidUri| Error::BuildRequest { source: e.into() })?;
+            let body = Full::new(Bytes::from(body_bytes.unwrap_or_default()));
+            let mut req = http::Request::builder()
+                .method(R::METHOD)
+                .uri(uri)
+                .body(body)
+                .context(BuildRequestSnafu)?;
+            *req.headers_mut() = headers;
+
+            // 6. Send.
+            let response = self.client.request(req).await.map_err(|e| Error::Request {
+                source: Box::new(e),
+            })?;
+
+            // 7. Absorb Set-Cookie into shared jar.
+            self.hooks
+                .cookies
+                .merge(parse_set_cookies(response.headers()))
+                .await;
+
+            // 8. Read response body.
             let status = response.status();
-            let bytes = response.bytes().await.context(RequestSnafu)?.to_vec();
+            let collected = response
+                .into_body()
+                .collect()
+                .await
+                .map_err(|e| Error::Request {
+                    source: Box::new(e),
+                })?;
+            let bytes = collected.to_bytes().to_vec();
+
             if !status.is_success() {
                 return HttpStatusSnafu {
                     status,
@@ -592,6 +654,10 @@ impl ApiClient {
         .await
     }
 }
+
+// ---------------------------------------------------------------------------
+// VpnDot helpers
+// ---------------------------------------------------------------------------
 
 /// Android VPN mode ids carried on a dot's `mode` field and the requested
 /// connect mode (kept in sync with `rustylink_core::vpn::VpnConnectMode`).
@@ -638,6 +704,10 @@ impl VpnDot {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
 fn parse_base_url(value: &str) -> Result<Url> {
     Url::parse(value).context(InvalidBaseUrlSnafu {
         value: value.to_string(),
@@ -681,20 +751,6 @@ fn check_api_status(response: &impl ApiResponse, body: &[u8]) -> Result<()> {
         response: Box::new(response),
     }
     .fail()
-}
-
-/// Map a `reqwest_middleware::Error` back into our [`Error`], recovering the
-/// original signing/decoration error if the middleware produced one.
-fn map_middleware_error(error: reqwest_middleware::Error) -> Error {
-    match error {
-        reqwest_middleware::Error::Reqwest(source) => Error::Request { source },
-        reqwest_middleware::Error::Middleware(err) => {
-            err.downcast::<Error>()
-                .unwrap_or_else(|err| Error::MiddlewareFailed {
-                    message: err.to_string(),
-                })
-        }
-    }
 }
 
 /// Build the `Cookie` header value: the session cookies followed by the device
