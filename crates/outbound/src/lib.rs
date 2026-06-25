@@ -36,6 +36,7 @@
 //! TUN and preventing the self-loop.  No system-level side-effects (routes,
 //! rules, marks) are created by this crate -- teardown is just `drop`.
 
+pub mod bypass;
 pub mod connector;
 pub mod context;
 pub mod dialer;
@@ -44,6 +45,7 @@ pub mod resolver;
 pub mod snapshot;
 
 // Re-exports for convenience.
+pub use bypass::{Error as BypassError, RouteBypass};
 pub use connector::{Error as ConnectorError, HyperConnector, parse_uri_host_port};
 pub use context::{Error as ContextError, OutboundConfig, OutboundContext};
 pub use dialer::{Dialer, Error as DialerError, should_bind};

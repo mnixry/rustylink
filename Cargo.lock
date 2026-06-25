@@ -2949,6 +2949,7 @@ dependencies = [
 name = "rustylink-outbound"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "default-net",
  "hickory-proto",
  "hickory-resolver",

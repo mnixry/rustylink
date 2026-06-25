@@ -33,6 +33,8 @@ async fn bind_udp_to_loopback_skips_iface_bind() {
     let dialer = Dialer::new(Some(OutboundInterface {
         name: "nonexistent0".to_string(),
         index: 99999,
+        gateway_v4: None,
+        gateway_v6: None,
     }));
     let server = SocketAddr::from((Ipv4Addr::LOCALHOST, 53));
     let _socket = dialer.bind_udp_to(server).expect("bind for loopback DNS");

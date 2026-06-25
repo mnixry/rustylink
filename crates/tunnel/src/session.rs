@@ -12,7 +12,7 @@ use gotatun::{
 };
 use ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
 use rustylink_api::{ProtocolMode, VpnConnResponse};
-use rustylink_outbound::{Dialer, OutboundConfig, OutboundContext, Resolver};
+use rustylink_outbound::{Dialer, OutboundConfig, OutboundContext, Resolver, RouteBypass};
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use url::{Host, Url};
@@ -83,6 +83,11 @@ pub enum Error {
         source: rustylink_outbound::ContextError,
     },
 
+    #[snafu(display("route bypass setup failed: {source}"))]
+    Bypass {
+        source: rustylink_outbound::BypassError,
+    },
+
     #[snafu(display("gotatun device setup failed: {source}"))]
     Device { source: gotatun::device::Error },
 
@@ -144,6 +149,7 @@ pub struct TunnelSession {
     pub status: TunnelStatus,
     device: Option<TunnelDevice>,
     routes: Option<AppliedRoutes>,
+    bypass: Option<RouteBypass>,
     probe: Option<LivenessProbe>,
 }
 
@@ -230,6 +236,7 @@ impl TunnelSession {
             status: TunnelStatus::Created,
             device: None,
             routes: None,
+            bypass: None,
             probe: None,
         }
     }
@@ -339,6 +346,25 @@ impl TunnelSession {
 
         let endpoint = resolve_endpoint(&self.config.endpoint, ctx.resolver()).await?;
         let peer = tunnel_peer(&self.config, endpoint)?;
+
+        // Install route bypass (macOS: scoped default route, Linux: fwmark
+        // policy routing) so that interface-bound sockets can reach
+        // destinations despite /1 full-tunnel routes.  Must happen BEFORE
+        // TUN routes are applied.
+        if let Some(iface) = ctx.interface() {
+            match RouteBypass::setup(iface, self.config.full_tunnel).await {
+                Ok(bypass) => self.bypass = Some(bypass),
+                Err(e) => {
+                    tracing::warn!(
+                        %e,
+                        interface = %iface.name,
+                        full_tunnel = self.config.full_tunnel,
+                        "route bypass setup failed; bypass traffic may be unreachable"
+                    );
+                }
+            }
+        }
+
         let routes = self.config.routes.as_slice();
         let routes = route::apply(&actual_interface_name, routes)
             .await
@@ -391,6 +417,13 @@ impl TunnelSession {
         drop(self.probe.take());
         if let Some(routes) = self.routes.take() {
             routes.remove().await.context(RouteSnafu)?;
+        }
+        // Remove route bypass (macOS scoped default, Linux fwmark rules)
+        // after TUN routes are gone.
+        if let Some(bypass) = self.bypass.take()
+            && let Err(e) = bypass.teardown().await
+        {
+            tracing::warn!(%e, "failed to tear down route bypass");
         }
         if let Some(device) = self.device.take() {
             device.stop().await;

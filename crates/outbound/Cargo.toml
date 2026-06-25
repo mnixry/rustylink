@@ -4,6 +4,7 @@ name              = "rustylink-outbound"
 version.workspace = true
 
 [dependencies]
+async-trait.workspace       = true
 default-net.workspace      = true
 hickory-proto.workspace    = true
 hickory-resolver.workspace = true

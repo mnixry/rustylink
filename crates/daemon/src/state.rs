@@ -586,40 +586,63 @@ impl VpnMachine {
                 state: pb::tunnel::State::Disconnected.into(),
                 ..Default::default()
             },
-            VpnState::Connecting { .. } => pb::Tunnel {
+            VpnState::Connecting { request, .. } => pb::Tunnel {
                 state: pb::tunnel::State::Connecting.into(),
+                mode: vpn_mode_to_proto(request.mode).into(),
                 ..Default::default()
             },
-            VpnState::Configuring { .. } => pb::Tunnel {
+            VpnState::Configuring { request, .. } => pb::Tunnel {
                 state: pb::tunnel::State::Configuring.into(),
+                mode: vpn_mode_to_proto(request.mode).into(),
                 ..Default::default()
             },
-            VpnState::Connected { tunnel_info, .. } => pb::Tunnel {
+            VpnState::Connected {
+                request,
+                tunnel_info,
+                ..
+            } => pb::Tunnel {
                 state: pb::tunnel::State::Connected.into(),
+                mode: vpn_mode_to_proto(request.mode).into(),
                 dot_id: tunnel_info.dot_id,
                 dot_name: tunnel_info.dot_name.clone(),
                 endpoint: tunnel_info.endpoint.clone(),
                 assigned_ip: tunnel_info.assigned_ip.clone(),
                 ..Default::default()
             },
-            VpnState::Reconnecting { attempts, .. } => pb::Tunnel {
+            VpnState::Reconnecting {
+                request, attempts, ..
+            } => pb::Tunnel {
                 state: pb::tunnel::State::Reconnecting.into(),
+                mode: vpn_mode_to_proto(request.mode).into(),
                 reconnect_attempts: *attempts,
                 ..Default::default()
             },
             VpnState::Failed {
-                error, attempts, ..
+                request,
+                error,
+                attempts,
+                ..
             } => pb::Tunnel {
                 state: pb::tunnel::State::Failed.into(),
+                mode: vpn_mode_to_proto(request.mode).into(),
                 error: error.clone(),
                 reconnect_attempts: *attempts,
                 ..Default::default()
             },
-            VpnState::Disconnecting { .. } => pb::Tunnel {
+            VpnState::Disconnecting { request, .. } => pb::Tunnel {
                 state: pb::tunnel::State::Disconnecting.into(),
+                mode: vpn_mode_to_proto(request.mode).into(),
                 ..Default::default()
             },
         }
+    }
+}
+
+/// Map a [`VpnConnectMode`] to the proto [`VpnMode`](pb::VpnMode).
+fn vpn_mode_to_proto(mode: VpnConnectMode) -> pb::VpnMode {
+    match mode {
+        VpnConnectMode::Full => pb::VpnMode::Full,
+        VpnConnectMode::Split => pb::VpnMode::Split,
     }
 }
 

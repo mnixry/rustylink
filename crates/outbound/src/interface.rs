@@ -43,11 +43,18 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 ///
 /// Carries the OS interface **index** used by the per-socket `setsockopt`
 /// binding (`SO_BINDTOIFINDEX` on Linux, `IP_BOUND_IF` on macOS,
-/// `IP_UNICAST_IF` on Windows).
+/// `IP_UNICAST_IF` on Windows) and the gateway IPs needed for route-bypass
+/// setup (macOS scoped default routes).
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct OutboundInterface {
     pub name: String,
     pub index: u32,
+    /// IPv4 gateway of this interface (for macOS scoped default route).
+    #[serde(default)]
+    pub gateway_v4: Option<IpAddr>,
+    /// IPv6 gateway of this interface (for macOS scoped default route).
+    #[serde(default)]
+    pub gateway_v6: Option<IpAddr>,
 }
 
 impl OutboundInterface {
@@ -106,9 +113,19 @@ impl OutboundInterface {
             }
             .fail();
         }
+        let (gateway_v4, gateway_v6) =
+            interface
+                .gateway
+                .as_ref()
+                .map_or((None, None), |gw| match gw.ip_addr {
+                    IpAddr::V4(_) => (Some(gw.ip_addr), None),
+                    IpAddr::V6(_) => (None, Some(gw.ip_addr)),
+                });
         Ok(Self {
             name: interface.name,
             index: interface.index,
+            gateway_v4,
+            gateway_v6,
         })
     }
 }

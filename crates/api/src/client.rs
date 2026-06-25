@@ -484,14 +484,10 @@ async fn build_dialer_and_resolver(
 /// DNS is resolved via the interface-bound [`Resolver`] (raw UDP to system
 /// servers over the bound NIC), making it immune to TUN routing state.
 pub async fn build_http_client(options: &ApiClientOptions) -> Result<HttpClient> {
-    let (_dialer, resolver) = build_dialer_and_resolver(options.outbound_interface.as_deref())
+    let (dialer, resolver) = build_dialer_and_resolver(options.outbound_interface.as_deref())
         .await
         .context(BuildHttpClientSnafu)?;
-    let dialer_for_conn = build_dialer_and_resolver(options.outbound_interface.as_deref())
-        .await
-        .context(BuildHttpClientSnafu)?
-        .0;
-    let connector = HyperConnector::new(dialer_for_conn, resolver);
+    let connector = HyperConnector::new(dialer, resolver);
     let https = build_https_connector(connector);
     let client = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
         .build(https);

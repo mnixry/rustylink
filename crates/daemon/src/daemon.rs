@@ -360,6 +360,22 @@ impl Daemon {
             if inner.config.outbound_interface == inner.active_outbound {
                 return;
             }
+            // Rebuild the HTTP pool with the new outbound interface so
+            // tenant API calls (vpn/list, vpn/setting, info/me) use the
+            // updated Dialer + Resolver.
+            match rustylink_api::build_http_client(&rustylink_api::ApiClientOptions {
+                outbound_interface: inner.config.outbound_interface.clone(),
+            })
+            .await
+            {
+                Ok(pool) => {
+                    tracing::info!("rebuilt HTTP pool for new outbound interface");
+                    inner.auth.http_pool = pool;
+                }
+                Err(e) => {
+                    tracing::warn!(%e, "failed to rebuild HTTP pool for new outbound interface");
+                }
+            }
             let request = inner
                 .vpn
                 .as_ref()
