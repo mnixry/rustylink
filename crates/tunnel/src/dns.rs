@@ -2,17 +2,25 @@
 //!
 //! [`VpnTun`] is the gotatun TUN device (merging the old `IpTun` + hijacker):
 //! it forwards normal IP packets and intercepts UDP/53, handing the query to a
-//! [`DnsResolver`]. The resolver routes each query over one of two pluggable
-//! [`DnsQueryTransport`]s — **routed** (bound to the TUN, reaches the VPN
-//! resolver through the tunnel, used for intranet / full-tunnel) or
-//! **directed** (bound to the physical outbound interface, reaches the system
-//! resolver directly, used for public split-tunnel names) — and always returns
-//! a DNS response (the upstream answer, or a synthesized `SERVFAIL`).
+//! [`DnsResolver`]. The resolver first tries to **synthesize** an answer from
+//! the dynamic-domain answer tables ([`DnsConfig::synthesize`]); failing that
+//! it routes the query over one of two pluggable [`DnsQueryTransport`]s —
+//! **routed** (bound to the TUN, reaches the VPN resolver through the tunnel,
+//! used for intranet / full-tunnel) or **directed** (bound to the physical
+//! outbound interface, reaches the system resolver directly, used for public
+//! split-tunnel names) — and always returns a DNS response (the upstream
+//! answer, a synthesized answer, or a synthesized `SERVFAIL`).
+//!
+//! Config parsing is split into two phases. [`DnsConfig::from_vpn_conn`] is
+//! sync and network-free: it compiles split-domain matchers and the
+//! dynamic-domain tables from the `/vpn/conn` response. [`DnsResolver::build`]
+//! runs at session start and binds the (pre-resolved) upstreams to the two
+//! transports.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     io, iter,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -25,12 +33,10 @@ use gotatun::{
 };
 use hickory_proto::{
     op::{Message as DnsMessage, MessageType, OpCode, Query, ResponseCode},
-    rr::{Name, RecordType},
+    rr::{Name, RData, Record, RecordType},
 };
-use rustylink_api::VpnConnResponse;
+use rustylink_api::{CentralDns, IpNat, VpnConnResponse};
 use rustylink_outbound::Dialer;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use snafu::prelude::*;
 use tokio::net::lookup_host;
 use url::{Host, Url};
@@ -40,6 +46,9 @@ const DNS_PORT: u16 = 53;
 const DNS_RESPONSE_HOP_LIMIT: u8 = 64;
 const DNS_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_DNS_PACKET: usize = 4096;
+/// TTL (seconds) for records synthesized from the dynamic-domain answer tables.
+/// Matches the native client's dynamic-domain answer TTL.
+const DYNAMIC_TTL: u32 = 3600;
 /// Used for directed (public) resolution when the OS exposes no system
 /// resolver.
 const DEFAULT_SYSTEM_DNS: IpAddr = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
@@ -73,12 +82,6 @@ pub enum Error {
     #[snafu(display("DNS query to `{server}` timed out"))]
     QueryTimeout { server: SocketAddr },
 
-    #[snafu(display("failed to resolve DNS server `{server}`: {source}"))]
-    ResolveServer { server: String, source: io::Error },
-
-    #[snafu(display("DNS server `{server}` resolved to no usable address"))]
-    NoServerAddress { server: String },
-
     #[snafu(display("failed to build DNS response packet: {source}"))]
     BuildResponse {
         source: etherparse::err::packet::BuildWriteError,
@@ -99,53 +102,263 @@ impl From<Error> for io::Error {
     }
 }
 
-/// Parsed, serializable DNS configuration carried in [`crate::TunnelConfig`].
+/// Dynamic-domain answer tables (the native client's first three DNS lookup
+/// layers).
 ///
-/// Built once from the `/vpn/conn` response (plus optional local DNS override)
-/// and consumed by [`DnsResolver::build`] at session start.
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub struct DnsHijackPlan {
-    /// `host:port` VPN resolver endpoints, de-duplicated, used by the routed
-    /// (intranet) transport.
-    pub vpn_servers: Vec<String>,
-    /// Normalized lowercase domain patterns; each matches both `domain` and
-    /// `*.domain` and routes the query through the VPN resolver.
-    pub split_domains: Vec<String>,
+/// A query whose name hits one of these tables is answered locally from the
+/// table's IP values rather than forwarded upstream. Exact tables are genuine
+/// keyed lookups (`HashMap`); wildcard/suffix tables are scanned linearly, so
+/// they are `Vec<(pattern, answers)>` — a `HashMap` would buy nothing when
+/// every entry is visited.
+#[derive(Clone, Debug, Default)]
+pub struct DynamicDomainTables {
+    /// `dynamic_domain` + `vpn_dynamic_domain_route_split` → A answers.
+    exact_v4: HashMap<String, Vec<String>>,
+    /// `v6_vpn_dynamic_domain_route_split` → AAAA answers.
+    exact_v6: HashMap<String, Vec<String>>,
+    /// `vpn_wildcard_dynamic_domain_route_split` → A answers (linear scan).
+    wildcard_v4: Vec<(String, Vec<String>)>,
+    /// `suffix_wildcard_dynamic_domain_route_split` → A answers (linear scan).
+    suffix_v4: Vec<(String, Vec<String>)>,
 }
 
-impl DnsHijackPlan {
+impl DynamicDomainTables {
+    /// IPv4 answer values for `name`: exact table, then wildcard, then suffix
+    /// pattern lists. A pattern matches `name` exactly or as a parent domain
+    /// (`name` ends with `.pattern`).
+    fn lookup_v4(&self, name: &str) -> Option<&[String]> {
+        if let Some(values) = self.exact_v4.get(name) {
+            return Some(values);
+        }
+        for table in [&self.wildcard_v4, &self.suffix_v4] {
+            if let Some((_, values)) = table.iter().find(|(pattern, _)| {
+                !pattern.is_empty()
+                    && (name == pattern.as_str() || name.ends_with(&format!(".{pattern}")))
+            }) {
+                return Some(values);
+            }
+        }
+        None
+    }
+
+    /// IPv6 answer values for `name` (exact table only — there are no v6
+    /// wildcard/suffix fields).
+    fn lookup_v6(&self, name: &str) -> Option<&[String]> {
+        self.exact_v6.get(name).map(Vec::as_slice)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.exact_v4.is_empty()
+            && self.exact_v6.is_empty()
+            && self.wildcard_v4.is_empty()
+            && self.suffix_v4.is_empty()
+    }
+}
+
+/// Parsed DNS configuration from `/vpn/conn`.
+///
+/// Holds no transports and performs no network I/O: built once (sync) by
+/// [`DnsConfig::from_vpn_conn`] and consumed by [`DnsResolver::build`] at
+/// session start. The matching/synthesis methods are pure so they can be
+/// unit-tested without sockets.
+#[derive(Clone, Debug)]
+pub struct DnsConfig {
+    /// True in full-tunnel mode (all queries route through the VPN resolver).
+    full_tunnel: bool,
+    /// `host:port` VPN resolver endpoints; resolved to addresses at session
+    /// start by [`DnsConfig::resolve_vpn_servers`].
+    vpn_servers: Vec<String>,
+    /// Compiled split-domain matchers (layer 6): each split domain yields a
+    /// matcher for `domain` and one for `*.domain`.
+    split_matchers: Vec<WildMatch>,
+    /// Dynamic-domain answer tables (layers 1-3).
+    dynamic: DynamicDomainTables,
+    /// `central_dns` DNAT policy (parsed; matching deferred).
+    central_dns: Option<CentralDns>,
+    /// `ip_nats` NAT route-match rules (parsed; rewriting deferred).
+    ip_nats: Vec<IpNat>,
+}
+
+impl DnsConfig {
+    /// Parse the DNS configuration from a `/vpn/conn` response. Sync and
+    /// network-free.
     #[must_use]
-    pub fn from_vpn_conn(conn: &VpnConnResponse, local_dns: Option<&str>) -> Self {
+    pub fn from_vpn_conn(
+        conn: &VpnConnResponse, local_dns: Option<&str>, full_tunnel: bool,
+    ) -> Self {
         let setting = &conn.setting;
         let vpn_servers = collect_vpn_servers([
             local_dns,
             setting.vpn_dns.as_deref(),
             setting.vpn_dns_backup.as_deref(),
         ]);
-        let mut split_domains = BTreeSet::new();
+
+        // Layer 6: split-domain routing list.
+        let mut split = BTreeSet::new();
         if let Some(list) = setting.vpn_dns_domain_split.as_deref() {
             for raw in list {
-                accept_domain(raw, &mut split_domains);
+                accept_domain(raw, &mut split);
             }
         }
-        for raw in [
-            setting.vpn_dynamic_domain_route_split.as_deref(),
-            setting.v6_vpn_dynamic_domain_route_split.as_deref(),
-            setting.vpn_wildcard_dynamic_domain_route_split.as_deref(),
-            setting
-                .suffix_wildcard_dynamic_domain_route_split
-                .as_deref(),
-            setting.dynamic_domain.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            extract_domains(raw, &mut split_domains);
+        let split_matchers = split
+            .iter()
+            .flat_map(|domain| {
+                [
+                    WildMatch::new(domain),
+                    WildMatch::new(&format!("*.{domain}")),
+                ]
+            })
+            .collect();
+
+        // Layers 1-3: dynamic-domain answer tables. The top-level
+        // `dynamic_domain` and `vpn_dynamic_domain_route_split` both feed the
+        // exact IPv4 table.
+        let mut exact_v4: HashMap<String, Vec<String>> = HashMap::new();
+        for (domain, values) in normalized_entries(setting.dynamic_domain.as_ref()).chain(
+            normalized_entries(setting.vpn_dynamic_domain_route_split.as_ref()),
+        ) {
+            exact_v4.entry(domain).or_default().extend(values);
         }
+        let dynamic = DynamicDomainTables {
+            exact_v4,
+            exact_v6: normalized_entries(setting.v6_vpn_dynamic_domain_route_split.as_ref())
+                .collect(),
+            wildcard_v4: normalized_entries(
+                setting.vpn_wildcard_dynamic_domain_route_split.as_ref(),
+            )
+            .collect(),
+            suffix_v4: normalized_entries(
+                setting.suffix_wildcard_dynamic_domain_route_split.as_ref(),
+            )
+            .collect(),
+        };
+
         Self {
+            full_tunnel,
             vpn_servers,
-            split_domains: split_domains.into_iter().collect(),
+            split_matchers,
+            dynamic,
+            central_dns: setting.central_dns.clone(),
+            ip_nats: setting.ip_nats.clone().unwrap_or_default(),
         }
+    }
+
+    /// True when no resolver endpoints were provided (DNS hijack disabled).
+    #[must_use]
+    pub fn is_hijack_disabled(&self) -> bool {
+        self.vpn_servers.is_empty()
+    }
+
+    /// Number of compiled split-domain matchers (for logging).
+    #[must_use]
+    pub fn split_matcher_count(&self) -> usize {
+        self.split_matchers.len()
+    }
+
+    /// Parsed `central_dns` DNAT policy, if any.
+    ///
+    /// Currently informational only: the bloom-filter DNS matching path it
+    /// describes is not implemented (see [`DnsResolver::resolve`]).
+    #[must_use]
+    pub fn central_dns(&self) -> Option<&CentralDns> {
+        self.central_dns.as_ref()
+    }
+
+    /// Parsed `ip_nats` NAT route-match rules.
+    ///
+    /// Currently informational only: IP-NAT rewriting is not implemented (see
+    /// [`DnsResolver::resolve`]).
+    #[must_use]
+    pub fn ip_nats(&self) -> &[IpNat] {
+        &self.ip_nats
+    }
+
+    /// Resolve the `host:port` VPN resolver endpoints to concrete socket
+    /// addresses, once, at session start. Unresolvable specs are logged and
+    /// skipped; results are de-duplicated.
+    pub async fn resolve_vpn_servers(&self) -> Vec<SocketAddr> {
+        let mut seen = BTreeSet::new();
+        let mut servers = Vec::new();
+        for spec in &self.vpn_servers {
+            match lookup_host(spec).await {
+                Ok(addrs) => {
+                    for addr in addrs {
+                        if seen.insert(addr) {
+                            servers.push(addr);
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%spec, %error, "failed to resolve DNS server");
+                }
+            }
+        }
+        servers
+    }
+
+    /// Layers 1-3: try to answer `query` locally from the dynamic-domain answer
+    /// tables. Returns the synthesized DNS wire response, or `None` to fall
+    /// through to the forward path. Pure (no network).
+    fn synthesize(&self, query: &DnsWireQuery) -> Option<Vec<u8>> {
+        if self.dynamic.is_empty() {
+            return None;
+        }
+        let request = DnsMessage::from_vec(&query.payload).ok()?;
+        let question = request.queries.first()?;
+        let name = normalize_domain(&question.name().to_ascii());
+        if name.is_empty() {
+            return None;
+        }
+        match question.query_type() {
+            RecordType::A => {
+                let qname = question.name().clone();
+                let answers: Vec<Record> = self
+                    .dynamic
+                    .lookup_v4(&name)?
+                    .iter()
+                    .filter_map(|value| value_token(value).parse::<Ipv4Addr>().ok())
+                    .map(|ip| Record::from_rdata(qname.clone(), DYNAMIC_TTL, RData::A(ip.into())))
+                    .collect();
+                if answers.is_empty() {
+                    return None;
+                }
+                build_response(&request, answers)
+            }
+            RecordType::AAAA => match self.dynamic.lookup_v6(&name) {
+                Some(values) => {
+                    let qname = question.name().clone();
+                    let answers: Vec<Record> = values
+                        .iter()
+                        .filter_map(|value| value_token(value).parse::<Ipv6Addr>().ok())
+                        .map(|ip| {
+                            Record::from_rdata(qname.clone(), DYNAMIC_TTL, RData::AAAA(ip.into()))
+                        })
+                        .collect();
+                    build_response(&request, answers)
+                }
+                // Domain is managed for IPv4 only: suppress AAAA with an empty
+                // NOERROR (NODATA) answer so the client falls back to the
+                // synthesized A record (matches the native client).
+                None if self.dynamic.lookup_v4(&name).is_some() => {
+                    build_response(&request, Vec::new())
+                }
+                None => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Layer 6: should `domain` route through the VPN resolver (routed) rather
+    /// than the system resolver (directed)? Full-tunnel forces routed.
+    fn route_through_vpn(&self, domain: Option<&str>) -> bool {
+        self.full_tunnel || domain.is_some_and(|domain| self.matches_split(domain))
+    }
+
+    fn matches_split(&self, domain: &str) -> bool {
+        let domain = normalize_domain(domain);
+        self.split_matchers
+            .iter()
+            .any(|matcher| matcher.matches(&domain))
     }
 }
 
@@ -189,86 +402,84 @@ impl DnsQueryTransport for UdpDnsTransport {
     }
 }
 
-/// Routes DNS queries to the VPN resolver (routed) or the system resolver
-/// (directed) by rule, and always yields a DNS response.
+/// Routes DNS queries to a synthesized answer (dynamic-domain tables), the VPN
+/// resolver (routed), or the system resolver (directed), and always yields a
+/// DNS response.
 pub struct DnsResolver {
-    full_tunnel: bool,
-    vpn_servers: Vec<String>,
-    /// Pre-extracted IPs of the VPN resolver(s). Used by [`VpnTun`] to skip
-    /// hijacking the routed transport's own forwarding traffic (which would
-    /// otherwise re-enter the TUN and loop indefinitely).
+    config: DnsConfig,
+    /// Pre-resolved VPN resolver endpoints (routed transport).
+    vpn_servers: Vec<SocketAddr>,
+    /// Pre-resolved system resolver endpoints (directed transport).
+    system_servers: Vec<SocketAddr>,
+    /// IPs of the VPN resolver(s). Used by [`VpnTun`] to skip hijacking the
+    /// routed transport's own forwarding traffic (which would otherwise
+    /// re-enter the TUN and loop indefinitely).
     vpn_dns_ips: Vec<IpAddr>,
-    system_servers: Vec<String>,
-    matchers: Vec<WildMatch>,
     directed: Arc<dyn DnsQueryTransport>,
     routed: Arc<dyn DnsQueryTransport>,
 }
 
 impl DnsResolver {
-    /// Build the resolver. Returns `None` (hijack disabled) when the VPN
-    /// provided no resolver. `system_servers` is read once via
-    /// [`system_dns_servers`] so the same set can also be host-routed into
-    /// the tunnel (split mode).
+    /// Build the resolver from a parsed [`DnsConfig`] and the pre-resolved
+    /// upstreams. Returns `None` (hijack disabled) when the VPN provided no
+    /// resolver. `vpn_servers` is resolved once by
+    /// [`DnsConfig::resolve_vpn_servers`]; `system_servers` is read once via
+    /// [`system_dns_servers`] (so the same set can be host-routed into the
+    /// tunnel in split mode).
     #[must_use]
     pub fn build(
-        plan: &DnsHijackPlan, full_tunnel: bool, system_servers: &[IpAddr],
+        config: DnsConfig, vpn_servers: Vec<SocketAddr>, system_servers: &[IpAddr],
         directed: Arc<dyn DnsQueryTransport>, routed: Arc<dyn DnsQueryTransport>,
     ) -> Option<Self> {
-        if plan.vpn_servers.is_empty() {
+        if config.is_hijack_disabled() {
             tracing::info!("DNS hijack disabled: VPN provided no resolver");
             return None;
         }
-        let vpn_dns_ips = plan
-            .vpn_servers
-            .iter()
-            .filter_map(|server| server.parse::<SocketAddr>().ok().map(|addr| addr.ip()))
-            .collect();
+        let vpn_dns_ips = vpn_servers.iter().map(SocketAddr::ip).collect();
         let system_servers = system_servers
             .iter()
-            .map(|ip| SocketAddr::new(*ip, DNS_PORT).to_string())
-            .collect();
-        let matchers = plan
-            .split_domains
-            .iter()
-            .flat_map(|domain| {
-                [
-                    WildMatch::new(domain),
-                    WildMatch::new(&format!("*.{domain}")),
-                ]
-            })
+            .map(|ip| SocketAddr::new(*ip, DNS_PORT))
             .collect();
         Some(Self {
-            full_tunnel,
-            vpn_servers: plan.vpn_servers.clone(),
-            vpn_dns_ips,
+            config,
+            vpn_servers,
             system_servers,
-            matchers,
+            vpn_dns_ips,
             directed,
             routed,
         })
     }
 
-    /// Resolve a hijacked query, always returning a DNS wire response (the
-    /// upstream answer, or a synthesized `SERVFAIL`).
+    /// Resolve a hijacked query, always returning a DNS wire response (a
+    /// synthesized answer, the upstream answer, or a synthesized `SERVFAIL`).
+    ///
+    /// DNAT is intentionally not applied here. The native client matches a DNS
+    /// query against the bloom filters carried in `central_dns` and rewrites
+    /// the response's A records to the translation target IP picked from
+    /// `ip_nats`. Both fields are parsed into [`DnsConfig`] but unused until
+    /// that path is implemented. See `docs/vpn-dns-dnat-behavior.md`.
     async fn resolve(&self, query: &DnsWireQuery) -> Vec<u8> {
-        let domain = query
-            .domain
-            .clone()
-            .or_else(|| parse_dns_question_domain(&query.payload));
-        let routed = self.full_tunnel
-            || domain
-                .as_deref()
-                .is_some_and(|value| self.matches_split_domain(value));
-        let (transport, servers, route) = if routed {
+        // Layers 1-3: synthesize from the dynamic-domain answer tables.
+        if let Some(answer) = self.config.synthesize(query) {
+            tracing::debug!(
+                domain = query.domain.as_deref().unwrap_or("<unknown>"),
+                "DNS answered from dynamic-domain table"
+            );
+            return answer;
+        }
+
+        // Layer 6: forward to the routed (VPN) or directed (system) resolver.
+        let domain = query.domain.as_deref();
+        let (transport, servers, route) = if self.config.route_through_vpn(domain) {
             (self.routed.as_ref(), &self.vpn_servers, "routed")
         } else {
             (self.directed.as_ref(), &self.system_servers, "directed")
         };
-        let name = domain.as_deref().unwrap_or("<unknown>");
+        let name = domain.unwrap_or("<unknown>");
 
         let start = Instant::now();
-        for server in servers {
-            match query_server(transport, server, &query.payload).await {
+        for &server in servers {
+            match transport.query(server, &query.payload).await {
                 Ok(response) => {
                     tracing::debug!(
                         domain = name,
@@ -291,11 +502,6 @@ impl DnsResolver {
             "DNS resolution failed; returning SERVFAIL"
         );
         synthesize_failure(&query.payload, ResponseCode::ServFail)
-    }
-
-    fn matches_split_domain(&self, domain: &str) -> bool {
-        let domain = normalize_domain(domain);
-        self.matchers.iter().any(|matcher| matcher.matches(&domain))
     }
 }
 
@@ -345,7 +551,7 @@ pub struct LivenessProbe {
 
 impl LivenessProbe {
     #[must_use]
-    pub fn start(routed: Arc<dyn DnsQueryTransport>, servers: Vec<String>) -> Self {
+    pub fn start(routed: Arc<dyn DnsQueryTransport>, servers: Vec<SocketAddr>) -> Self {
         let last_rx = Arc::new(Mutex::new(None));
         let handle = tokio::spawn(run_probe(routed, servers, last_rx.clone()));
         Self { last_rx, handle }
@@ -375,14 +581,15 @@ impl Drop for LivenessProbe {
 }
 
 async fn run_probe(
-    routed: Arc<dyn DnsQueryTransport>, servers: Vec<String>, last_rx: Arc<Mutex<Option<Instant>>>,
+    routed: Arc<dyn DnsQueryTransport>, servers: Vec<SocketAddr>,
+    last_rx: Arc<Mutex<Option<Instant>>>,
 ) {
     let query = liveness_probe_query();
     let mut tick = tokio::time::interval(PROBE_INTERVAL);
     loop {
         tick.tick().await;
-        for server in &servers {
-            match query_server(routed.as_ref(), server, &query).await {
+        for &server in &servers {
+            match routed.query(server, &query).await {
                 Ok(_) => {
                     *last_rx.lock().expect("liveness probe state lock poisoned") =
                         Some(Instant::now());
@@ -406,22 +613,6 @@ fn liveness_probe_query() -> Vec<u8> {
         RecordType::A,
     ));
     message.to_vec().expect("static probe message serializes")
-}
-
-async fn query_server(
-    transport: &dyn DnsQueryTransport, server: &str, request: &[u8],
-) -> Result<Vec<u8>> {
-    let mut last_error = None;
-    for addr in lookup_host(server)
-        .await
-        .context(ResolveServerSnafu { server })?
-    {
-        match transport.query(addr, request).await {
-            Ok(response) => return Ok(response),
-            Err(error) => last_error = Some(error),
-        }
-    }
-    last_error.map_or_else(|| NoServerAddressSnafu { server }.fail(), Err)
 }
 
 /// The TUN device, merging the basic gotatun adapter with the DNS hijacker.
@@ -597,6 +788,24 @@ fn write_udp_packet(
     Ok(packet)
 }
 
+/// The leading `/`-delimited token of a dynamic-table value (the address part).
+fn value_token(value: &str) -> &str {
+    value.split('/').next().unwrap_or(value).trim()
+}
+
+/// Turn a parsed query [`DnsMessage`] into a NOERROR response carrying
+/// `answers` (an empty `answers` yields a NODATA response).
+fn build_response(request: &DnsMessage, answers: Vec<Record>) -> Option<Vec<u8>> {
+    let mut response = request.clone();
+    response.metadata.message_type = MessageType::Response;
+    response.metadata.response_code = ResponseCode::NoError;
+    response.metadata.recursion_available = true;
+    for record in answers {
+        response.add_answer(record);
+    }
+    response.to_vec().ok()
+}
+
 fn parse_dns_question_domain(payload: &[u8]) -> Option<String> {
     let message = DnsMessage::from_vec(payload).ok()?;
     first_query_domain(&message)
@@ -678,27 +887,15 @@ fn parse_dns_endpoint(value: &str) -> Option<String> {
     })
 }
 
-/// Extract split-tunnel domain patterns from a config value that may itself be
-/// JSON (string / array / object of strings) or a comma/semicolon-separated
-/// list. Accepts entries that look like real domains and rejects IPs, CIDRs,
-/// and host:port forms.
-fn extract_domains(raw: &str, out: &mut BTreeSet<String>) {
-    if let Ok(value) = serde_json::from_str::<Value>(raw) {
-        walk_json_for_domains(&value, out);
-    } else {
-        for token in split_config_tokens(raw) {
-            accept_domain(&token, out);
-        }
-    }
-}
-
-fn walk_json_for_domains(value: &Value, out: &mut BTreeSet<String>) {
-    match value {
-        Value::String(value) => accept_domain(value, out),
-        Value::Array(values) => values.iter().for_each(|v| walk_json_for_domains(v, out)),
-        Value::Object(values) => values.values().for_each(|v| walk_json_for_domains(v, out)),
-        Value::Null | Value::Bool(_) | Value::Number(_) => {}
-    }
+/// Yield `(domain, values)` pairs from a typed answer table with each domain
+/// key normalized (lowercased, `*.`/dots trimmed). Empty keys are skipped.
+fn normalized_entries(
+    map: Option<&HashMap<String, Vec<String>>>,
+) -> impl Iterator<Item = (String, Vec<String>)> + '_ {
+    map.into_iter().flatten().filter_map(|(key, values)| {
+        let domain = normalize_domain(key);
+        (!domain.is_empty()).then(|| (domain, values.clone()))
+    })
 }
 
 fn accept_domain(value: &str, out: &mut BTreeSet<String>) {
@@ -735,12 +932,93 @@ fn split_config_tokens(value: &str) -> impl Iterator<Item = String> + '_ {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use hickory_proto::{
-        op::{Message as DnsMessage, MessageType, OpCode, Query},
-        rr::{Name, RecordType},
+        op::{Message as DnsMessage, MessageType, OpCode, Query, ResponseCode},
+        rr::{Name, RData, RecordType},
+    };
+    use rustylink_api::{CentralDns, IpNat, VpnConnResponse, models::vpn::VpnConnSetting};
+
+    use super::{
+        DYNAMIC_TTL, DnsConfig, DnsWireQuery, normalize_domain, parse_dns_endpoint,
+        parse_dns_question_domain,
     };
 
-    use super::{normalize_domain, parse_dns_endpoint, parse_dns_question_domain};
+    fn map(pairs: &[(&str, &[&str])]) -> HashMap<String, Vec<String>> {
+        pairs
+            .iter()
+            .map(|(key, values)| {
+                (
+                    (*key).to_string(),
+                    values.iter().map(|v| (*v).to_string()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    fn setting() -> VpnConnSetting {
+        VpnConnSetting {
+            vpn_mtu: 1400,
+            vpn_dns: Some("10.0.0.53".to_string()),
+            vpn_dns_backup: None,
+            vpn_dns_domain_split: None,
+            vpn_route_full: None,
+            vpn_route_split: None,
+            v6_route_full: None,
+            v6_route_split: None,
+            vpn_dynamic_domain_route_split: None,
+            v6_vpn_dynamic_domain_route_split: None,
+            vpn_wildcard_dynamic_domain_route_split: None,
+            suffix_wildcard_dynamic_domain_route_split: None,
+            dynamic_domain: None,
+            central_dns: None,
+            ip_nats: None,
+        }
+    }
+
+    fn conn(setting: VpnConnSetting) -> VpnConnResponse {
+        VpnConnResponse {
+            ip: "10.0.0.2".to_string(),
+            ipv6: None,
+            ip_mask: Some(24),
+            public_key: "server-public-key".to_string(),
+            preshared_key: None,
+            sign_token: None,
+            protocol_version: None,
+            setting,
+            raw: None,
+        }
+    }
+
+    fn query_payload(name: &str, record_type: RecordType) -> Vec<u8> {
+        let mut message = DnsMessage::new(0x1234, MessageType::Query, OpCode::Query);
+        message.add_query(Query::query(
+            Name::from_ascii(name).expect("valid name"),
+            record_type,
+        ));
+        message.to_vec().expect("serialize query")
+    }
+
+    fn wire_query(name: &str, record_type: RecordType) -> DnsWireQuery {
+        DnsWireQuery {
+            source: "10.0.0.2".parse().unwrap(),
+            destination: "10.0.0.53".parse().unwrap(),
+            source_port: 40000,
+            destination_port: 53,
+            domain: Some(normalize_domain(name)),
+            payload: query_payload(name, record_type),
+        }
+    }
+
+    fn answers(payload: &[u8]) -> Vec<RData> {
+        DnsMessage::from_vec(payload)
+            .expect("decode response")
+            .answers
+            .iter()
+            .map(|record| record.data.clone())
+            .collect()
+    }
 
     #[test]
     fn normalizes_dns_upstreams() {
@@ -770,15 +1048,158 @@ mod tests {
 
     #[test]
     fn parses_dns_question_domain() {
-        let mut message = DnsMessage::new(1, MessageType::Query, OpCode::Query);
-        message.add_query(Query::query(
-            Name::from_ascii("example.com.").unwrap(),
-            RecordType::A,
-        ));
-        let payload = message.to_vec().unwrap();
+        let payload = query_payload("example.com.", RecordType::A);
         assert_eq!(
             parse_dns_question_domain(&payload),
             Some("example.com".to_string())
         );
+    }
+
+    #[test]
+    fn dynamic_fields_do_not_leak_into_split_matchers() {
+        let mut s = setting();
+        s.vpn_dynamic_domain_route_split = Some(map(&[("intranet.corp", &["10.1.2.3"])]));
+        s.central_dns = Some(CentralDns {
+            tenant_id: "t".to_string(),
+            dns: vec!["10.0.0.9".to_string()],
+            ..CentralDns::default()
+        });
+        s.ip_nats = Some(vec![IpNat {
+            ips: vec!["10.0.0.0/8".to_string()],
+            nat_ip: "100.64.0.1".to_string(),
+            ..IpNat::default()
+        }]);
+        let config = DnsConfig::from_vpn_conn(&conn(s), None, false);
+        // The dynamic domain must not become a split matcher.
+        assert!(!config.matches_split("intranet.corp"));
+        // It must be answered from the dynamic table instead.
+        assert!(
+            config
+                .synthesize(&wire_query("intranet.corp.", RecordType::A))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn parses_central_dns_and_ip_nats() {
+        let mut s = setting();
+        s.central_dns = Some(CentralDns {
+            tenant_id: "tenant-1".to_string(),
+            dnat_ip: "100.64.0.1".to_string(),
+            dns: vec!["10.0.0.9".to_string()],
+            ..CentralDns::default()
+        });
+        s.ip_nats = Some(vec![IpNat {
+            ips: vec!["10.0.0.0/8".to_string(), "172.16.0.0/12".to_string()],
+            is_default_nat: true,
+            nat_ip: "100.64.0.1".to_string(),
+        }]);
+        let config = DnsConfig::from_vpn_conn(&conn(s), None, false);
+        let central = config.central_dns.expect("central_dns parsed");
+        assert_eq!(central.tenant_id, "tenant-1");
+        assert_eq!(central.dnat_ip, "100.64.0.1");
+        assert_eq!(config.ip_nats.len(), 1);
+        assert_eq!(config.ip_nats[0].ips.len(), 2);
+        assert!(config.ip_nats[0].is_default_nat);
+        assert_eq!(config.ip_nats[0].nat_ip, "100.64.0.1");
+    }
+
+    #[test]
+    fn synthesizes_exact_a_record_with_dynamic_ttl() {
+        let mut s = setting();
+        s.dynamic_domain = Some(map(&[("git.corp", &["10.9.9.9"])]));
+        let config = DnsConfig::from_vpn_conn(&conn(s), None, false);
+        let payload = config
+            .synthesize(&wire_query("git.corp.", RecordType::A))
+            .expect("synthesized");
+        let message = DnsMessage::from_vec(&payload).unwrap();
+        assert_eq!(message.metadata.message_type, MessageType::Response);
+        assert_eq!(message.metadata.response_code, ResponseCode::NoError);
+        let records = message.answers;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].ttl, DYNAMIC_TTL);
+        assert_eq!(
+            records[0].data.clone(),
+            RData::A("10.9.9.9".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn synthesizes_wildcard_and_suffix_matches() {
+        let mut s = setting();
+        s.vpn_wildcard_dynamic_domain_route_split = Some(map(&[("*.wild.corp", &["10.1.1.1"])]));
+        s.suffix_wildcard_dynamic_domain_route_split = Some(map(&[("suffix.corp", &["10.2.2.2"])]));
+        let config = DnsConfig::from_vpn_conn(&conn(s), None, false);
+
+        let wild = config
+            .synthesize(&wire_query("host.wild.corp.", RecordType::A))
+            .expect("wildcard synthesized");
+        assert_eq!(answers(&wild), vec![RData::A("10.1.1.1".parse().unwrap())]);
+
+        let suffix = config
+            .synthesize(&wire_query("deep.host.suffix.corp.", RecordType::A))
+            .expect("suffix synthesized");
+        assert_eq!(
+            answers(&suffix),
+            vec![RData::A("10.2.2.2".parse().unwrap())]
+        );
+    }
+
+    #[test]
+    fn aaaa_for_v4_only_domain_returns_nodata() {
+        let mut s = setting();
+        s.vpn_dynamic_domain_route_split = Some(map(&[("v4only.corp", &["10.3.3.3"])]));
+        let config = DnsConfig::from_vpn_conn(&conn(s), None, false);
+        let payload = config
+            .synthesize(&wire_query("v4only.corp.", RecordType::AAAA))
+            .expect("nodata response");
+        let message = DnsMessage::from_vec(&payload).unwrap();
+        assert_eq!(message.metadata.message_type, MessageType::Response);
+        assert_eq!(message.metadata.response_code, ResponseCode::NoError);
+        assert!(message.answers.is_empty());
+    }
+
+    #[test]
+    fn synthesizes_aaaa_from_v6_table() {
+        let mut s = setting();
+        s.v6_vpn_dynamic_domain_route_split = Some(map(&[("v6.corp", &["fd00::1"])]));
+        let config = DnsConfig::from_vpn_conn(&conn(s), None, false);
+        let payload = config
+            .synthesize(&wire_query("v6.corp.", RecordType::AAAA))
+            .expect("aaaa synthesized");
+        assert_eq!(
+            answers(&payload),
+            vec![RData::AAAA("fd00::1".parse().unwrap())]
+        );
+    }
+
+    #[test]
+    fn unmatched_domain_is_not_synthesized() {
+        let mut s = setting();
+        s.dynamic_domain = Some(map(&[("git.corp", &["10.9.9.9"])]));
+        let config = DnsConfig::from_vpn_conn(&conn(s), None, false);
+        assert!(
+            config
+                .synthesize(&wire_query("example.com.", RecordType::A))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn split_matchers_route_through_vpn() {
+        let mut s = setting();
+        s.vpn_dns_domain_split = Some(vec!["corp.example".to_string()]);
+        let config = DnsConfig::from_vpn_conn(&conn(s), None, false);
+        assert!(config.route_through_vpn(Some("corp.example")));
+        assert!(config.route_through_vpn(Some("host.corp.example")));
+        assert!(!config.route_through_vpn(Some("example.com")));
+        assert!(!config.route_through_vpn(None));
+    }
+
+    #[test]
+    fn full_tunnel_routes_everything_through_vpn() {
+        let config = DnsConfig::from_vpn_conn(&conn(setting()), None, true);
+        assert!(config.route_through_vpn(Some("anything.example")));
+        assert!(config.route_through_vpn(None));
     }
 }

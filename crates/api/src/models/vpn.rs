@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
 use strum::{Display, EnumIter, FromRepr};
@@ -252,51 +254,128 @@ where
     }
 }
 
-/// Deserialize an optional string, tolerating the server sending a non-string
-/// (e.g. a map for `vpn_dynamic_domain_route_split`). Mirrors the Android
-/// client's `optString`, which yields an empty/absent value for non-strings.
-fn deserialize_flexible_opt_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+/// Deserialize a field the server sends as a JSON value encoded inside a string
+/// (the Android client's `optString` then `json.Unmarshal` pattern), tolerating
+/// a few shapes: a JSON string whose contents are parsed as `T`, a native JSON
+/// value of `T`, or an absent/null/malformed value (yielding `None`). Lenient
+/// on purpose — a single bad field must not fail the whole `/vpn/conn` decode.
+fn deserialize_stringified_json<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
-    D: serde::Deserializer<'de>, {
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned, {
     use serde::Deserialize as _;
-    match Option::<serde_json::Value>::deserialize(deserializer)? {
-        Some(serde_json::Value::String(text)) => Ok(Some(text)),
-        _ => Ok(None),
-    }
+    Ok(
+        match Option::<serde_json::Value>::deserialize(deserializer)? {
+            Some(serde_json::Value::String(text)) => {
+                let text = text.trim();
+                (!text.is_empty())
+                    .then(|| serde_json::from_str(text).ok())
+                    .flatten()
+            }
+            Some(serde_json::Value::Null) | None => None,
+            Some(other) => serde_json::from_value(other).ok(),
+        },
+    )
+}
+
+/// Structured central DNS / DNAT policy carried in
+/// [`VpnConnSetting::central_dns`].
+///
+/// NOTE: the bloom-filter DNS matching path (`second_bloom`/`third_bloom`) is
+/// not implemented yet; this is parsed and stored for completeness. The
+/// false-positive-rate field is intentionally omitted until then (it is an
+/// `f64`, which would break this type's `Eq`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CentralDns {
+    #[serde(rename = "TenantID")]
+    pub tenant_id: String,
+    #[serde(rename = "CpeID")]
+    pub cpe_id: i64,
+    #[serde(rename = "DNATIp")]
+    pub dnat_ip: String,
+    #[serde(rename = "Dns")]
+    pub dns: Vec<String>,
+    #[serde(rename = "SecondBloom")]
+    pub second_bloom: String,
+    #[serde(rename = "ThirdBloom")]
+    pub third_bloom: String,
+    #[serde(rename = "BloomNum")]
+    pub bloom_num: i64,
+    #[serde(rename = "Version")]
+    pub version: String,
+}
+
+/// One NAT route-match rule carried in [`VpnConnSetting::ip_nats`].
+///
+/// NOTE: IP-NAT rewriting is not implemented yet; rules are parsed and stored
+/// only.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IpNat {
+    /// CIDR selectors the rule matches against.
+    #[serde(rename = "ips", alias = "IPs")]
+    pub ips: Vec<String>,
+    #[serde(rename = "is_default_nat", alias = "IsDefaultNat")]
+    pub is_default_nat: bool,
+    /// Translation target IP.
+    #[serde(rename = "nat_ip", alias = "NatIP")]
+    pub nat_ip: String,
 }
 
 #[skip_serializing_none]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VpnConnSetting {
     pub vpn_mtu: i32,
+    /// Primary VPN DNS resolver upstream(s).
     #[serde(default)]
     pub vpn_dns: Option<String>,
+    /// Backup VPN DNS resolver upstream(s).
     #[serde(default)]
     pub vpn_dns_backup: Option<String>,
+    /// Split-tunnel domain list: names routed through the VPN resolver.
     #[serde(default)]
     pub vpn_dns_domain_split: Option<Vec<String>>,
+    /// IPv4 tunnel route CIDRs (full-tunnel mode).
     #[serde(default)]
     pub vpn_route_full: Option<Vec<String>>,
+    /// IPv4 tunnel route CIDRs (split-tunnel mode).
     #[serde(default)]
     pub vpn_route_split: Option<Vec<String>>,
+    /// IPv6 tunnel route CIDRs (full-tunnel mode).
     #[serde(default)]
     pub v6_route_full: Option<Vec<String>>,
+    /// IPv6 tunnel route CIDRs (split-tunnel mode).
     #[serde(default)]
     pub v6_route_split: Option<Vec<String>>,
-    #[serde(default, deserialize_with = "deserialize_flexible_opt_string")]
-    pub vpn_dynamic_domain_route_split: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_flexible_opt_string")]
-    pub v6_vpn_dynamic_domain_route_split: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_flexible_opt_string")]
-    pub vpn_wildcard_dynamic_domain_route_split: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_flexible_opt_string")]
-    pub suffix_wildcard_dynamic_domain_route_split: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_flexible_opt_string")]
-    pub dynamic_domain: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_flexible_opt_string")]
-    pub central_dns: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_flexible_opt_string")]
-    pub ip_nats: Option<String>,
+    /// Dynamic-domain answer table (IPv4): `domain -> [ip]`. NOT a split-domain
+    /// list — matched names are answered directly from the table. The server
+    /// encodes the map as a JSON string.
+    #[serde(default, deserialize_with = "deserialize_stringified_json")]
+    pub vpn_dynamic_domain_route_split: Option<HashMap<String, Vec<String>>>,
+    /// Dynamic-domain answer table (IPv6); see
+    /// [`Self::vpn_dynamic_domain_route_split`].
+    #[serde(default, deserialize_with = "deserialize_stringified_json")]
+    pub v6_vpn_dynamic_domain_route_split: Option<HashMap<String, Vec<String>>>,
+    /// Wildcard dynamic-domain answer table (IPv4).
+    #[serde(default, deserialize_with = "deserialize_stringified_json")]
+    pub vpn_wildcard_dynamic_domain_route_split: Option<HashMap<String, Vec<String>>>,
+    /// Suffix-wildcard dynamic-domain answer table (IPv4).
+    #[serde(default, deserialize_with = "deserialize_stringified_json")]
+    pub suffix_wildcard_dynamic_domain_route_split: Option<HashMap<String, Vec<String>>>,
+    /// Top-level dynamic-domain answer table (IPv4); merged with
+    /// [`Self::vpn_dynamic_domain_route_split`] into the exact answer map.
+    #[serde(default, deserialize_with = "deserialize_stringified_json")]
+    pub dynamic_domain: Option<HashMap<String, Vec<String>>>,
+    /// Structured central DNS / DNAT policy (the server encodes the object as a
+    /// JSON string). The bloom-filter DNS matching it describes is not yet
+    /// implemented.
+    #[serde(default, deserialize_with = "deserialize_stringified_json")]
+    pub central_dns: Option<CentralDns>,
+    /// NAT route-match rules (the server encodes the array as a JSON string).
+    /// IP-NAT rewriting is not yet implemented.
+    #[serde(default, deserialize_with = "deserialize_stringified_json")]
+    pub ip_nats: Option<Vec<IpNat>>,
 }
 
 #[cfg(test)]
@@ -332,5 +411,67 @@ mod tests {
             .expect("decode object payload");
         serde_json::from_str::<Response>(r#"{"code":0,"data":"success"}"#)
             .expect("decode string payload");
+    }
+
+    fn setting_from(json: serde_json::Value) -> VpnConnSetting {
+        serde_json::from_value(json).expect("decode VpnConnSetting")
+    }
+
+    #[test]
+    fn parses_dynamic_domain_table_from_stringified_json() {
+        let setting = setting_from(serde_json::json!({
+            "vpn_mtu": 1400,
+            "vpn_dynamic_domain_route_split": "{\"intranet.corp\":[\"10.1.2.3\"]}",
+        }));
+        let table = setting
+            .vpn_dynamic_domain_route_split
+            .expect("table parsed");
+        assert_eq!(
+            table.get("intranet.corp").map(Vec::as_slice),
+            Some(["10.1.2.3".to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn parses_dynamic_domain_table_from_native_object() {
+        // Tolerate the server sending a real JSON object instead of a string.
+        let setting = setting_from(serde_json::json!({
+            "vpn_mtu": 1400,
+            "dynamic_domain": {"git.corp": ["10.9.9.9"]},
+        }));
+        let table = setting.dynamic_domain.expect("table parsed");
+        assert_eq!(table.len(), 1);
+        assert!(table.contains_key("git.corp"));
+    }
+
+    #[test]
+    fn parses_central_dns_and_ip_nats_from_stringified_json() {
+        let setting = setting_from(serde_json::json!({
+            "vpn_mtu": 1400,
+            "central_dns": "{\"TenantID\":\"tenant-1\",\"DNATIp\":\"100.64.0.1\",\"Dns\":[\"10.0.0.9\"]}",
+            "ip_nats": "[{\"ips\":[\"10.0.0.0/8\"],\"is_default_nat\":true,\"nat_ip\":\"100.64.0.1\"}]",
+        }));
+        let central = setting.central_dns.expect("central_dns parsed");
+        assert_eq!(central.tenant_id, "tenant-1");
+        assert_eq!(central.dnat_ip, "100.64.0.1");
+        assert_eq!(central.dns, vec!["10.0.0.9".to_string()]);
+        let ip_nats = setting.ip_nats.expect("ip_nats parsed");
+        assert_eq!(ip_nats.len(), 1);
+        assert_eq!(ip_nats[0].ips, vec!["10.0.0.0/8".to_string()]);
+        assert!(ip_nats[0].is_default_nat);
+        assert_eq!(ip_nats[0].nat_ip, "100.64.0.1");
+    }
+
+    #[test]
+    fn malformed_and_empty_dnat_fields_become_none() {
+        let setting = setting_from(serde_json::json!({
+            "vpn_mtu": 1400,
+            "central_dns": "not json",
+            "ip_nats": "",
+            "dynamic_domain": null,
+        }));
+        assert!(setting.central_dns.is_none());
+        assert!(setting.ip_nats.is_none());
+        assert!(setting.dynamic_domain.is_none());
     }
 }

@@ -7,7 +7,8 @@ pub mod session;
 pub mod transport;
 
 pub use dns::{
-    DnsHijackPlan, DnsQueryTransport, DnsResolver, LivenessProbe, UdpDnsTransport, VpnTun,
+    DnsConfig, DnsQueryTransport, DnsResolver, DynamicDomainTables, LivenessProbe, UdpDnsTransport,
+    VpnTun,
 };
 pub use error::{Error, Result};
 pub use outbound::BoundUdpSocketFactory;

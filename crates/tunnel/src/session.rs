@@ -18,8 +18,8 @@ use snafu::prelude::*;
 use url::{Host, Url};
 
 use crate::{
-    BoundUdpSocketFactory, DnsHijackPlan, DnsQueryTransport, DnsResolver,
-    FeilianTcpTransportFactory, LivenessProbe, UdpDnsTransport, VpnTun,
+    BoundUdpSocketFactory, DnsConfig, DnsQueryTransport, DnsResolver, FeilianTcpTransportFactory,
+    LivenessProbe, UdpDnsTransport, VpnTun,
     route::{self, AppliedRoutes, VpnRouteMode},
 };
 
@@ -114,7 +114,7 @@ pub struct LocalTunnelParams {
     pub local_dns: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug)]
 pub struct TunnelConfig {
     pub interface_name: String,
     pub local_addr: String,
@@ -133,7 +133,7 @@ pub struct TunnelConfig {
     pub routes: Vec<IpNetwork>,
     pub full_tunnel: bool,
     pub ipv6_enabled: bool,
-    pub dns_plan: DnsHijackPlan,
+    pub dns: DnsConfig,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -192,11 +192,12 @@ impl TunnelConfig {
             }
             .fail();
         }
-        let dns_plan = DnsHijackPlan::from_vpn_conn(conn, local_params.local_dns.as_deref());
         let ipv6_enabled = conn
             .ipv6
             .as_deref()
             .is_some_and(|value| !value.trim().is_empty());
+        let full_tunnel = matches!(route_mode, VpnRouteMode::Full);
+        let dns = DnsConfig::from_vpn_conn(conn, local_params.local_dns.as_deref(), full_tunnel);
         let routes =
             route::networks_from_vpn_conn(conn, route_mode, ipv6_enabled).context(RouteSnafu)?;
         tracing::info!(
@@ -221,9 +222,9 @@ impl TunnelConfig {
             protocol_version: conn.protocol_version.clone(),
             outbound_interface: None,
             routes,
-            full_tunnel: matches!(route_mode, VpnRouteMode::Full),
+            full_tunnel,
             ipv6_enabled,
-            dns_plan,
+            dns,
         })
     }
 }
@@ -286,24 +287,31 @@ impl TunnelSession {
     /// racing the OS routing table; `VpnTun` skips hijacking these forwards
     /// via its `dst ∈ vpn_dns_ips` check (otherwise the resolver would catch
     /// its own traffic and loop indefinitely).
-    fn build_vpn_tun(
+    async fn build_vpn_tun(
         &self, tun_device: tun_rs::AsyncDevice, directed_dialer: &Dialer, routed_dialer: &Dialer,
         system_servers: &[std::net::IpAddr],
-    ) -> Result<(VpnTun, Arc<dyn DnsQueryTransport>)> {
+    ) -> Result<(
+        VpnTun,
+        Arc<dyn DnsQueryTransport>,
+        Vec<std::net::SocketAddr>,
+    )> {
         let directed_dns: Arc<dyn DnsQueryTransport> =
             Arc::new(UdpDnsTransport::new(directed_dialer.clone()));
         let routed_dns: Arc<dyn DnsQueryTransport> =
             Arc::new(UdpDnsTransport::new(routed_dialer.clone()));
+        // Pre-resolve the VPN resolver endpoints once (shared by the resolver
+        // and the liveness probe) so hijacked queries never re-resolve.
+        let vpn_servers = self.config.dns.resolve_vpn_servers().await;
         let resolver = DnsResolver::build(
-            &self.config.dns_plan,
-            self.config.full_tunnel,
+            self.config.dns.clone(),
+            vpn_servers.clone(),
             system_servers,
             directed_dns,
             routed_dns.clone(),
         )
         .map(Arc::new);
         let tun = VpnTun::new(tun_device, resolver).context(TunCreateSnafu)?;
-        Ok((tun, routed_dns))
+        Ok((tun, routed_dns, vpn_servers))
     }
 
     async fn start_inner(&mut self) -> Result<()> {
@@ -318,7 +326,7 @@ impl TunnelSession {
             protocol_version = ?self.config.protocol_version,
             full_tunnel = self.config.full_tunnel,
             vpn_routes = self.config.routes.len(),
-            split_domain_rules = self.config.dns_plan.split_domains.len(),
+            split_domain_rules = self.config.dns.split_matcher_count(),
             "selected tunnel runtime options"
         );
         let private_key = StaticSecret::from(decode_key(
@@ -371,8 +379,9 @@ impl TunnelSession {
             .context(RouteSnafu)?;
         self.routes = Some(routes);
         self.status = TunnelStatus::RoutesApplied;
-        let (tun, routed_dns) =
-            self.build_vpn_tun(tun_device, ctx.directed(), ctx.routed(), &system_servers)?;
+        let (tun, routed_dns, vpn_servers) = self
+            .build_vpn_tun(tun_device, ctx.directed(), ctx.routed(), &system_servers)
+            .await?;
         let device = match self.config.protocol_mode {
             ProtocolMode::Udp => {
                 let builder = DeviceBuilder::new()
@@ -396,10 +405,7 @@ impl TunnelSession {
             }
         };
         self.device = Some(device);
-        self.probe = Some(LivenessProbe::start(
-            routed_dns,
-            self.config.dns_plan.vpn_servers.clone(),
-        ));
+        self.probe = Some(LivenessProbe::start(routed_dns, vpn_servers));
         self.status = TunnelStatus::Running;
         tracing::info!(
             interface = %self.config.interface_name,
