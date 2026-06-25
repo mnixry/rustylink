@@ -15,6 +15,10 @@
       url = "github:numtide/treefmt-nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    pnpm2nix = {
+      url = "github:wrvsrx/pnpm2nix-nzbr/adapt-to-v9";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
     crane.url = "github:ipetkov/crane";
   };
 
@@ -33,7 +37,10 @@
         let
           pkgs = import inputs.nixpkgs {
             inherit system;
-            overlays = [ (import inputs.rust-overlay) ];
+            overlays = [
+              (import inputs.rust-overlay)
+              inputs.pnpm2nix.overlays.default
+            ];
           };
           rust = pkgs.rust-bin.stable.latest.default.override {
             extensions = [
@@ -46,7 +53,10 @@
           craneCommonArgs = rec {
             src = ./.;
             inherit (craneLib.crateNameFromCargoToml { inherit src; }) version;
-            nativeBuildInputs = [ ];
+            nativeBuildInputs = with pkgs; [
+              protobuf
+              buf
+            ];
             strictDeps = true;
             cargoVendorDir = craneLib.vendorMultipleCargoDeps {
               inherit (craneLib.findCargoFiles src) cargoConfigs;
@@ -124,13 +134,20 @@
             );
           };
 
-          packages.default = craneLib.buildPackage (
-            craneCommonArgs
-            // {
-              inherit cargoArtifacts;
-              doCheck = false;
-            }
-          );
+          packages = rec {
+            frontend = pkgs.callPackage ./ui { inherit inputs; };
+            daemon = craneLib.buildPackage (
+              craneCommonArgs
+              // {
+                inherit cargoArtifacts;
+                prePatch = ''
+                  ln -s ${frontend} ./ui/dist
+                '';
+                doCheck = false;
+              }
+            );
+            default = daemon;
+          };
         };
     };
 }
