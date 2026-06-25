@@ -16,10 +16,9 @@ mod latency;
 mod persist;
 mod service;
 mod state;
-#[cfg(feature = "embed-ui")]
-mod static_assets;
 mod supervisor;
 mod token;
+mod ui;
 
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -36,7 +35,7 @@ use snafu::prelude::*;
 use tower::ServiceBuilder;
 use tower_http::{
     cors::CorsLayer,
-    request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
+    request_id::{MakeRequestUuid, PropagateRequestIdLayer, RequestId, SetRequestIdLayer},
     trace::TraceLayer,
     validate_request::ValidateRequestHeaderLayer,
 };
@@ -62,18 +61,57 @@ struct Args {
     /// Log filter in `tracing` `EnvFilter` syntax, e.g.
     /// `info,rustylink_tunnel=trace,gotatun=debug`. Reads `RUST_LOG` when the
     /// flag is omitted; defaults to `debug` in debug builds, `info` in release.
-    #[arg(long, env = "RUST_LOG", default_value_t = default_log_level())]
+    #[arg(long, env = "RUST_LOG", default_value = default_log_level())]
     log_level: String,
 }
 
 /// Default log filter: verbose in debug builds, quiet in release. Overridden by
 /// `--log-level` or `RUST_LOG`.
-fn default_log_level() -> String {
+fn default_log_level() -> &'static str {
     if cfg!(debug_assertions) {
-        "debug".to_owned()
+        "debug"
     } else {
-        "info".to_owned()
+        "info"
     }
+}
+
+/// Fatal errors raised while starting the daemon, before the RPC server begins
+/// serving. Surfaced from `main` via [`snafu::Report`] (`#[snafu::report]`) for
+/// a clean, fully-sourced error stack instead of a `Box<dyn Error>` debug dump.
+#[derive(Debug, Snafu)]
+enum InitError {
+    #[snafu(display("failed to load daemon config from {}: {source}", path.display()))]
+    LoadConfig {
+        path: PathBuf,
+        source: persist::Error,
+    },
+
+    #[snafu(display("failed to parse log level {log_level:?}: {source}"))]
+    LogLevelParse {
+        log_level: String,
+        source: tracing_subscriber::filter::ParseError,
+    },
+
+    #[snafu(display("failed to save daemon config to {}: {source}", path.display()))]
+    SaveConfig {
+        path: PathBuf,
+        source: persist::Error,
+    },
+
+    #[snafu(display("failed to load credentials from {}: {source}", path.display()))]
+    LoadCredentials {
+        path: PathBuf,
+        source: persist::Error,
+    },
+
+    #[snafu(display("failed to bind the RPC listener to {listen}: {source}"))]
+    BindListener {
+        listen: SocketAddr,
+        source: std::io::Error,
+    },
+
+    #[snafu(display("the RPC server terminated unexpectedly: {source}"))]
+    Serve { source: std::io::Error },
 }
 
 #[snafu::report]
@@ -81,14 +119,12 @@ fn default_log_level() -> String {
 async fn main() -> Result<(), InitError> {
     let args = Args::parse();
 
-    // `--log-level` / `RUST_LOG` (full EnvFilter syntax) gates both our
-    // `tracing` events and gotatun's `log` records (bridged via
-    // tracing-subscriber's `tracing-log` feature). Falls back to the cfg-based
-    // default on an invalid directive.
-    let filter =
-        EnvFilter::try_new(&args.log_level).unwrap_or_else(|_| EnvFilter::new(default_log_level()));
     fmt()
-        .with_env_filter(filter)
+        .with_env_filter(
+            EnvFilter::try_new(&args.log_level).context(LogLevelParseSnafu {
+                log_level: args.log_level.clone(),
+            })?,
+        )
         .with_writer(std::io::stderr)
         .init();
 
@@ -165,36 +201,29 @@ async fn main() -> Result<(), InitError> {
             .layer(ValidateRequestHeaderLayer::bearer(&token)),
     );
 
-    let app = axum::Router::new().nest("/api", api);
-
-    // Serve the embedded SPA at `/` (with SPA-fallback) when built with the
-    // `embed-ui` feature. Without it, the daemon serves `/api` only and the UI
-    // is served by the Vite dev server (which proxies `/api`).
-    #[cfg(feature = "embed-ui")]
-    let app = app.fallback(static_assets::handler);
-
-    // Outer layers wrap everything: stamp a request id, open a tracing span
-    // carrying it, then echo the id on the way out.
-    let app = app.layer(
-        ServiceBuilder::new()
-            .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
-            .layer(
-                TraceLayer::new_for_http().make_span_with(|request: &axum::extract::Request| {
-                    let request_id = request
-                        .headers()
-                        .get("x-request-id")
-                        .and_then(|value| value.to_str().ok())
-                        .unwrap_or_default();
-                    tracing::info_span!(
-                        "request",
-                        method = %request.method(),
-                        uri = %request.uri(),
-                        request_id,
-                    )
-                }),
-            )
-            .layer(PropagateRequestIdLayer::x_request_id()),
-    );
+    let app = axum::Router::new()
+        .nest("/api", api)
+        .fallback(ui::handler)
+        .layer(
+            ServiceBuilder::new()
+                .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
+                .layer(TraceLayer::new_for_http().make_span_with(
+                    |request: &axum::extract::Request| {
+                        let request_id = request
+                            .extensions()
+                            .get::<RequestId>()
+                            .and_then(|value| value.header_value().to_str().ok())
+                            .unwrap_or_default();
+                        tracing::info_span!(
+                            "request",
+                            method = %request.method(),
+                            uri = %request.uri(),
+                            request_id,
+                        )
+                    },
+                ))
+                .layer(PropagateRequestIdLayer::x_request_id()),
+        );
 
     let listener = tokio::net::TcpListener::bind(args.listen)
         .await
@@ -275,37 +304,4 @@ async fn shutdown_signal() {
         () = ctrl_c => tracing::info!("received SIGINT"),
         () = terminate => tracing::info!("received SIGTERM"),
     }
-}
-
-/// Fatal errors raised while starting the daemon, before the RPC server begins
-/// serving. Surfaced from `main` via [`snafu::Report`] (`#[snafu::report]`) for
-/// a clean, fully-sourced error stack instead of a `Box<dyn Error>` debug dump.
-#[derive(Debug, Snafu)]
-enum InitError {
-    #[snafu(display("failed to load daemon config from {}: {source}", path.display()))]
-    LoadConfig {
-        path: PathBuf,
-        source: persist::Error,
-    },
-
-    #[snafu(display("failed to save daemon config to {}: {source}", path.display()))]
-    SaveConfig {
-        path: PathBuf,
-        source: persist::Error,
-    },
-
-    #[snafu(display("failed to load credentials from {}: {source}", path.display()))]
-    LoadCredentials {
-        path: PathBuf,
-        source: persist::Error,
-    },
-
-    #[snafu(display("failed to bind the RPC listener to {listen}: {source}"))]
-    BindListener {
-        listen: SocketAddr,
-        source: std::io::Error,
-    },
-
-    #[snafu(display("the RPC server terminated unexpectedly: {source}"))]
-    Serve { source: std::io::Error },
 }

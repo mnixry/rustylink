@@ -7,11 +7,6 @@ version.workspace = true
 name = "rustylinkd"
 path = "src/main.rs"
 
-[features]
-# Embed the built web UI (ui/dist) into the binary and serve it from axum.
-# Build the UI first (`pnpm -C ui build`), then `cargo build -p rustylinkd --features embed-ui`.
-embed-ui = ["dep:rust-embed", "dep:mime_guess"]
-
 [dependencies]
 rustylink-api.path      = "../api"
 rustylink-core.path     = "../core"
@@ -30,9 +25,8 @@ dirs.workspace                  = true
 hex.workspace                   = true
 http.workspace                  = true
 jiff.workspace                  = true
-mime_guess                      = { workspace = true, optional = true }
 rand.workspace                  = true
-rust-embed                      = { workspace = true, optional = true }
+rust-embed.workspace            = true
 serde.workspace                 = true
 serde_json.workspace            = true
 snafu.workspace                 = true
