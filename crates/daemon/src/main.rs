@@ -142,7 +142,7 @@ async fn main() -> Result<(), InitError> {
     // Build three service implementations.
     let auth_svc = AuthServiceImpl::new(daemon.clone());
     let vpn_svc = VpnServiceImpl::new(daemon.clone());
-    let meta_svc = MetaServiceImpl::new(daemon);
+    let meta_svc = MetaServiceImpl::new(daemon.clone());
 
     // Register all three services with the Connect router.
     let router = ConnectRouter::new();
@@ -209,6 +209,16 @@ async fn main() -> Result<(), InitError> {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context(ServeSnafu)?;
+
+    // Graceful tunnel teardown: cancel the supervise task, await it, and
+    // clean up OS state (routes, route-bypass rules, WireGuard device).
+    // Without this, a signal-initiated shutdown leaks /1 routes and scoped
+    // default routes in the OS routing table.
+    tracing::info!("shutting down tunnel...");
+    match daemon.disconnect_tunnel().await {
+        Ok(_) => tracing::info!("tunnel teardown complete"),
+        Err(e) => tracing::warn!(%e, "tunnel teardown failed"),
+    }
 
     tracing::info!("shutdown complete");
     Ok(())

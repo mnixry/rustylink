@@ -64,7 +64,15 @@
             { ... }:
             {
               projectRootFile = ".git/config";
+              settings.excludes = [ "**/pnpm-lock.yaml" ];
               programs.buf.enable = true;
+              programs.biome = {
+                enable = true;
+                settings = (lib.importJSON ./biome.json) // {
+                  vcs.enabled = false;
+                };
+                validate.enable = false;
+              };
               programs.nixfmt.enable = true;
               programs.taplo.enable = true;
               programs.rustfmt = {

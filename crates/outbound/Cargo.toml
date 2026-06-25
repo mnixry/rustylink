@@ -4,7 +4,7 @@ name              = "rustylink-outbound"
 version.workspace = true
 
 [dependencies]
-async-trait.workspace       = true
+async-trait.workspace      = true
 default-net.workspace      = true
 hickory-proto.workspace    = true
 hickory-resolver.workspace = true
@@ -22,9 +22,9 @@ tracing.workspace          = true
 windows-sys = { version = "0.59", features = ["Win32_Networking_WinSock"] }
 
 [dev-dependencies]
-http-body-util = "0.1"
-hyper = { workspace = true, features = ["server"] }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+http-body-util  = "0.1"
+hyper           = { workspace = true, features = ["server"] }
+tokio.workspace = true
 
 [lints]
 workspace = true
