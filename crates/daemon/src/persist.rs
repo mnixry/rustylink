@@ -232,10 +232,8 @@ pub struct PersistedTotpConfig {
 pub struct PersistedVpnRequest {
     /// VPN connect mode name (e.g. `"Full"`, `"Split"`).
     pub mode: String,
-    /// Export ID for the connection.
-    pub export_id: i32,
-    /// Preferred dot ID, if any.
-    pub preferred_dot_id: Option<i32>,
+    /// Chosen location (dot) id, or `None` for Auto.
+    pub location_id: Option<i32>,
     /// Caller-requested `WireGuard` transport (UDP or `FeiLian` TCP).
     pub protocol_mode: rustylink_api::ProtocolMode,
     /// Whether this is a reconnect attempt.

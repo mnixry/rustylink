@@ -524,8 +524,7 @@ impl VpnMachine {
             .current_request()
             .map(|request| crate::persist::PersistedVpnRequest {
                 mode: request.mode.to_string(),
-                export_id: request.export_id,
-                preferred_dot_id: request.preferred_dot_id,
+                location_id: request.location_id,
                 protocol_mode: request.protocol_mode,
                 reconnect: request.reconnect,
             })
@@ -652,8 +651,8 @@ fn vpn_mode_to_proto(mode: VpnConnectMode) -> pb::VpnMode {
 /// foreign (core) type.
 #[must_use]
 pub fn vpn_request_from_proto(
-    mode: Option<pb::VpnMode>, protocol_mode: Option<pb::ProtocolMode>, export_id: i32,
-    preferred_dot_id: Option<i32>, otp: Option<&str>, reconnect: bool,
+    mode: Option<pb::VpnMode>, protocol_mode: Option<pb::ProtocolMode>, location_id: Option<i32>,
+    otp: Option<&str>, reconnect: bool,
 ) -> VpnRequest {
     let mode = match mode {
         Some(pb::VpnMode::Split) => VpnConnectMode::Split,
@@ -661,8 +660,7 @@ pub fn vpn_request_from_proto(
     };
     VpnRequest {
         mode,
-        export_id,
-        preferred_dot_id,
+        location_id: location_id.filter(|id| *id > 0),
         otp: otp.filter(|s| !s.is_empty()).map(ToOwned::to_owned),
         reconnect,
         protocol_mode: protocol_mode_to_api(protocol_mode),

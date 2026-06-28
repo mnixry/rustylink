@@ -6,8 +6,6 @@ use strum::{Display, EnumIter, FromRepr};
 
 use super::{BaseResponse, JsonObject};
 
-pub type VpnExportInfo = JsonObject;
-
 /// `WireGuard` transport choice for the tunnel: native UDP or the `FeiLian`
 /// TCP framing.
 ///
@@ -52,7 +50,6 @@ pub struct VpnSetting {
     #[serde(rename = "vpn_enable", alias = "enable")]
     pub enable: Option<bool>,
     pub mode: Option<String>,
-    pub export_id: Option<i32>,
     #[serde(rename = "vpn_split_only", alias = "vpnSplitOnly")]
     pub split_only: Option<bool>,
     #[serde(rename = "vpn_status", alias = "vpnStatus")]
@@ -64,22 +61,6 @@ pub struct VpnSetting {
     /// (Android: `VpnSettingBean.vpn_domain`, used by the dot hostname
     /// verifier.)
     pub vpn_domain: Option<String>,
-    pub raw: Option<JsonObject>,
-}
-
-#[skip_serializing_none]
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct VpnLocation {
-    pub name: Option<String>,
-    pub ip: Option<String>,
-    pub r#type: Option<String>,
-    #[serde(rename = "isAuto", alias = "is_auto")]
-    pub is_auto: Option<bool>,
-    #[serde(rename = "currentDotBean", alias = "current_dot_bean")]
-    pub current_dot_bean: Option<VpnDot>,
-    #[serde(rename = "vpnDotBeans", alias = "vpn_dot_beans")]
-    pub vpn_dot_beans: Option<Vec<VpnDot>>,
     pub raw: Option<JsonObject>,
 }
 
@@ -167,16 +148,6 @@ pub struct VpnPingRequest;
 
 impl_empty_request!(VpnPingRequest, GET, "/vpn/ping", BaseResponse<JsonObject>);
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct GetVpnExportsRequest;
-
-impl_empty_request!(
-    GetVpnExportsRequest,
-    GET,
-    "/vpn/export",
-    BaseResponse<VpnExportListInfo>
-);
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VpnReportRequest {
     pub r#type: String,
@@ -209,13 +180,6 @@ impl VpnReportType {
     pub fn wire(self) -> String {
         (self as i32).to_string()
     }
-}
-
-#[skip_serializing_none]
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct VpnExportListInfo {
-    pub exports: Option<Vec<VpnExportInfo>>,
 }
 
 #[skip_serializing_none]

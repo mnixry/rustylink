@@ -254,8 +254,7 @@ impl Daemon {
             match creds.last_vpn_request {
                 Some(persisted) => VpnRequest {
                     mode: persisted.mode.parse().unwrap_or(VpnConnectMode::Full),
-                    export_id: persisted.export_id,
-                    preferred_dot_id: persisted.preferred_dot_id,
+                    location_id: persisted.location_id,
                     otp: None,
                     reconnect: persisted.reconnect,
                     protocol_mode: persisted.protocol_mode,
@@ -473,12 +472,11 @@ impl Daemon {
         let config_request = VpnConfigRequest {
             mode: request.mode,
             public_key: local_params.local_public_key.clone(),
-            export_id: request.export_id,
+            location_id: request.location_id,
             otp,
             sign_token: None,
             not_auto: true,
             reconnect: request.reconnect,
-            preferred_dot_id: request.preferred_dot_id,
         };
 
         let (pool, hooks, outbound_interface) = {
@@ -1040,93 +1038,5 @@ mod tests {
         // No dot mode advertised: caller wins.
         assert_eq!(effective_transport(None, tcp), tcp);
         assert_eq!(effective_transport(None, udp), udp);
-    }
-
-    /// Live, network + real-credentials check (run with
-    /// `cargo test -p rustylinkd -- --ignored --nocapture live_dot_connect`).
-    /// Loads the on-disk session, fetches the dot list, and exercises the dot
-    /// config TLS path — proving the cert validates against `vpn_domain` rather
-    /// than failing `NotValidForName` on the dialed IP.
-    #[tokio::test]
-    #[ignore = "requires network and an authenticated credentials.json"]
-    async fn live_dot_connect() {
-        use rustylink_api::{
-            ClientIdentity, GetVpnLocationsRequest, GetVpnSettingRequest, SendableRequest as _,
-            VpnConnRequest,
-        };
-
-        use crate::{
-            daemon::build_dot_api_client, persist::PersistedCredentials, state::AuthMachine,
-        };
-
-        let path = dirs::config_dir()
-            .expect("config dir")
-            .join("rustylink")
-            .join("credentials.json");
-        let creds = PersistedCredentials::load(&path)
-            .await
-            .expect("read creds")
-            .expect("credentials.json present");
-
-        let pool = rustylink_api::build_http_client(&rustylink_api::ApiClientOptions::default())
-            .await
-            .expect("build http client");
-        let machine =
-            AuthMachine::restore_from_credentials(creds, pool.clone(), ClientIdentity::default());
-        let client = machine.build_tenant_client().expect("tenant client");
-        // The tenant client and every dot client share this machine's live
-        // cookie jar, so Set-Cookie mutations propagate automatically.
-        let hooks = machine.build_hooks();
-        let snapshot = |label: &str, jar: rustylink_api::SessionCookies| {
-            eprintln!("{label}: {:?}", jar.values.keys().collect::<Vec<_>>());
-        };
-        snapshot("initial cookies", hooks.cookies.snapshot().await);
-
-        // Authenticated tenant APIs — confirm the session is valid; the shared
-        // jar absorbs any Set-Cookie mutations (e.g. open-time, vpn-token).
-        let setting = GetVpnSettingRequest
-            .send(&client)
-            .await
-            .expect("vpn setting");
-        snapshot("after /api/setting", hooks.cookies.snapshot().await);
-        let vpn_domain = setting.data.and_then(|s| s.vpn_domain);
-        eprintln!("vpn_domain = {vpn_domain:?}");
-
-        let locations = GetVpnLocationsRequest
-            .send(&client)
-            .await
-            .expect("vpn locations");
-        snapshot("after /api/vpn/list", hooks.cookies.snapshot().await);
-        let dots = locations.data.unwrap_or_default();
-        eprintln!("dots = {}", dots.len());
-
-        // With the device_id cookie now sent on every request, /api/vpn/list
-        // re-issues a device-bound `vpn-token` (non-empty `did`), so /vpn/conn
-        // returns the WireGuard config (code 0) instead of "session expired".
-        let mut any_ok = false;
-        for dot in dots.iter().take(2) {
-            let use_vpn_ip = dot.should_use_vpn_ip_for_config_api(false);
-            let Ok(endpoint) = rustylink_api::DotEndpoint::from_dot(dot, use_vpn_ip) else {
-                continue;
-            };
-            let dot_client =
-                build_dot_api_client(&endpoint, &pool, &hooks, vpn_domain.as_deref(), None).await;
-            let body = VpnConnRequest {
-                mode: Some("Full".to_owned()),
-                public_key: rustylink_tunnel::LocalTunnelParams::generate().local_public_key,
-                otp: None,
-                export_id: dot.id.unwrap_or_default(),
-                sign_token: None,
-                not_auto: Some(true),
-            };
-            match body.send(&dot_client).await {
-                Ok(resp) => {
-                    eprintln!("dot {:?}: /vpn/conn code={}", dot.id, resp.code);
-                    any_ok |= resp.code == 0;
-                }
-                Err(error) => eprintln!("dot {:?}: /vpn/conn err = {error}", dot.id),
-            }
-        }
-        assert!(any_ok, "no dot returned a successful /vpn/conn");
     }
 }

@@ -27,7 +27,6 @@ import { Switch } from "@/components/ui/switch"
 import {
   connectTunnel,
   listVpnLocations,
-  probeDotLatency,
 } from "@/gen/rustylink/daemon/v1/daemon-VpnService_connectquery"
 import type { VpnLocation } from "@/gen/rustylink/daemon/v1/tunnel_pb"
 import { ProtocolMode, VpnMode } from "@/gen/rustylink/daemon/v1/types_pb"
@@ -114,7 +113,6 @@ export function ConnectDialog({
     }
   }, [supported, protocol, setValue])
 
-  const probe = useMutation(probeDotLatency)
   const connect = useMutation(connectTunnel, {
     onSuccess: (res) => {
       if (res.tunnel) {
@@ -126,33 +124,14 @@ export function ConnectDialog({
     onError: (err) => toast.error(errorMessage(err)),
   })
 
-  // For "Auto", probe latency and pick the fastest reachable node; otherwise
-  // use the chosen location. (The daemon also latency-ranks nodes, but this
-  // lets the user pick the export region with the best round-trip.)
-  const onConnect = handleSubmit(async (values) => {
-    let exportId: number
-    if (values.locationId === AUTO) {
-      try {
-        const res = await probe.mutateAsync({})
-        const best = res.results
-          .filter((r) => r.reachable)
-          .sort((a, b) => a.latencyMs - b.latencyMs)[0]
-        if (!best) {
-          toast.error("No reachable location found")
-          return
-        }
-        exportId = best.dotId
-      } catch (err) {
-        toast.error(errorMessage(err))
-        return
-      }
-    } else {
-      exportId = Number(values.locationId)
-    }
+  // A specific location pins that dot; "Auto" leaves locationId unset so the
+  // daemon connects to the lowest-latency reachable dot and reports it back.
+  const onConnect = handleSubmit((values) => {
     connect.mutate({
       mode: values.mode as VpnMode,
       protocolMode: values.protocol as ProtocolMode,
-      exportId,
+      locationId:
+        values.locationId === AUTO ? undefined : Number(values.locationId),
       otp: values.otp ? values.otp : undefined,
       reconnect: values.reconnect,
     })
@@ -299,15 +278,8 @@ export function ConnectDialog({
           </div>
 
           <DialogFooter>
-            <Button
-              type="submit"
-              disabled={connect.isPending || probe.isPending}
-            >
-              {probe.isPending
-                ? "Measuring latency…"
-                : connect.isPending
-                  ? "Connecting…"
-                  : "Connect"}
+            <Button type="submit" disabled={connect.isPending}>
+              {connect.isPending ? "Connecting…" : "Connect"}
             </Button>
           </DialogFooter>
         </form>

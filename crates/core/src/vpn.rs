@@ -35,12 +35,13 @@ pub enum VpnConnectMode {
 pub struct VpnConfigRequest {
     pub mode: VpnConnectMode,
     pub public_key: String,
-    pub export_id: i32,
+    /// Chosen location (dot) id, or `None` for Auto. Pins dot selection; the
+    /// `/vpn/conn` export id is derived from the dot actually dialed.
+    pub location_id: Option<i32>,
     pub otp: Option<String>,
     pub sign_token: Option<String>,
     pub not_auto: bool,
     pub reconnect: bool,
-    pub preferred_dot_id: Option<i32>,
 }
 
 #[derive(Clone, Debug)]
@@ -164,9 +165,9 @@ pub struct TotpConfig {
 /// Dot (access-point) selection mirrors the outbound-interface resolution
 /// model:
 ///
-/// * **Pinned** — when `request.preferred_dot_id` is `Some`, only that dot is
+/// * **Pinned** — when `request.location_id` is `Some`, only that dot is
 ///   considered (the caller explicitly chose a node; we stick to it).
-/// * **Auto** — when `preferred_dot_id` is `None`, all dots that support the
+/// * **Auto** — when `location_id` is `None`, all dots that support the
 ///   requested mode are ranked by measured latency via `rank_dots`, and the
 ///   fastest-responding nodes are tried first.
 ///
@@ -195,12 +196,12 @@ where
         return NoVpnDotsSnafu.fail();
     }
 
-    let pinned = request.preferred_dot_id.is_some();
+    let pinned = request.location_id.is_some();
     let mut candidates = dots
         .into_iter()
         .filter(|dot| {
             request
-                .preferred_dot_id
+                .location_id
                 .is_none_or(|preferred| dot.id == Some(preferred))
         })
         .filter(|dot| dot.supports_android_mode(request.mode.android_id()))
@@ -230,7 +231,7 @@ where
             mode: Some(request.mode.android_name()),
             public_key: request.public_key.clone(),
             otp: request.otp.clone(),
-            export_id: request.export_id,
+            export_id: dot.id.unwrap_or_default(),
             sign_token: request.sign_token.clone(),
             not_auto: Some(request.not_auto),
         };

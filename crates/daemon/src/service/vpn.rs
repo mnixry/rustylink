@@ -55,8 +55,7 @@ impl VpnService for VpnServiceImpl {
         let vpn_request = vpn_request_from_proto(
             request.mode.as_known(),
             request.protocol_mode.as_known(),
-            request.export_id,
-            request.preferred_dot_id,
+            request.location_id,
             request.otp,
             request.reconnect,
         );

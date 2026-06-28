@@ -14,8 +14,10 @@ use crate::vpn::VpnConnectMode;
 #[derive(Clone, Debug)]
 pub struct VpnRequest {
     pub mode: VpnConnectMode,
-    pub export_id: i32,
-    pub preferred_dot_id: Option<i32>,
+    /// Chosen location (dot) id, or `None` for Auto (lowest-latency dot).
+    /// The daemon pins this dot for the connection and derives the `/vpn/conn`
+    /// export id from the dot it actually dials.
+    pub location_id: Option<i32>,
     pub otp: Option<String>,
     pub reconnect: bool,
     /// Caller-requested `WireGuard` transport. Must be either `Udp` or
@@ -28,8 +30,7 @@ impl Default for VpnRequest {
     fn default() -> Self {
         Self {
             mode: VpnConnectMode::Full,
-            export_id: 0,
-            preferred_dot_id: None,
+            location_id: None,
             otp: None,
             reconnect: true,
             protocol_mode: ProtocolMode::Udp,

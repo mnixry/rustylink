@@ -43,11 +43,14 @@ message GetTunnelResponse {
 
 message ConnectTunnelRequest {
   VpnMode mode = 1;
-  int32 export_id = 2;
-  optional int32 preferred_dot_id = 3;
-  optional string otp = 4;
-  ProtocolMode protocol_mode = 5;
-  bool reconnect = 6;
+  // Chosen location (dot) id. Unset = Auto: the daemon connects to the
+  // lowest-latency reachable dot. The daemon pins this dot, reports it back,
+  // and uses its id as the /vpn/conn export id, so the connected node always
+  // matches the selection.
+  optional int32 location_id = 2;
+  optional string otp = 3;
+  ProtocolMode protocol_mode = 4;
+  bool reconnect = 5;
 }
 
 message ConnectTunnelResponse {
