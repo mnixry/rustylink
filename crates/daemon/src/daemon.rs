@@ -241,26 +241,28 @@ impl Daemon {
     /// On startup, re-establish the tunnel if it was active and auto-reconnect
     /// is enabled.
     pub async fn maybe_auto_resume(&self) {
-        let request = {
+        let (auto_reconnect, path) = {
             let inner = self.inner.lock().await;
-            if !inner.config.auto_reconnect {
-                return;
-            }
-            // Restore from the credentials' last_vpn_request.
-            let Some(creds) = inner.auth.to_credentials().await else {
-                return;
-            };
-            drop(inner);
-            match creds.last_vpn_request {
-                Some(persisted) => VpnRequest {
-                    mode: persisted.mode.parse().unwrap_or(VpnConnectMode::Full),
-                    location_id: persisted.location_id,
-                    otp: None,
-                    reconnect: persisted.reconnect,
-                    protocol_mode: persisted.protocol_mode,
-                },
-                None => return,
-            }
+            (inner.config.auto_reconnect, inner.credential_path.clone())
+        };
+        if !auto_reconnect {
+            return;
+        }
+        // The last VPN request lives only in credentials.json — the in-memory
+        // auth machine does not retain it after restore — so read it back from
+        // disk rather than from a fresh in-memory snapshot.
+        let Some(creds) = PersistedCredentials::load(&path).await.ok().flatten() else {
+            return;
+        };
+        let Some(persisted) = creds.last_vpn_request else {
+            return;
+        };
+        let request = VpnRequest {
+            mode: persisted.mode.parse().unwrap_or(VpnConnectMode::Full),
+            location_id: persisted.location_id,
+            otp: None,
+            reconnect: persisted.reconnect,
+            protocol_mode: persisted.protocol_mode,
         };
         tracing::info!("auto-resuming tunnel from persisted request");
         if let Err(error) = self.connect_tunnel(request).await {
@@ -504,11 +506,21 @@ impl Daemon {
             message: "/vpn/conn returned no data",
         })?;
 
+        let effective_protocol =
+            effective_transport(config_result.dot.protocol_mode, request.protocol_mode);
+
         let mut session = self
-            .start_session(&config_result, &data, &local_params, request)
+            .start_session(
+                &config_result,
+                &data,
+                &local_params,
+                request,
+                effective_protocol,
+            )
             .await?;
 
-        self.mark_connected(&config_result, &data.ip).await;
+        self.mark_connected(&config_result, &data.ip, effective_protocol)
+            .await;
 
         // `/vpn/report` is a VPN-control API: like `/vpn/conn`, the Android
         // client (`VpnReportOperator.report`) posts it to the *selected dot's*
@@ -561,6 +573,7 @@ impl Daemon {
     async fn start_session(
         &self, config_result: &VpnConfigResult, data: &VpnConnResponse,
         local_params: &LocalTunnelParams, request: &VpnRequest,
+        effective_protocol_mode: ProtocolMode,
     ) -> Result<TunnelSession> {
         let (outbound_iface, tun_interface, dns_listen_port, dns_listen_host, fallback_dns) = {
             let mut inner = self.inner.lock().await;
@@ -578,9 +591,6 @@ impl Daemon {
                 inner.config.fallback_dns.clone(),
             )
         };
-
-        let effective_protocol_mode =
-            effective_transport(config_result.dot.protocol_mode, request.protocol_mode);
 
         let mut tunnel_config = TunnelConfig::from_vpn_conn(
             data,
@@ -615,13 +625,16 @@ impl Daemon {
     }
 
     /// Record the connected tunnel in `VpnMachine`.
-    async fn mark_connected(&self, config_result: &VpnConfigResult, assigned_ip: &str) {
+    async fn mark_connected(
+        &self, config_result: &VpnConfigResult, assigned_ip: &str, protocol_mode: ProtocolMode,
+    ) {
         let dot = &config_result.dot;
         let active = ActiveTunnel {
             dot_id: dot.id.unwrap_or_default(),
             dot_name: dot.name.clone().unwrap_or_default(),
             endpoint: config_result.endpoint.wireguard_endpoint.to_string(),
             assigned_ip: assigned_ip.to_string(),
+            protocol_mode,
         };
         self.vpn_transition(move |vpn| vpn.set_connected(active))
             .await;

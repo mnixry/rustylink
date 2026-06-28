@@ -588,11 +588,13 @@ impl VpnMachine {
             VpnState::Connecting { request, .. } => pb::Tunnel {
                 state: pb::tunnel::State::Connecting.into(),
                 mode: vpn_mode_to_proto(request.mode).into(),
+                protocol_mode: protocol_mode_to_proto(request.protocol_mode).into(),
                 ..Default::default()
             },
             VpnState::Configuring { request, .. } => pb::Tunnel {
                 state: pb::tunnel::State::Configuring.into(),
                 mode: vpn_mode_to_proto(request.mode).into(),
+                protocol_mode: protocol_mode_to_proto(request.protocol_mode).into(),
                 ..Default::default()
             },
             VpnState::Connected {
@@ -602,6 +604,7 @@ impl VpnMachine {
             } => pb::Tunnel {
                 state: pb::tunnel::State::Connected.into(),
                 mode: vpn_mode_to_proto(request.mode).into(),
+                protocol_mode: protocol_mode_to_proto(tunnel_info.protocol_mode).into(),
                 dot_id: tunnel_info.dot_id,
                 dot_name: tunnel_info.dot_name.clone(),
                 endpoint: tunnel_info.endpoint.clone(),
@@ -613,6 +616,7 @@ impl VpnMachine {
             } => pb::Tunnel {
                 state: pb::tunnel::State::Reconnecting.into(),
                 mode: vpn_mode_to_proto(request.mode).into(),
+                protocol_mode: protocol_mode_to_proto(request.protocol_mode).into(),
                 reconnect_attempts: *attempts,
                 ..Default::default()
             },
@@ -624,6 +628,7 @@ impl VpnMachine {
             } => pb::Tunnel {
                 state: pb::tunnel::State::Failed.into(),
                 mode: vpn_mode_to_proto(request.mode).into(),
+                protocol_mode: protocol_mode_to_proto(request.protocol_mode).into(),
                 error: error.clone(),
                 reconnect_attempts: *attempts,
                 ..Default::default()
@@ -631,6 +636,7 @@ impl VpnMachine {
             VpnState::Disconnecting { request, .. } => pb::Tunnel {
                 state: pb::tunnel::State::Disconnecting.into(),
                 mode: vpn_mode_to_proto(request.mode).into(),
+                protocol_mode: protocol_mode_to_proto(request.protocol_mode).into(),
                 ..Default::default()
             },
         }
@@ -642,6 +648,15 @@ fn vpn_mode_to_proto(mode: VpnConnectMode) -> pb::VpnMode {
     match mode {
         VpnConnectMode::Full => pb::VpnMode::Full,
         VpnConnectMode::Split => pb::VpnMode::Split,
+    }
+}
+
+/// Map the api [`ProtocolMode`] to the proto
+/// [`ProtocolMode`](pb::ProtocolMode).
+fn protocol_mode_to_proto(mode: ProtocolMode) -> pb::ProtocolMode {
+    match mode {
+        ProtocolMode::Udp => pb::ProtocolMode::Udp,
+        ProtocolMode::FeilianTcp => pb::ProtocolMode::Tcp,
     }
 }
 

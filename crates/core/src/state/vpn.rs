@@ -45,6 +45,8 @@ pub struct ActiveTunnel {
     pub dot_name: String,
     pub endpoint: String,
     pub assigned_ip: String,
+    /// Effective `WireGuard` transport actually running (UDP or `FeiLian` TCP).
+    pub protocol_mode: ProtocolMode,
 }
 
 /// VPN connection state.
