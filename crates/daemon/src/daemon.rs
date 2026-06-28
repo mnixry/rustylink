@@ -903,7 +903,7 @@ pub async fn build_dot_api_client(
 /// A concrete hostname for TLS validation, derived from the tenant's
 /// `vpn_domain`.
 ///
-/// `vpn_domain` is often a wildcard (e.g. `*.msh.team`) which can't be used as
+/// `vpn_domain` is often a wildcard which can't be used as
 /// a URL host / SNI. The leading `*` label is replaced with a concrete label
 /// that still validates against the wildcard certificate (a wildcard matches
 /// any single leftmost label). Concrete domains are used unchanged.

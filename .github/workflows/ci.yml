@@ -1,0 +1,29 @@
+name: Nix CI
+on:
+  push:
+jobs:
+  check:
+    strategy:
+      matrix:
+        runs-on: [ubuntu-latest, ubuntu-24.04-arm, macos-latest]
+      fail-fast: false
+    runs-on: ${{ matrix.runs-on }}
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@main
+      - uses: NixOS/nix-installer-action@main
+      - uses: Mic92/niks3-action@main
+        with:
+          server-url: https://${{ secrets.NIKS3_SERVER_HOST }}
+      - uses: actions/cache@main
+        with:
+          path: ~/.cache/nix
+          key: nix-cache-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
+          restore-keys: nix-cache-${{ runner.os }}-${{ runner.arch }}-
+      - run: nix flake check --print-build-logs
+      - run: nix build --print-build-logs
+      - uses: actions/upload-artifact@main
+        with:
+          path: result/bin
+          name: result-${{ runner.os }}-${{ runner.arch }}
