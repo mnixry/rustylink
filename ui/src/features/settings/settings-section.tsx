@@ -174,34 +174,6 @@ export function SettingsSection() {
         </div>
 
         <div className="grid gap-2">
-          <Label>DNS interface</Label>
-          <Select
-            value={interfaceValue(cfg.dnsInterface)}
-            disabled={update.isPending}
-            onValueChange={(v) =>
-              save(
-                { dnsInterface: { selector: interfaceSelector(v ?? AUTO) } },
-                ["dns_interface"]
-              )
-            }
-          >
-            <SelectTrigger className="w-full">
-              <SelectValue>
-                {(value) => (!value || value === AUTO ? "Automatic" : value)}
-              </SelectValue>
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value={AUTO}>Automatic</SelectItem>
-              {ifaceOptions.map((iface) => (
-                <SelectItem key={iface.name} value={iface.name}>
-                  {iface.name}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
-
-        <div className="grid gap-2">
           <Label htmlFor="tun-interface">TUN interface</Label>
           <Input
             id="tun-interface"
@@ -217,6 +189,44 @@ export function SettingsSection() {
           />
           <p className="text-muted-foreground text-xs">
             Name of the VPN tunnel device. Leave empty for the platform default.
+          </p>
+        </div>
+
+        <div className="grid gap-2">
+          <Label htmlFor="dns-listen">DNS server</Label>
+          <div className="flex gap-2">
+            <Input
+              id="dns-listen-host"
+              className="w-2/3"
+              defaultValue={cfg.dnsListenHost ?? ""}
+              placeholder="127.0.0.1"
+              disabled={update.isPending}
+              onBlur={(event) => {
+                const value = event.target.value.trim()
+                if (value !== (cfg.dnsListenHost ?? "")) {
+                  save({ dnsListenHost: value }, ["dns_listen_host"])
+                }
+              }}
+            />
+            <Input
+              id="dns-listen-port"
+              className="w-1/3"
+              type="number"
+              defaultValue={cfg.dnsListenPort ?? ""}
+              placeholder="Off"
+              disabled={update.isPending}
+              onBlur={(event) => {
+                const raw = event.target.value.trim()
+                const port = raw ? Number.parseInt(raw, 10) : 0
+                if (port !== (cfg.dnsListenPort ?? 0)) {
+                  save({ dnsListenPort: port }, ["dns_listen_port"])
+                }
+              }}
+            />
+          </div>
+          <p className="text-muted-foreground text-xs">
+            Optional DNS server started with the VPN. Set a port (e.g. 53) to
+            enable. Leave empty to disable.
           </p>
         </div>
 

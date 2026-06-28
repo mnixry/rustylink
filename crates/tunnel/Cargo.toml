@@ -5,6 +5,7 @@ version.workspace = true
 
 [dependencies]
 rustylink-api.path      = "../api"
+rustylink-dns.path      = "../dns"
 rustylink-outbound.path = "../outbound"
 
 async-trait.workspace      = true

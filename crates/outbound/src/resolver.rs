@@ -286,6 +286,10 @@ pub fn system_dns_servers() -> Result<Vec<SocketAddr>> {
         .name_servers()
         .iter()
         .map(|ns| SocketAddr::new(ns.ip, DEFAULT_DNS_PORT))
+        // Defensive: skip loopback/unspecified addresses, which may appear if
+        // the local DNS server previously set system DNS to 127.0.0.1 and the
+        // daemon restarted without restoring.
+        .filter(|addr| !addr.ip().is_loopback() && !addr.ip().is_unspecified())
         .collect();
 
     if servers.is_empty() {

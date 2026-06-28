@@ -23,9 +23,12 @@ message Configuration {
   DeviceIdentity device_identity = 2;
   SecurityReport security_report = 3;
   bool auto_reconnect_on_start = 4;
-  OutboundInterface dns_interface = 5;
+  // Port for the optional local DNS server. 0 or absent = disabled.
+  optional uint32 dns_listen_port = 5;
   // Name of the TUN device to create. Empty = platform default (utun/wg0).
   optional string tun_interface = 6;
+  // Host for the optional local DNS server. Default = 127.0.0.1 (loopback).
+  optional string dns_listen_host = 7;
 }
 
 message OutboundInterface {

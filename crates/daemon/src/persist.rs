@@ -67,12 +67,20 @@ pub struct DaemonConfig {
     pub identity: DeviceIdentityConfig,
     /// Bind outbound HTTP/tunnel sockets to a specific interface.
     pub outbound_interface: Option<String>,
-    /// Bind DNS resolver sockets to a specific interface.
-    pub dns_interface: Option<String>,
+    /// Fallback DNS servers when system DNS is empty or all-loopback.
+    /// Default: `["223.5.5.5"]`.
+    #[serde(default)]
+    pub fallback_dns: Option<Vec<String>>,
     /// Name of the TUN device to create (empty/unset = platform default).
     pub tun_interface: Option<String>,
     /// Whether to automatically reconnect the VPN tunnel on daemon start.
     pub auto_reconnect: bool,
+    /// Port for the optional local DNS server. 0 or absent = disabled.
+    #[serde(default)]
+    pub dns_listen_port: Option<u32>,
+    /// Host/IP for the optional local DNS server. Default = "127.0.0.1".
+    #[serde(default)]
+    pub dns_listen_host: Option<String>,
 }
 
 /// The persisted device identity.

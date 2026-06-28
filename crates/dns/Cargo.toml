@@ -1,0 +1,21 @@
+[package]
+edition.workspace = true
+name              = "rustylink-dns"
+version.workspace = true
+
+[dependencies]
+rustylink-api.path      = "../api"
+rustylink-outbound.path = "../outbound"
+
+hickory-proto.workspace    = true
+hickory-resolver.workspace = true
+snafu.workspace            = true
+socket2.workspace          = true
+tokio.workspace            = true
+tokio-util.workspace       = true
+tracing.workspace          = true
+url.workspace              = true
+wildmatch.workspace        = true
+
+[lints]
+workspace = true

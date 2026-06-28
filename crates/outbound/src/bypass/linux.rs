@@ -29,6 +29,9 @@ use crate::OutboundInterface;
 ///
 /// Any non-zero value that doesn't collide with other marks on the system.
 /// The same value used by clash-rs (0x162E = 5678 decimal).
+///
+/// Set on sockets via `SO_MARK` in the dialer (`dialer.rs`) and matched
+/// by the policy routing rules installed here.
 pub const BYPASS_FWMARK: u32 = 0x162E;
 
 /// The routing table ID for TUN-directed traffic.

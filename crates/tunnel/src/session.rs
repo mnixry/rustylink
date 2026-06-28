@@ -12,14 +12,15 @@ use gotatun::{
 };
 use ipnetwork::{IpNetwork, Ipv4Network, Ipv6Network};
 use rustylink_api::{ProtocolMode, VpnConnResponse};
+use rustylink_dns::{DnsConfig, DnsResolver, DnsServer};
 use rustylink_outbound::{Dialer, OutboundConfig, OutboundContext, Resolver, RouteBypass};
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 use url::{Host, Url};
 
 use crate::{
-    BoundUdpSocketFactory, DnsConfig, DnsQueryTransport, DnsResolver, FeilianTcpTransportFactory,
-    LivenessProbe, UdpDnsTransport, VpnTun,
+    BoundUdpSocketFactory, DnsQueryTransport, FeilianTcpTransportFactory, LivenessProbe,
+    UdpDnsTransport, VpnTun,
     route::{self, AppliedRoutes, VpnRouteMode},
 };
 
@@ -102,6 +103,9 @@ pub enum Error {
 
     #[snafu(display("invalid WireGuard key `{name}`"))]
     InvalidKey { name: &'static str },
+
+    #[snafu(display("DNS server failed: {source}"))]
+    DnsServer { source: rustylink_dns::ServerError },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -134,6 +138,12 @@ pub struct TunnelConfig {
     pub full_tunnel: bool,
     pub ipv6_enabled: bool,
     pub dns: DnsConfig,
+    /// Port for the optional local DNS server. 0 = disabled.
+    pub dns_listen_port: u16,
+    /// Host/IP for the optional local DNS server. Default = loopback.
+    pub dns_listen_host: Option<String>,
+    /// Fallback DNS servers when system DNS is empty/all-loopback.
+    pub fallback_dns: Option<Vec<String>>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -151,6 +161,7 @@ pub struct TunnelSession {
     routes: Option<AppliedRoutes>,
     bypass: Option<RouteBypass>,
     probe: Option<LivenessProbe>,
+    dns_server: Option<DnsServer>,
 }
 
 enum TunnelDevice {
@@ -225,13 +236,16 @@ impl TunnelConfig {
             full_tunnel,
             ipv6_enabled,
             dns,
+            dns_listen_port: 0,
+            dns_listen_host: None,
+            fallback_dns: None,
         })
     }
 }
 
 impl TunnelSession {
     #[must_use]
-    pub const fn new(config: TunnelConfig) -> Self {
+    pub fn new(config: TunnelConfig) -> Self {
         Self {
             config,
             status: TunnelStatus::Created,
@@ -239,6 +253,7 @@ impl TunnelSession {
             routes: None,
             bypass: None,
             probe: None,
+            dns_server: None,
         }
     }
 
@@ -257,9 +272,7 @@ impl TunnelSession {
 
     /// In split-tunnel mode, route the system DNS server IP(s) into the TUN as
     /// host routes so the OS's own DNS queries enter the tunnel and can be
-    /// intercepted by the hijacker. IPv6 servers are gated on the tunnel having
-    /// a v6 address. Full-tunnel mode needs no extra route (the default route
-    /// already covers them).
+    /// intercepted by the hijacker.
     fn route_system_dns_into_tunnel(&mut self, system_servers: &[std::net::IpAddr]) {
         if self.config.full_tunnel {
             return;
@@ -278,15 +291,7 @@ impl TunnelSession {
         self.config.routes.extend(dns_host_routes);
     }
 
-    /// Build the directed/routed DNS transports, the `DnsResolver`, and the
-    /// merged `VpnTun`. Returned alongside the routed transport (cloned so the
-    /// `LivenessProbe` can reuse it).
-    ///
-    /// The routed transport is pinned to the TUN via `IP_BOUND_IF` so the
-    /// probe + intranet forwards egress the `WireGuard` adapter rather than
-    /// racing the OS routing table; `VpnTun` skips hijacking these forwards
-    /// via its `dst ∈ vpn_dns_ips` check (otherwise the resolver would catch
-    /// its own traffic and loop indefinitely).
+    /// Build the routed DNS transport, the `DnsResolver`, and the `VpnTun`.
     async fn build_vpn_tun(
         &self, tun_device: tun_rs::AsyncDevice, directed_dialer: &Dialer, routed_dialer: &Dialer,
         system_servers: &[std::net::IpAddr],
@@ -295,25 +300,21 @@ impl TunnelSession {
         Arc<dyn DnsQueryTransport>,
         Vec<std::net::SocketAddr>,
     )> {
-        let directed_dns: Arc<dyn DnsQueryTransport> =
-            Arc::new(UdpDnsTransport::new(directed_dialer.clone()));
         let routed_dns: Arc<dyn DnsQueryTransport> =
             Arc::new(UdpDnsTransport::new(routed_dialer.clone()));
-        // Pre-resolve the VPN resolver endpoints once (shared by the resolver
-        // and the liveness probe) so hijacked queries never re-resolve.
         let vpn_servers = self.config.dns.resolve_vpn_servers().await;
         let resolver = DnsResolver::build(
             self.config.dns.clone(),
             vpn_servers.clone(),
             system_servers,
-            directed_dns,
-            routed_dns.clone(),
+            directed_dialer.clone(),
         )
         .map(Arc::new);
         let tun = VpnTun::new(tun_device, resolver).context(TunCreateSnafu)?;
         Ok((tun, routed_dns, vpn_servers))
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn start_inner(&mut self) -> Result<()> {
         tracing::info!(
             interface = %self.config.interface_name,
@@ -345,11 +346,12 @@ impl TunnelSession {
         .await
         .context(OutboundSnafu)?;
 
-        let system_servers: Vec<std::net::IpAddr> = ctx
-            .dns_servers()
-            .iter()
-            .map(std::net::SocketAddr::ip)
-            .collect();
+        // Capture system DNS for non-routed forwarding + split-tunnel host routes.
+        let system_servers = rustylink_dns::capture_system_dns(self.config.fallback_dns.as_deref());
+        tracing::info!(
+            system_dns = ?system_servers,
+            "captured system DNS for directed forwarding"
+        );
         self.route_system_dns_into_tunnel(&system_servers);
 
         let endpoint = resolve_endpoint(&self.config.endpoint, ctx.resolver()).await?;
@@ -382,6 +384,32 @@ impl TunnelSession {
         let (tun, routed_dns, vpn_servers) = self
             .build_vpn_tun(tun_device, ctx.directed(), ctx.routed(), &system_servers)
             .await?;
+
+        // Optional DNS server (if dns_listen_port is configured). Fail-fast.
+        if self.config.dns_listen_port > 0
+            && let Some(resolver) = DnsResolver::build(
+                self.config.dns.clone(),
+                vpn_servers.clone(),
+                &system_servers,
+                ctx.directed().clone(),
+            )
+        {
+            let host = self
+                .config
+                .dns_listen_host
+                .as_deref()
+                .unwrap_or("127.0.0.1");
+            let port = self.config.dns_listen_port;
+            let bind_v4: std::net::SocketAddr = format!("{host}:{port}")
+                .parse()
+                .unwrap_or_else(|_| ([127, 0, 0, 1], port).into());
+            let bind_v6: std::net::SocketAddr = ([0, 0, 0, 0, 0, 0, 0, 1], port).into();
+            let server =
+                DnsServer::start(bind_v4, bind_v6, Arc::new(resolver)).context(DnsServerSnafu)?;
+            tracing::info!(%bind_v4, %bind_v6, "optional DNS server started");
+            self.dns_server = Some(server);
+        }
+
         let device = match self.config.protocol_mode {
             ProtocolMode::Udp => {
                 let builder = DeviceBuilder::new()
@@ -421,6 +449,12 @@ impl TunnelSession {
         // (which sends through routed_dns → TUN → gotatun) is cancelled before
         // the receive end disappears.
         drop(self.probe.take());
+
+        // Stop the optional DNS server.
+        if let Some(server) = self.dns_server.take() {
+            server.shutdown().await;
+        }
+
         if let Some(routes) = self.routes.take() {
             routes.remove().await.context(RouteSnafu)?;
         }

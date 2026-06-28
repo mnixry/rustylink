@@ -320,7 +320,18 @@ fn bind_socket_to_interface_inner(
     }
     .context(InterfaceBindSnafu {
         interface: interface.name.clone(),
-    })
+    })?;
+
+    // On Linux, also set SO_MARK so packets are tagged with the bypass
+    // fwmark. The policy routing rules installed by bypass/linux.rs match
+    // on this mark to route bypass traffic through the main table.
+    #[cfg(target_os = "linux")]
+    {
+        use crate::bypass::BYPASS_FWMARK;
+        socket.set_mark(BYPASS_FWMARK).context(SetOptionSnafu)?;
+    }
+
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]

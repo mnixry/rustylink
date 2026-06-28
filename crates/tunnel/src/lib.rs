@@ -6,10 +6,7 @@ pub mod route;
 pub mod session;
 pub mod transport;
 
-pub use dns::{
-    DnsConfig, DnsQueryTransport, DnsResolver, DynamicDomainTables, LivenessProbe, UdpDnsTransport,
-    VpnTun,
-};
+pub use dns::{DnsQueryTransport, LivenessProbe, UdpDnsTransport, VpnTun};
 pub use error::{Error, Result};
 pub use outbound::BoundUdpSocketFactory;
 pub use reconnect::{ReconnectController, ReconnectDecision, ReconnectEvent, ReconnectPolicy};

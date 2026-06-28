@@ -93,26 +93,11 @@ impl MetaService for MetaServiceImpl {
                     _ => None,
                 });
 
-        // Extract dns interface selector.
-        let dns_name = config
-            .dns_interface
-            .selector
-            .as_ref()
-            .map(|selector| match selector {
-                pb::outbound_interface::Selector::Name(name) if !name.is_empty() => {
-                    Some(name.clone())
-                }
-                _ => None,
-            });
-
         {
             let mut inner = self.daemon.inner.lock().await;
             inner.config.auto_reconnect = config.auto_reconnect_on_start;
             if let Some(name) = outbound_name {
                 inner.config.outbound_interface = name;
-            }
-            if let Some(name) = dns_name {
-                inner.config.dns_interface = name;
             }
             // Only touch `tun_interface` when the field is present in the
             // (partial) update; an empty string clears it to the platform
@@ -120,6 +105,13 @@ impl MetaService for MetaServiceImpl {
             if let Some(tun) = config.tun_interface.as_deref() {
                 let tun = tun.trim();
                 inner.config.tun_interface = (!tun.is_empty()).then(|| tun.to_owned());
+            }
+            if let Some(port) = config.dns_listen_port {
+                inner.config.dns_listen_port = if port > 0 { Some(port) } else { None };
+            }
+            if let Some(host) = config.dns_listen_host.as_deref() {
+                let host = host.trim();
+                inner.config.dns_listen_host = (!host.is_empty()).then(|| host.to_owned());
             }
         }
 

@@ -37,6 +37,8 @@ mod imp;
 #[path = "bypass/unsupported.rs"]
 mod imp;
 
+#[cfg(target_os = "linux")]
+pub use imp::BYPASS_FWMARK;
 pub use imp::Error;
 
 use crate::OutboundInterface;

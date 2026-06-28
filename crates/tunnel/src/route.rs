@@ -210,10 +210,7 @@ mod tests {
 
     use rustylink_api::VpnConnResponse;
 
-    use super::{
-        AddressFamily, VpnRouteMode, dns_host_routes, networks_from_vpn_conn, parse_network,
-        system_route,
-    };
+    use super::{AddressFamily, VpnRouteMode, networks_from_vpn_conn, parse_network, system_route};
 
     #[test]
     fn normalizes_host_routes() {
@@ -277,26 +274,6 @@ mod tests {
             networks_from_vpn_conn(&vpn_conn(), VpnRouteMode::Full, false).expect("routes");
 
         assert_eq!(routes, vec!["0.0.0.0/1".parse().expect("static CIDR")]);
-    }
-
-    #[test]
-    fn builds_dns_host_routes_gated_by_ipv6() {
-        let servers = [
-            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
-            "2001:4860:4860::8888".parse().expect("static IP"),
-        ];
-
-        assert_eq!(
-            dns_host_routes(&servers, false),
-            vec!["192.168.1.1/32".parse().expect("static CIDR")]
-        );
-        assert_eq!(
-            dns_host_routes(&servers, true),
-            vec![
-                "192.168.1.1/32".parse().expect("static CIDR"),
-                "2001:4860:4860::8888/128".parse().expect("static CIDR"),
-            ]
-        );
     }
 
     fn vpn_conn() -> VpnConnResponse {
