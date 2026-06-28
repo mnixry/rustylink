@@ -81,6 +81,12 @@ pub struct DaemonConfig {
     /// Host/IP for the optional local DNS server. Default = "127.0.0.1".
     #[serde(default)]
     pub dns_listen_host: Option<String>,
+    /// Split-tunnel system DNS hijack. `None`/`Some(true)` = enabled (default):
+    /// route the system DNS server IP(s) into the TUN so the OS's DNS queries
+    /// are intercepted. `Some(false)` = let the OS reach its DNS servers
+    /// directly. No effect in full-tunnel mode.
+    #[serde(default)]
+    pub route_system_dns: Option<bool>,
 }
 
 /// The persisted device identity.

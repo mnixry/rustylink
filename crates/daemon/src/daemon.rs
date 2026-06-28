@@ -575,7 +575,14 @@ impl Daemon {
         local_params: &LocalTunnelParams, request: &VpnRequest,
         effective_protocol_mode: ProtocolMode,
     ) -> Result<TunnelSession> {
-        let (outbound_iface, tun_interface, dns_listen_port, dns_listen_host, fallback_dns) = {
+        let (
+            outbound_iface,
+            tun_interface,
+            dns_listen_port,
+            dns_listen_host,
+            fallback_dns,
+            route_system_dns,
+        ) = {
             let mut inner = self.inner.lock().await;
             let outbound = inner.config.outbound_interface.clone();
             inner.active_outbound = outbound;
@@ -589,6 +596,7 @@ impl Daemon {
                     .unwrap_or(0),
                 inner.config.dns_listen_host.clone(),
                 inner.config.fallback_dns.clone(),
+                inner.config.route_system_dns.unwrap_or(true),
             )
         };
 
@@ -609,6 +617,7 @@ impl Daemon {
         tunnel_config.dns_listen_port = dns_listen_port;
         tunnel_config.dns_listen_host = dns_listen_host;
         tunnel_config.fallback_dns = fallback_dns;
+        tunnel_config.route_system_dns = route_system_dns;
         // Override the default TUN device name when one is configured.
         if let Some(name) = tun_interface.filter(|name| !name.trim().is_empty()) {
             tunnel_config.interface_name = name;
@@ -818,10 +827,11 @@ impl DaemonConfig {
         );
         pb::Configuration {
             outbound_interface: outbound.into(),
-            auto_reconnect_on_start: self.auto_reconnect,
+            auto_reconnect_on_start: Some(self.auto_reconnect),
             dns_listen_port: self.dns_listen_port,
             tun_interface: self.tun_interface.clone(),
             dns_listen_host: self.dns_listen_host.clone(),
+            route_system_dns: Some(self.route_system_dns.unwrap_or(true)),
             ..Default::default()
         }
     }

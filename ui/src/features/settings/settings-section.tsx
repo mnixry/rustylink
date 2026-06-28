@@ -117,7 +117,7 @@ export function SettingsSection() {
           </div>
           <Switch
             id="auto-reconnect"
-            checked={cfg.autoReconnectOnStart}
+            checked={cfg.autoReconnectOnStart ?? false}
             disabled={update.isPending}
             onCheckedChange={(checked) =>
               save({ autoReconnectOnStart: checked }, [
@@ -228,6 +228,29 @@ export function SettingsSection() {
             Optional DNS server started with the VPN. Set a port (e.g. 53) to
             enable. Leave empty to disable.
           </p>
+        </div>
+
+        <Separator />
+
+        <div className="flex items-center justify-between gap-4">
+          <div>
+            <Label htmlFor="route-system-dns">
+              System DNS hijack (split tunnel)
+            </Label>
+            <p className="text-muted-foreground text-xs">
+              Route the system DNS servers into the tunnel so split-mode DNS is
+              intercepted. Turn off to let the OS reach its DNS servers
+              directly. No effect in full-tunnel mode.
+            </p>
+          </div>
+          <Switch
+            id="route-system-dns"
+            checked={cfg.routeSystemDns ?? true}
+            disabled={update.isPending}
+            onCheckedChange={(checked) =>
+              save({ routeSystemDns: checked }, ["route_system_dns"])
+            }
+          />
         </div>
 
         {cfg.deviceIdentity ? (

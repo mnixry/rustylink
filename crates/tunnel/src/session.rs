@@ -138,6 +138,12 @@ pub struct TunnelConfig {
     pub full_tunnel: bool,
     pub ipv6_enabled: bool,
     pub dns: DnsConfig,
+    /// Split-tunnel system DNS hijack: when `true` (default), the system DNS
+    /// server IP(s) are routed into the TUN so the OS's DNS queries are
+    /// intercepted. When `false`, those host routes are not installed (UDP:53
+    /// packets that still reach the TUN are hijacked as usual). No effect in
+    /// full-tunnel mode.
+    pub route_system_dns: bool,
     /// Port for the optional local DNS server. 0 = disabled.
     pub dns_listen_port: u16,
     /// Host/IP for the optional local DNS server. Default = loopback.
@@ -236,6 +242,7 @@ impl TunnelConfig {
             full_tunnel,
             ipv6_enabled,
             dns,
+            route_system_dns: true,
             dns_listen_port: 0,
             dns_listen_host: None,
             fallback_dns: None,
@@ -275,6 +282,12 @@ impl TunnelSession {
     /// intercepted by the hijacker.
     fn route_system_dns_into_tunnel(&mut self, system_servers: &[std::net::IpAddr]) {
         if self.config.full_tunnel {
+            return;
+        }
+        if !self.config.route_system_dns {
+            tracing::info!(
+                "system DNS hijack disabled: not routing system DNS into tunnel (split mode)"
+            );
             return;
         }
         let dns_host_routes = route::dns_host_routes(system_servers, self.config.ipv6_enabled);

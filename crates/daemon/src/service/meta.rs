@@ -95,7 +95,9 @@ impl MetaService for MetaServiceImpl {
 
         {
             let mut inner = self.daemon.inner.lock().await;
-            inner.config.auto_reconnect = config.auto_reconnect_on_start;
+            if let Some(auto) = config.auto_reconnect_on_start {
+                inner.config.auto_reconnect = auto;
+            }
             if let Some(name) = outbound_name {
                 inner.config.outbound_interface = name;
             }
@@ -112,6 +114,9 @@ impl MetaService for MetaServiceImpl {
             if let Some(host) = config.dns_listen_host.as_deref() {
                 let host = host.trim();
                 inner.config.dns_listen_host = (!host.is_empty()).then(|| host.to_owned());
+            }
+            if let Some(route_system_dns) = config.route_system_dns {
+                inner.config.route_system_dns = Some(route_system_dns);
             }
         }
 
